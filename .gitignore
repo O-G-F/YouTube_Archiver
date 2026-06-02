@@ -1,0 +1,50 @@
+# ---- Secrets (NEVER commit) ----
+# Section 5.4 / 12: cookies and tokens must not be Git-managed.
+cookies.txt
+*.cookies.txt
+secrets/
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
+# ---- Google Takeout exports (personal data) ----
+*.zip
+takeout*.zip
+takeout-*.zip
+takeout_imports/
+takeout/
+/takeout/
+
+# ---- Archived media / logs / runtime data (rooted and anywhere) ----
+/archive/
+/logs/
+/config/
+/data/
+archive/
+logs/
+config/
+data/
+*.sqlite3
+*.db
+
+# ---- Local Docker credential workaround (Mac: Docker Desktop/OrbStack mix) ----
+.docker-config-local/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+youtube_archiver.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- OS ----
+.DS_Store

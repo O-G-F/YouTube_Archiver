@@ -1,0 +1,29 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+build
+dist
+
+# Never bake secrets or personal data into images
+cookies.txt
+*.cookies.txt
+secrets/
+.env
+.env.*
+takeout*.zip
+takeout_imports/
+
+# Local runtime data
+archive/
+logs/
+data/
+*.sqlite3
+*.db
+.DS_Store

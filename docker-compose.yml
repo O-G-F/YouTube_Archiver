@@ -1,0 +1,80 @@
+# YouTube Archiver - Phase 0-1 services.
+#
+# Storage roots are mounted from the HOST (NAS-friendly). Set the *_HOST_PATH
+# vars in .env to your NAS paths, e.g.:
+#   ARCHIVE_HOST_PATH=/Volume1/NAS/youtube-archiver/archive
+# The container-side paths (ARCHIVE_ROOT etc.) stay constant, so only the host
+# side changes when moving to another NAS / external SSD.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-archiver}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-archiver}
+      POSTGRES_DB: ${POSTGRES_DB:-archiver}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-archiver}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: apply migrations + seed built-in profiles, then exit.
+  migrate:
+    build: .
+    command: ["migrate"]
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    build: .
+    command: ["web"]
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${ARCHIVE_HOST_PATH:-./data/archive}:/archive
+      - ${CONFIG_HOST_PATH:-./data/config}:/config
+      - ${LOG_HOST_PATH:-./data/logs}:/logs
+      - ${TAKEOUT_HOST_PATH:-./data/takeout}:/takeout_imports
+      - ./secrets:/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build: .
+    command: ["worker"]
+    env_file: .env
+    volumes:
+      - ${ARCHIVE_HOST_PATH:-./data/archive}:/archive
+      - ${CONFIG_HOST_PATH:-./data/config}:/config
+      - ${LOG_HOST_PATH:-./data/logs}:/logs
+      - ${TAKEOUT_HOST_PATH:-./data/takeout}:/takeout_imports
+      - ./secrets:/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:

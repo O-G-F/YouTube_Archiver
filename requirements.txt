@@ -1,0 +1,17 @@
+# Pinned-ish runtime dependencies for reproducible Docker builds.
+# The package itself is installed via `pip install -e .` (see Dockerfile),
+# this file exists so the heavy dependency layer can be cached separately.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+sqlalchemy>=2.0
+alembic>=1.13
+psycopg2-binary>=2.9
+redis>=5.0
+rq>=1.16
+# Pydantic v2 only. Upper-bounded to avoid a future v3 (or a stray old
+# pydantic-settings) breaking `from pydantic_settings import BaseSettings`.
+pydantic>=2.7,<3
+pydantic-settings>=2.3,<3
+typer>=0.12
+PyYAML>=6.0
+yt-dlp>=2025.0.0

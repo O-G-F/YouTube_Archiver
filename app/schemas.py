@@ -1,0 +1,158 @@
+"""Pydantic request/response models for the Web API."""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class ArchiveUrlRequest(BaseModel):
+    url: str
+    profile: str | None = None
+    priority: int = 0
+
+
+class ArchiveBatchRequest(BaseModel):
+    urls: list[str]
+    profile: str | None = None
+    priority: int = 0
+
+
+class JobOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    type: str
+    status: str
+    url: str | None = None
+    profile_name: str | None = None
+    video_id: int | None = None
+    collection_id: int | None = None
+    parent_job_id: int | None = None
+    rq_job_id: str | None = None
+    priority: int
+    progress: float
+    error_message: str | None = None
+    log_path: str | None = None
+    command_path: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class BatchItemResult(BaseModel):
+    url: str
+    job_id: int | None = None
+    error: str | None = None
+
+
+class BatchResult(BaseModel):
+    created: int
+    failed: int
+    results: list[BatchItemResult]
+
+
+class ProfileOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    name: str
+    media_mode: str
+    quality_mode: str | None = None
+    description: str | None = None
+    is_builtin: bool = False
+
+
+class VideoOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    youtube_video_id: str
+    title: str | None = None
+    channel_id: str | None = None
+    channel_title: str | None = None
+    url: str | None = None
+    duration: int | None = None
+    upload_date: str | None = None
+    is_short: bool = False
+    is_live: bool = False
+    availability: str | None = None
+    thumbnail_path: str | None = None
+    first_seen_at: datetime
+    last_metadata_refresh_at: datetime | None = None
+
+
+class MediaFileOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    media_type: str
+    profile: str | None = None
+    path: str
+    container: str | None = None
+    width: int | None = None
+    height: int | None = None
+    filesize: int | None = None
+
+
+class VideoDetailOut(VideoOut):
+    media_files: list[MediaFileOut] = Field(default_factory=list)
+    subtitle_count: int = 0
+    comment_count: int = 0
+
+
+class JobLogOut(BaseModel):
+    job_id: int
+    command: str | None = None
+    stdout_tail: str | None = None
+    stderr_tail: str | None = None
+
+
+class HealthOut(BaseModel):
+    status: str
+    version: str
+    ytdlp_version: str | None = None
+    database: bool
+    redis: bool
+
+
+class JobLogsOut(BaseModel):
+    job_id: int
+    log_path: str | None = None
+    available: bool = False
+    command: str | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+
+
+class JobDetailOut(JobOut):
+    stdout_log_path: str | None = None
+    stderr_log_path: str | None = None
+    command_log_path: str | None = None
+    output_dir: str | None = None
+    video: VideoOut | None = None
+    profile: ProfileOut | None = None
+
+
+class BuildCommandRequest(BaseModel):
+    url: str
+
+
+class BuildCommandOut(BaseModel):
+    profile: str
+    url: str
+    kind: str | None = None
+    argv: list[str]
+    command: str
+    note: str | None = None
+
+
+class DoctorCheck(BaseModel):
+    name: str
+    ok: bool
+    detail: str
+
+
+class DoctorOut(BaseModel):
+    ok: bool
+    checks: list[DoctorCheck]
