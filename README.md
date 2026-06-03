@@ -15,7 +15,7 @@ YouTube の動画・メタデータ・字幕・コメントを `yt-dlp` でロ�
 
 ---
 
-## 実装済み機能（Phase 0–3A）
+## 実装済み機能（Phase 0–3B）
 
 - URL 登録 → 種別判定（動画 / 再生リスト / チャンネル / タブ）→ ジョブ化
 - 7 種の組み込みダウンロードプロファイル（最高画質 mkv / 1080p / proxy mp4 / flac / opus / metadata / comments）+ 全字幕版
@@ -24,7 +24,7 @@ YouTube の動画・メタデータ・字幕・コメントを `yt-dlp` でロ�
 - **ダウンロードジョブ**と**メタデータ更新ジョブの分離** — コメント更新時に動画本体を再取得しない（要件 4.3 / 5.5）
 - **再生リスト / チャンネル展開（Phase 2A）** — flat extraction → `collections`/`collection_items` 差分検出 → 新規のみ子 download ジョブ投入
 - **再クロール・scheduler（Phase 2B）** — `crawl_policy`（manual/new_only/refresh）、`removed_at` 検出、scheduler 常駐、チャンネルルート URL のタブ自動展開、レート制御・429 retryable、DB ユニーク制約
-- **Google Takeout インポート（Phase 3A）** — ZIP を内容ベース判定（多言語対応）、視聴履歴を `watch_history_events` に正規化保存、重複統合、preview / dry-run / limit、path traversal・zip slip 対策
+- **Google Takeout インポート（Phase 3A/3B）** — ZIP を内容ベース判定（多言語対応）、視聴履歴 / 検索履歴 / 登録チャンネル / 再生リストを正規化保存（`watch_history_events` / `search_history_events` / `collections`(channel/takeout_playlist) / `collection_items` / Video stub）、重複統合、`import-all`、subscriptions enqueue、preview / dry-run / limit、path traversal・zip slip 対策
 - 字幕は安全な許可リスト（`ja,en`、`all` は明示時のみ）、YouTube JS チャレンジ対応（`--remote-components ejs:github` + deno）、`curl_cffi` 同梱
 - 失敗ジョブ管理（ステータス・エラーメッセージ・再実行・キャンセル）+ `partial_success` / retryable
 - 運用補強（Phase 1.5）: `doctor` 診断、ジョブログ API/CLI（path traversal 対策）、profile dry-run
@@ -329,6 +329,55 @@ API: `POST /api/takeout/preview`・`POST /api/takeout/import`（`{"path","limit"
 
 ---
 
+## Phase 3B: 残りの Takeout データ正規化
+
+Phase 3A の視聴履歴に加えて、**検索履歴 / 登録チャンネル / 再生リスト**を DB へ正規化します。OAuth/API なしで、Takeout だけから初期 DB を構築できます。
+
+```bash
+Z="/takeout_imports/takeout.zip"
+# まずは小さく（各 limit）
+docker compose exec web archiver takeout import-all "$Z" \
+  --limit-watch 10 --limit-search 10 --limit-subscriptions 5 --limit-playlists 2 --limit-items 3
+# 個別にも
+docker compose exec web archiver takeout import-subscriptions "$Z" --limit 5
+docker compose exec web archiver takeout import-playlists "$Z" --limit-playlists 2 --limit-items 3
+docker compose exec web archiver takeout playlists "$Z"           # 一覧 preview
+docker compose exec web archiver search-history stats
+docker compose exec web archiver subscriptions list
+```
+
+### マッピング
+
+| Takeout | 保存先 | 備考 |
+|---|---|---|
+| 検索履歴 (`検索履歴.json`) | `search_history_events`（新規テーブル） | `query` / `searched_at` / `raw_json`。dedup `(source, query, searched_at)` |
+| 登録チャンネル (`登録チャンネル.csv`) | `collections`（`type=channel`, `enabled=false`, `crawl_policy=manual`） + 1つの `sources`（`type=channel_subscription`） | `youtube_channel_id` / `title` / `url`。dedup は channel_id |
+| 再生リスト (`再生リスト.csv` + 各 `〇〇 の動画.csv`） | `collections`（`type=takeout_playlist`） + `collection_items` + `videos`（stub） | item は `video_id`/`position`/追加日時。stub Video を作成しリンク |
+
+- **既存の YouTube playlist expand collection（`type=playlist`、url=正規URL）とは衝突しません**。Takeout 由来は `type=takeout_playlist`、url=`takeout:playlist:<id|title>` という別名前空間です。
+- 登録チャンネルは `type=channel` の **disabled** collection として入るため、scheduler では自動クロールされません（`subscriptions enqueue` で明示的にタブ展開）。
+
+### 登録チャンネルのクロール（enqueue）
+
+`subscriptions enqueue` は登録チャンネルを Phase 2A/2B の **channel expand** に流します（直接 download はしません）。タブ（`--videos/--shorts/--streams`）の指定が必須で、**`--limit` で対象チャンネル数を制限**できます（大量チャンネル対策）。
+
+```bash
+docker compose exec web archiver subscriptions enqueue --videos --profile metadata_only --max-items 3 --limit 2 --now
+```
+
+### import-all と job 記録
+
+`import-all` は watch → search → subscriptions → playlists を順に実行し、各 import を `type=takeout_import`（`meta.kind` で区別）の job として記録します。`jobs show <id>` で件数を確認できます。
+
+### プライバシー（重要）
+
+- **検索履歴は特に個人的**です。`search_history_events.raw_json` は API 既定で返しません（`include_raw=true` のみ）。`watch_history_events` も同様。
+- import ログは件数のみで、検索語・視聴タイトルを大量出力しません。
+- preview の samples は各種**最大5件**に制限。
+- Takeout ZIP は `.gitignore` 済み。**OAuth / YouTube Data API 連携は Phase 3C 以降**です。
+
+---
+
 ## ストレージ構成
 
 ```
@@ -391,9 +440,18 @@ archiver scheduler run                             # ループ常駐（scheduler
 # --- Phase 3A: Google Takeout import ---
 archiver takeout list-files PATH                   # 検出ファイル一覧
 archiver takeout preview PATH                      # 件数・サンプル（DB保存なし）
-archiver takeout import PATH [--limit N] [--dry-run]
+archiver takeout import PATH [--limit N] [--dry-run]   # 視聴履歴
 archiver watch-history list [--limit N] [--offset N]
 archiver watch-history stats
+
+# --- Phase 3B: 残りの Takeout データ正規化 ---
+archiver takeout import-subscriptions PATH [--limit N] [--dry-run]
+archiver takeout import-playlists PATH [--limit-playlists N] [--limit-items N] [--dry-run]
+archiver takeout import-all PATH [--limit-watch N --limit-search N --limit-subscriptions N --limit-playlists N --limit-items N] [--dry-run]
+archiver takeout playlists PATH                    # 再生リスト一覧（title + 件数、保存なし）
+archiver search-history list [--limit N] / stats
+archiver subscriptions list
+archiver subscriptions enqueue --videos --shorts --streams --profile metadata_only --max-items 3 [--limit N] [--now]
 ```
 
 > macOS でローカルに `archiver worker` を使うと fork 由来の問題が出る場合があります。ローカル確認では `--now` / `download run` のインライン実行を推奨します。Docker（Linux）では worker が正常動作します。
@@ -422,9 +480,17 @@ archiver watch-history stats
 | GET | `/api/scheduler/status` | scheduler 設定と対象数 |
 | POST | `/api/scheduler/run-once` | 手動で1パス実行 |
 | POST | `/api/takeout/preview` | Takeout ZIP の preview（`{"path"}`、保存なし） |
-| POST | `/api/takeout/import` | Takeout import（`{"path","limit","dry_run"}`） |
+| POST | `/api/takeout/import` | 視聴履歴 import（`{"path","limit","dry_run"}`） |
+| POST | `/api/takeout/import-subscriptions` | 登録チャンネル import |
+| POST | `/api/takeout/import-playlists` | 再生リスト import（`{"path","limit_playlists","limit_items","dry_run"}`） |
+| POST | `/api/takeout/import-all` | 4種を順に import（各 limit 指定可） |
+| GET | `/api/takeout/playlists/preview` | 再生リスト一覧 preview（`?path=&limit=`） |
 | GET | `/api/watch-history` | 視聴履歴一覧（`?q=&limit=&offset=&include_raw=`） |
 | GET | `/api/watch-history/stats` | 視聴履歴の統計（件数 / 期間 / top channels） |
+| GET | `/api/search-history` | 検索履歴一覧（`?q=&limit=&offset=&include_raw=`） |
+| GET | `/api/search-history/stats` | 検索履歴の統計（件数 / 期間 / top queries） |
+| GET | `/api/subscriptions` | 登録チャンネル一覧 |
+| POST | `/api/subscriptions/enqueue` | 登録チャンネルを expand job 化（`{"videos","shorts","streams","profile","max_items","limit"}`） |
 | GET | `/api/doctor` | 環境診断（書込可否 / ツール版 / DB / Redis） |
 | GET | `/api/jobs` | ジョブ一覧（`?status=&type=&limit=&offset=`） |
 | GET | `/api/jobs/{id}` | ジョブ詳細（status/error/ログパス/出力先/動画/profile） |
@@ -523,6 +589,7 @@ live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_e
   - `0002` `jobs.meta`（expand の入力 `max_items` と結果カウント・scheduler タグを保持する JSON 列）
   - `0003` `collection_items` に `(collection_id, youtube_video_id)` のユニーク制約（重複防止。既存重複は migration 内で安全に dedup）
   - `0004` `watch_history_events` に `(source, youtube_video_id, watched_at)` のユニーク制約（Takeout 視聴履歴の重複防止。既存重複は安全に dedup）
+  - `0005` `search_history_events` テーブル追加（`(source, query, searched_at)` ユニーク）
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
 - 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 

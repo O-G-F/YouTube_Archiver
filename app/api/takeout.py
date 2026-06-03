@@ -7,14 +7,20 @@ members are read in-memory (no extraction; zip-slip guarded).
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.config import get_settings
 from app.schemas import (
+    PlaylistSampleOut,
+    PlaylistsImportOut,
+    TakeoutImportAllOut,
+    TakeoutImportAllRequest,
     TakeoutImportOut,
+    TakeoutImportPlaylistsRequest,
     TakeoutImportRequest,
+    TakeoutPlaylistsPreviewOut,
     TakeoutPreviewOut,
     TakeoutPreviewRequest,
 )
@@ -48,3 +54,76 @@ def takeout_import(
         raise HTTPException(status_code=400, detail=str(exc))
     db.commit()
     return TakeoutImportOut(**result)
+
+
+@router.post("/import-subscriptions", response_model=TakeoutImportOut)
+def takeout_import_subscriptions(
+    req: TakeoutImportRequest, db: Session = Depends(get_db)
+) -> TakeoutImportOut:
+    try:
+        result = takeout.run_import_subscriptions(
+            db, get_settings(), req.path, limit=req.limit, dry_run=req.dry_run
+        )
+    except takeout.TakeoutError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    db.commit()
+    return TakeoutImportOut(**result)
+
+
+@router.post("/import-playlists", response_model=PlaylistsImportOut)
+def takeout_import_playlists(
+    req: TakeoutImportPlaylistsRequest, db: Session = Depends(get_db)
+) -> PlaylistsImportOut:
+    try:
+        result = takeout.run_import_playlists(
+            db,
+            get_settings(),
+            req.path,
+            limit_playlists=req.limit_playlists,
+            limit_items=req.limit_items,
+            dry_run=req.dry_run,
+        )
+    except takeout.TakeoutError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    db.commit()
+    return PlaylistsImportOut(**result)
+
+
+@router.post("/import-all", response_model=TakeoutImportAllOut)
+def takeout_import_all(
+    req: TakeoutImportAllRequest, db: Session = Depends(get_db)
+) -> TakeoutImportAllOut:
+    try:
+        result = takeout.run_import_all(
+            db,
+            get_settings(),
+            req.path,
+            limit_watch=req.limit_watch,
+            limit_search=req.limit_search,
+            limit_subscriptions=req.limit_subscriptions,
+            limit_playlists=req.limit_playlists,
+            limit_items=req.limit_items,
+            dry_run=req.dry_run,
+        )
+    except takeout.TakeoutError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    db.commit()
+    return TakeoutImportAllOut(**result)
+
+
+@router.get("/playlists/preview", response_model=TakeoutPlaylistsPreviewOut)
+def takeout_playlists_preview(
+    path: str = Query(...), limit: int = Query(default=100, le=1000)
+) -> TakeoutPlaylistsPreviewOut:
+    settings = get_settings()
+    try:
+        zip_path = takeout.resolve_takeout_path(settings, path)
+        with takeout.open_archive(zip_path) as archive:
+            playlists = [
+                PlaylistSampleOut(title=p.title, playlist_id=p.playlist_id, item_count=len(p.items))
+                for i, p in enumerate(archive.iter_playlists())
+                if i < limit
+            ]
+    except takeout.TakeoutError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return TakeoutPlaylistsPreviewOut(path=path, playlists=playlists)

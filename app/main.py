@@ -20,7 +20,9 @@ from app.api import (
     jobs,
     profiles,
     scheduler,
+    search_history,
     sources,
+    subscriptions,
     takeout,
     videos,
     watch_history,
@@ -52,6 +54,8 @@ app.include_router(collections.router)
 app.include_router(scheduler.router)
 app.include_router(takeout.router)
 app.include_router(watch_history.router)
+app.include_router(search_history.router)
+app.include_router(subscriptions.router)
 app.include_router(jobs.router)
 app.include_router(profiles.router)
 app.include_router(videos.router)

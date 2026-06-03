@@ -44,6 +44,8 @@ collections_app = typer.Typer(help="Inspect and re-crawl playlist/channel collec
 scheduler_app = typer.Typer(help="Run the collection re-crawl scheduler.")
 takeout_app = typer.Typer(help="Google Takeout preview / import.")
 watch_history_app = typer.Typer(help="Inspect imported watch history.")
+search_history_app = typer.Typer(help="Inspect imported search history.")
+subscriptions_app = typer.Typer(help="Takeout subscriptions (channels).")
 app.add_typer(source_app, name="source")
 app.add_typer(download_app, name="download")
 app.add_typer(jobs_app, name="jobs")
@@ -53,6 +55,8 @@ app.add_typer(collections_app, name="collections")
 app.add_typer(scheduler_app, name="scheduler")
 app.add_typer(takeout_app, name="takeout")
 app.add_typer(watch_history_app, name="watch-history")
+app.add_typer(search_history_app, name="search-history")
+app.add_typer(subscriptions_app, name="subscriptions")
 
 
 # --------------------------------------------------------------------------- #
@@ -716,6 +720,231 @@ def takeout_import(
     )
     if result["warnings"]:
         typer.echo(f"warnings: {result['warnings'][:5]}")
+
+
+@takeout_app.command("import-subscriptions")
+def takeout_import_subscriptions(
+    path: str = typer.Argument(...),
+    limit: int = typer.Option(0, "--limit", help="Max channels (0 = all)."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Import subscribed channels as collections (type=channel, disabled)."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        try:
+            r = tk.run_import_subscriptions(
+                s, get_settings(), path, limit=(limit or None), dry_run=dry_run
+            )
+        except tk.TakeoutError as exc:
+            raise typer.BadParameter(str(exc))
+    typer.echo(
+        f"imported={r['imported_count']} skipped_duplicate={r['skipped_duplicate_count']} "
+        f"failed={r['failed_count']} scanned={r['scanned']} dry_run={r['dry_run']} job_id={r['job_id']}"
+    )
+
+
+@takeout_app.command("import-playlists")
+def takeout_import_playlists(
+    path: str = typer.Argument(...),
+    limit_playlists: int = typer.Option(0, "--limit-playlists", help="0 = all."),
+    limit_items: int = typer.Option(0, "--limit-items", help="0 = all per playlist."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Import Takeout playlists as collections (type=takeout_playlist) + items + video stubs."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        try:
+            r = tk.run_import_playlists(
+                s, get_settings(), path,
+                limit_playlists=(limit_playlists or None),
+                limit_items=(limit_items or None),
+                dry_run=dry_run,
+            )
+        except tk.TakeoutError as exc:
+            raise typer.BadParameter(str(exc))
+    typer.echo(
+        f"playlists_imported={r['playlists_imported']} items_imported={r['items_imported']} "
+        f"items_skipped={r['items_skipped']} videos_created={r['videos_created']} "
+        f"scanned_playlists={r['scanned_playlists']} dry_run={r['dry_run']} job_id={r['job_id']}"
+    )
+
+
+@takeout_app.command("playlists")
+def takeout_playlists(
+    path: str = typer.Argument(...),
+    limit: int = typer.Option(50, "--limit"),
+) -> None:
+    """Preview Takeout playlists (title + item count), no import."""
+    from app.services import takeout as tk
+
+    try:
+        zip_path = tk.resolve_takeout_path(get_settings(), path)
+        with tk.open_archive(zip_path) as a:
+            for i, p in enumerate(a.iter_playlists()):
+                if i >= limit:
+                    break
+                typer.echo(f"  {len(p.items):>5}  {p.playlist_id or '-':<36}  {p.title}")
+    except tk.TakeoutError as exc:
+        raise typer.BadParameter(str(exc))
+
+
+@takeout_app.command("import-all")
+def takeout_import_all(
+    path: str = typer.Argument(...),
+    limit_watch: int = typer.Option(0, "--limit-watch"),
+    limit_search: int = typer.Option(0, "--limit-search"),
+    limit_subscriptions: int = typer.Option(0, "--limit-subscriptions"),
+    limit_playlists: int = typer.Option(0, "--limit-playlists"),
+    limit_items: int = typer.Option(0, "--limit-items"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Import watch history, search history, subscriptions and playlists in order."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        try:
+            r = tk.run_import_all(
+                s, get_settings(), path,
+                limit_watch=(limit_watch or None),
+                limit_search=(limit_search or None),
+                limit_subscriptions=(limit_subscriptions or None),
+                limit_playlists=(limit_playlists or None),
+                limit_items=(limit_items or None),
+                dry_run=dry_run,
+            )
+        except tk.TakeoutError as exc:
+            raise typer.BadParameter(str(exc))
+    w, se, su, pl = r["watch_history"], r["search_history"], r["subscriptions"], r["playlists"]
+    typer.echo(f"dry_run={r['dry_run']}")
+    typer.echo(f"  watch_history : imported={w['imported_count']} skipped={w['skipped_duplicate_count']} scanned={w['scanned']}")
+    typer.echo(f"  search_history: imported={se['imported_count']} skipped={se['skipped_duplicate_count']} scanned={se['scanned']}")
+    typer.echo(f"  subscriptions : imported={su['imported_count']} skipped={su['skipped_duplicate_count']} scanned={su['scanned']}")
+    typer.echo(f"  playlists     : playlists={pl['playlists_imported']} items={pl['items_imported']} videos={pl['videos_created']} scanned={pl['scanned_playlists']}")
+
+
+# --------------------------------------------------------------------------- #
+# search-history
+# --------------------------------------------------------------------------- #
+@search_history_app.command("list")
+def search_history_list(
+    limit: int = typer.Option(20, "--limit"),
+    offset: int = typer.Option(0, "--offset"),
+) -> None:
+    """List recent search-history events."""
+    from app.models import SearchHistoryEvent
+
+    with session_scope() as s:
+        rows = list(
+            s.scalars(
+                select(SearchHistoryEvent)
+                .order_by(SearchHistoryEvent.searched_at.desc(), SearchHistoryEvent.id.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+        if not rows:
+            typer.echo("No search-history events. Import a Takeout ZIP first.")
+            return
+        for r in rows:
+            typer.echo(f"  {r.searched_at}  {r.query}")
+
+
+@search_history_app.command("stats")
+def search_history_stats() -> None:
+    """Show search-history statistics."""
+    from sqlalchemy import func
+
+    from app.models import SearchHistoryEvent
+
+    with session_scope() as s:
+        total = s.scalar(select(func.count(SearchHistoryEvent.id))) or 0
+        distinct = s.scalar(select(func.count(func.distinct(SearchHistoryEvent.query)))) or 0
+        earliest = s.scalar(select(func.min(SearchHistoryEvent.searched_at)))
+        latest = s.scalar(select(func.max(SearchHistoryEvent.searched_at)))
+        top = s.execute(
+            select(SearchHistoryEvent.query, func.count(SearchHistoryEvent.id))
+            .where(SearchHistoryEvent.query.is_not(None))
+            .group_by(SearchHistoryEvent.query)
+            .order_by(func.count(SearchHistoryEvent.id).desc())
+            .limit(10)
+        ).all()
+    typer.echo(f"total           : {total}")
+    typer.echo(f"distinct queries: {distinct}")
+    typer.echo(f"range           : {earliest}  ->  {latest}")
+    typer.echo("top queries:")
+    for q, n in top:
+        typer.echo(f"  {n:>6}  {q}")
+
+
+# --------------------------------------------------------------------------- #
+# subscriptions
+# --------------------------------------------------------------------------- #
+@subscriptions_app.command("list")
+def subscriptions_list(limit: int = typer.Option(30, "--limit")) -> None:
+    """List imported subscriptions (channel collections)."""
+    from app.models import Collection
+
+    with session_scope() as s:
+        rows = list(
+            s.scalars(
+                select(Collection).where(Collection.type == "channel").order_by(Collection.id).limit(limit)
+            )
+        )
+        if not rows:
+            typer.echo("No subscriptions. Run `takeout import-subscriptions` first.")
+            return
+        for c in rows:
+            typer.echo(f"  #{c.id:<4} {c.youtube_channel_id or '-':<26}  {c.title}")
+
+
+@subscriptions_app.command("enqueue")
+def subscriptions_enqueue(
+    videos: bool = typer.Option(False, "--videos"),
+    shorts: bool = typer.Option(False, "--shorts"),
+    streams: bool = typer.Option(False, "--streams"),
+    profile: str = typer.Option(None, "--profile", "-p"),
+    max_items: int = typer.Option(0, "--max-items"),
+    limit: int = typer.Option(0, "--limit", help="Max channels to enqueue (0 = all)."),
+    now: bool = typer.Option(False, "--now"),
+) -> None:
+    """Enqueue expand jobs for subscribed channels (selected tabs)."""
+    from app.models import Collection
+    from app.services.urls import UrlError, channel_tab_url, normalize_url
+
+    profile = profile or get_settings().default_profile
+    _ensure_profile(profile)
+    tabs = [t for t, on in (("videos", videos), ("shorts", shorts), ("streams", streams)) if on]
+    if not tabs:
+        raise typer.BadParameter("specify at least one of --videos / --shorts / --streams")
+
+    job_ids: list[int] = []
+    with session_scope() as s:
+        stmt = select(Collection).where(Collection.type == "channel").order_by(Collection.id)
+        if limit:
+            stmt = stmt.limit(limit)
+        subs = list(s.scalars(stmt))
+        for c in subs:
+            url = c.url or (
+                f"https://www.youtube.com/channel/{c.youtube_channel_id}"
+                if c.youtube_channel_id
+                else None
+            )
+            if not url:
+                continue
+            try:
+                parsed = normalize_url(url)
+            except UrlError:
+                continue
+            for tab in tabs:
+                job = jobs_svc.create_job_for_url(
+                    s, channel_tab_url(parsed, tab), profile, max_items=(max_items or None)
+                )
+                job_ids.append(job.id)
+    typer.echo(f"Created {len(job_ids)} expand job(s) for {len(subs)} channel(s).")
+    for jid in job_ids:
+        _dispatch(jid, now)
 
 
 # --------------------------------------------------------------------------- #

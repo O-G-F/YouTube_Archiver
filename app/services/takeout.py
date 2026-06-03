@@ -25,14 +25,24 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
+from urllib.parse import parse_qs, unquote, urlparse
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.models import Job, WatchHistoryEvent, utcnow
-from app.services.urls import extract_video_id
+from app.models import (
+    Collection,
+    CollectionItem,
+    Job,
+    SearchHistoryEvent,
+    Source,
+    Video,
+    WatchHistoryEvent,
+    utcnow,
+)
+from app.services.urls import canonical_video_url, extract_video_id, is_video_id
 
 
 class TakeoutError(Exception):
@@ -58,6 +68,35 @@ class WatchEvent:
     channel_title: str | None
     watched_at: datetime | None
     raw: dict = field(default_factory=dict)
+
+
+@dataclass
+class SearchEvent:
+    query: str | None
+    searched_at: datetime | None
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass
+class Subscription:
+    channel_id: str | None
+    channel_url: str | None
+    channel_title: str | None
+
+
+@dataclass
+class PlaylistItem:
+    youtube_video_id: str
+    position: int
+    added_at: datetime | None
+
+
+@dataclass
+class TakeoutPlaylist:
+    title: str
+    playlist_id: str | None
+    file_name: str
+    items: list[PlaylistItem] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +213,104 @@ def _parse_html_time(chunk: str) -> datetime | None:
             except ValueError:
                 continue
     return None
+
+
+_SEARCH_PREFIXES = ("Searched for ",)
+_SEARCH_SUFFIX_RE = re.compile(r"\s*(を検索しました|を検索)\s*$")
+_UC_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+
+
+def _clean_search_query(title: str | None, url: str | None) -> str | None:
+    if title:
+        t = title.strip()
+        for pref in _SEARCH_PREFIXES:
+            if t.startswith(pref):
+                t = t[len(pref):]
+                break
+        t = _SEARCH_SUFFIX_RE.sub("", t).strip()
+        if t:
+            return t[:512]
+    if url:
+        q = parse_qs(urlparse(url).query).get("search_query")
+        if q and q[0]:
+            return unquote(q[0])[:512]
+    return None
+
+
+def parse_search_history_json(entries: list[dict]) -> Iterator[SearchEvent]:
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        yield SearchEvent(
+            query=_clean_search_query(e.get("title"), e.get("titleUrl")),
+            searched_at=_parse_iso_time(e.get("time")),
+            raw=e,
+        )
+
+
+def parse_subscriptions_csv(text: str) -> Iterator[Subscription]:
+    rows = list(csv.reader(io.StringIO(text)))
+    for row in rows[1:]:  # skip header
+        if not row or not any(c.strip() for c in row):
+            continue
+        cells = [c.strip() for c in row]
+        cid = cells[0] if cells and _UC_RE.match(cells[0]) else None
+        if cid is None:
+            cid = next((c for c in cells if _UC_RE.match(c)), None)
+        url = next((c for c in cells if c.lower().startswith("http")), None)
+        title = cells[2] if len(cells) >= 3 else None
+        if cid and not url:
+            url = f"https://www.youtube.com/channel/{cid}"
+        if cid or title:
+            yield Subscription(channel_id=cid, channel_url=url, channel_title=title or None)
+
+
+def _playlist_title_from_filename(name: str) -> str:
+    base = name.rsplit("/", 1)[-1]
+    base = re.sub(r"\.csv$", "", base, flags=re.IGNORECASE)
+    base = re.sub(r"\s*の動画$", "", base)            # ja: "<title> の動画"
+    base = re.sub(r"[-\s]videos$", "", base, flags=re.IGNORECASE)  # en: "<title>-videos"
+    return base.strip()
+
+
+def parse_playlist_items_csv(text: str) -> Iterator[PlaylistItem]:
+    rows = list(csv.reader(io.StringIO(text)))
+    pos = 0
+    for row in rows[1:]:  # skip header
+        if not row:
+            continue
+        vid = row[0].strip()
+        if not is_video_id(vid):
+            continue
+        added = _parse_iso_time(row[1]) if len(row) > 1 else None
+        yield PlaylistItem(youtube_video_id=vid, position=pos, added_at=added)
+        pos += 1
+
+
+def parse_playlist_index_csv(text: str) -> dict[str, str | None]:
+    """Return {playlist_title: playlist_id} from the playlists index CSV."""
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return {}
+    header = rows[0]
+    title_col = None
+    for i, h in enumerate(header):
+        if "タイトル" in h or "title" in h.lower():
+            title_col = i
+            break
+    index: dict[str, str | None] = {}
+    for row in rows[1:]:
+        if not row:
+            continue
+        pid = row[0].strip() if row else None
+        title = (
+            row[title_col].strip()
+            if title_col is not None and len(row) > title_col
+            else None
+        )
+        if title:
+            index[title] = pid or None
+    return index
 
 
 def parse_watch_history_html(html: str) -> Iterator[WatchEvent]:
@@ -309,6 +446,40 @@ class TakeoutArchive:
             elif f.format == "html":
                 yield from parse_watch_history_html(self._read_text(f.name))
 
+    def iter_search_events(self) -> Iterator[SearchEvent]:
+        for f in self.list_files():
+            if f.kind != "search_history" or f.format != "json":
+                continue
+            data = json.loads(self._read_text(f.name))
+            if isinstance(data, list):
+                yield from parse_search_history_json(data)
+
+    def iter_subscriptions(self) -> Iterator[Subscription]:
+        for f in self.list_files():
+            if f.kind != "subscriptions":
+                continue
+            yield from parse_subscriptions_csv(self._read_text(f.name))
+
+    def _playlist_index(self) -> dict[str, str | None]:
+        index: dict[str, str | None] = {}
+        for f in self.list_files():
+            if f.kind == "playlists_index":
+                index.update(parse_playlist_index_csv(self._read_text(f.name)))
+        return index
+
+    def iter_playlists(self, *, limit_items: int | None = None) -> Iterator[TakeoutPlaylist]:
+        index = self._playlist_index()
+        for f in self.list_files():
+            if f.kind != "playlist":
+                continue
+            title = _playlist_title_from_filename(f.name)
+            items = list(parse_playlist_items_csv(self._read_text(f.name)))
+            if limit_items is not None:
+                items = items[:limit_items]
+            yield TakeoutPlaylist(
+                title=title, playlist_id=index.get(title), file_name=f.name, items=items
+            )
+
     def preview(self, sample: int = 5) -> dict:
         files = self.list_files()
         counts = {
@@ -335,6 +506,9 @@ class TakeoutArchive:
                 warnings.append(f"{f.name}: {exc}")
 
         samples: list[dict] = []
+        search_samples: list[str] = []
+        subscription_samples: list[dict] = []
+        playlist_samples: list[dict] = []
         try:
             for ev in self.iter_watch_events():
                 samples.append(
@@ -347,9 +521,32 @@ class TakeoutArchive:
                 )
                 if len(samples) >= sample:
                     break
+            for sev in self.iter_search_events():
+                if sev.query:
+                    search_samples.append(sev.query)
+                if len(search_samples) >= sample:
+                    break
+            for sub in self.iter_subscriptions():
+                subscription_samples.append(
+                    {"channel_id": sub.channel_id, "channel_title": sub.channel_title}
+                )
+                if len(subscription_samples) >= sample:
+                    break
+            for pl in self.iter_playlists():
+                playlist_samples.append(
+                    {"title": pl.title, "playlist_id": pl.playlist_id, "item_count": len(pl.items)}
+                )
+                if len(playlist_samples) >= sample:
+                    break
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"sample parse: {exc}")
 
+        importable = {
+            "watch_history": counts["watch_history_count"] > 0,
+            "search_history": counts["search_history_count"] > 0,
+            "subscriptions": counts["subscriptions_count"] > 0,
+            "playlists": counts["playlists_count"] > 0,
+        }
         return {
             "files": [
                 {"name": f.name, "kind": f.kind, "format": f.format, "size": f.size}
@@ -357,6 +554,10 @@ class TakeoutArchive:
             ],
             **counts,
             "samples": samples,
+            "search_samples": search_samples,
+            "subscription_samples": subscription_samples,
+            "playlist_samples": playlist_samples,
+            "importable": importable,
             "warnings": warnings,
         }
 
@@ -440,40 +641,243 @@ def import_watch_history(
     }
 
 
-def run_import(
+def import_search_history(
+    session: Session, archive: TakeoutArchive, *, limit: int | None = None, dry_run: bool = False
+) -> dict:
+    """Import search events into ``search_history_events`` with dedup."""
+    existing: set[tuple] = set()
+    for q, sa in session.execute(
+        select(SearchHistoryEvent.query, SearchHistoryEvent.searched_at).where(
+            SearchHistoryEvent.source == "takeout"
+        )
+    ):
+        existing.add(((q or "")[:512], sa.isoformat() if sa else ""))
+
+    imported = skipped = failed = scanned = 0
+    seen: set[tuple] = set()
+    for ev in archive.iter_search_events():
+        if limit is not None and scanned >= limit:
+            break
+        scanned += 1
+        if not ev.query:
+            failed += 1
+            continue
+        key = (ev.query[:512], ev.searched_at.isoformat() if ev.searched_at else "")
+        if key in existing or key in seen:
+            skipped += 1
+            continue
+        seen.add(key)
+        if not dry_run:
+            session.add(
+                SearchHistoryEvent(
+                    source="takeout",
+                    query=ev.query,
+                    searched_at=ev.searched_at,
+                    raw_json=ev.raw,
+                )
+            )
+        imported += 1
+    if not dry_run:
+        session.flush()
+    return {
+        "imported_count": imported,
+        "skipped_duplicate_count": skipped,
+        "failed_count": failed,
+        "scanned": scanned,
+        "warnings": [],
+    }
+
+
+def import_subscriptions(
+    session: Session, archive: TakeoutArchive, *, limit: int | None = None, dry_run: bool = False
+) -> dict:
+    """Import subscribed channels as Collections (type=channel, disabled)."""
+    src = session.scalar(
+        select(Source).where(
+            Source.type == "channel_subscription", Source.api_source == "takeout"
+        )
+    )
+    if src is None and not dry_run:
+        src = Source(type="channel_subscription", api_source="takeout", name="Takeout subscriptions")
+        session.add(src)
+        session.flush()
+
+    existing = {
+        c for c in session.scalars(
+            select(Collection.youtube_channel_id).where(Collection.type == "channel")
+        ) if c
+    }
+    imported = skipped = failed = scanned = 0
+    seen: set[str] = set()
+    for sub in archive.iter_subscriptions():
+        if limit is not None and scanned >= limit:
+            break
+        scanned += 1
+        cid = sub.channel_id
+        dkey = cid or sub.channel_url or sub.channel_title
+        if not dkey:
+            failed += 1
+            continue
+        if (cid and cid in existing) or dkey in seen:
+            skipped += 1
+            continue
+        seen.add(dkey)
+        if not dry_run:
+            url = f"https://www.youtube.com/channel/{cid}" if cid else sub.channel_url
+            session.add(
+                Collection(
+                    source_id=src.id if src else None,
+                    type="channel",
+                    youtube_channel_id=cid,
+                    title=sub.channel_title,
+                    url=url,
+                    enabled=False,
+                    crawl_policy="manual",
+                )
+            )
+        imported += 1
+    if not dry_run:
+        session.flush()
+    return {
+        "imported_count": imported,
+        "skipped_duplicate_count": skipped,
+        "failed_count": failed,
+        "scanned": scanned,
+        "warnings": [],
+    }
+
+
+def _find_or_create_video(session: Session, vid: str) -> tuple[Video, bool]:
+    v = session.scalar(select(Video).where(Video.youtube_video_id == vid))
+    if v is None:
+        v = Video(youtube_video_id=vid, url=canonical_video_url(vid), first_seen_at=utcnow())
+        session.add(v)
+        session.flush()
+        return v, True
+    return v, False
+
+
+def import_playlists(
+    session: Session,
+    archive: TakeoutArchive,
+    *,
+    limit_playlists: int | None = None,
+    limit_items: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Import Takeout playlists as Collections (type=takeout_playlist) + items + Video stubs."""
+    src = session.scalar(
+        select(Source).where(
+            Source.type == "takeout_playlists", Source.api_source == "takeout"
+        )
+    )
+    if src is None and not dry_run:
+        src = Source(type="takeout_playlists", api_source="takeout", name="Takeout playlists")
+        session.add(src)
+        session.flush()
+
+    existing_coll = {
+        c.url: c
+        for c in session.scalars(select(Collection).where(Collection.type == "takeout_playlist"))
+    }
+    playlists_imported = items_imported = items_skipped = videos_created = scanned_playlists = 0
+
+    for pl in archive.iter_playlists(limit_items=limit_items):
+        if limit_playlists is not None and scanned_playlists >= limit_playlists:
+            break
+        scanned_playlists += 1
+        url = f"takeout:playlist:{pl.playlist_id or pl.title}"
+        coll = existing_coll.get(url)
+        if coll is None:
+            playlists_imported += 1
+            if not dry_run:
+                coll = Collection(
+                    source_id=src.id if src else None,
+                    type="takeout_playlist",
+                    title=pl.title,
+                    url=url,
+                    youtube_playlist_id=pl.playlist_id,
+                    enabled=False,
+                    crawl_policy="manual",
+                )
+                session.add(coll)
+                session.flush()
+                existing_coll[url] = coll
+
+        coll_id = coll.id if coll is not None else None
+        existing_items: set[str] = set()
+        if coll_id is not None:
+            existing_items = set(
+                session.scalars(
+                    select(CollectionItem.youtube_video_id).where(
+                        CollectionItem.collection_id == coll_id
+                    )
+                )
+            )
+        for it in pl.items:
+            if it.youtube_video_id in existing_items:
+                items_skipped += 1
+                continue
+            existing_items.add(it.youtube_video_id)
+            items_imported += 1
+            if not dry_run:
+                video, created = _find_or_create_video(session, it.youtube_video_id)
+                if created:
+                    videos_created += 1
+                session.add(
+                    CollectionItem(
+                        collection_id=coll_id,
+                        youtube_video_id=it.youtube_video_id,
+                        video_id=video.id,
+                        position=it.position,
+                        discovered_at=utcnow(),
+                        last_seen_at=utcnow(),
+                        raw_json={"added_at": it.added_at.isoformat() if it.added_at else None},
+                    )
+                )
+    if not dry_run:
+        session.flush()
+    return {
+        "playlists_imported": playlists_imported,
+        "items_imported": items_imported,
+        "items_skipped": items_skipped,
+        "videos_created": videos_created,
+        "scanned_playlists": scanned_playlists,
+        "warnings": [],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Job-wrapped runners
+# --------------------------------------------------------------------------- #
+def _run_with_job(
     session: Session,
     settings: Settings,
     path: str,
-    *,
-    limit: int | None = None,
-    dry_run: bool = False,
+    kind: str,
+    importer: Callable[[TakeoutArchive], dict],
+    dry_run: bool,
 ) -> dict:
-    """Resolve + open the archive, record a job, and import watch history."""
     zip_path = resolve_takeout_path(settings, path)
-
     job: Job | None = None
     if not dry_run:
         job = Job(
             type="takeout_import",
             status="running",
             started_at=utcnow(),
-            meta={"file": zip_path.name, "limit": limit},
+            meta={"file": zip_path.name, "kind": kind},
         )
         session.add(job)
         session.flush()
-
     try:
         with open_archive(zip_path) as archive:
-            result = import_watch_history(
-                session, archive, limit=limit, dry_run=dry_run
-            )
+            result = importer(archive)
     except TakeoutError:
         if job is not None:
             job.status = "failed"
             job.finished_at = utcnow()
             session.flush()
         raise
-
     result["dry_run"] = dry_run
     if job is not None:
         job.status = "success"
@@ -481,13 +885,80 @@ def run_import(
         job.progress = 100.0
         job.meta = {
             **(job.meta or {}),
-            "imported_count": result["imported_count"],
-            "skipped_duplicate_count": result["skipped_duplicate_count"],
-            "failed_count": result["failed_count"],
-            "scanned": result["scanned"],
+            **{k: v for k, v in result.items() if isinstance(v, int)},
         }
         session.flush()
         result["job_id"] = job.id
     else:
         result["job_id"] = None
     return result
+
+
+def run_import(
+    session: Session, settings: Settings, path: str, *, limit: int | None = None, dry_run: bool = False
+) -> dict:
+    """Import watch history (Phase 3A)."""
+    return _run_with_job(
+        session, settings, path, "watch_history",
+        lambda a: import_watch_history(session, a, limit=limit, dry_run=dry_run), dry_run,
+    )
+
+
+def run_import_search(
+    session: Session, settings: Settings, path: str, *, limit: int | None = None, dry_run: bool = False
+) -> dict:
+    return _run_with_job(
+        session, settings, path, "search_history",
+        lambda a: import_search_history(session, a, limit=limit, dry_run=dry_run), dry_run,
+    )
+
+
+def run_import_subscriptions(
+    session: Session, settings: Settings, path: str, *, limit: int | None = None, dry_run: bool = False
+) -> dict:
+    return _run_with_job(
+        session, settings, path, "subscriptions",
+        lambda a: import_subscriptions(session, a, limit=limit, dry_run=dry_run), dry_run,
+    )
+
+
+def run_import_playlists(
+    session: Session,
+    settings: Settings,
+    path: str,
+    *,
+    limit_playlists: int | None = None,
+    limit_items: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    return _run_with_job(
+        session, settings, path, "playlists",
+        lambda a: import_playlists(
+            session, a, limit_playlists=limit_playlists, limit_items=limit_items, dry_run=dry_run
+        ),
+        dry_run,
+    )
+
+
+def run_import_all(
+    session: Session,
+    settings: Settings,
+    path: str,
+    *,
+    limit_watch: int | None = None,
+    limit_search: int | None = None,
+    limit_subscriptions: int | None = None,
+    limit_playlists: int | None = None,
+    limit_items: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Run all Takeout imports in order, returning per-kind results."""
+    return {
+        "watch_history": run_import(session, settings, path, limit=limit_watch, dry_run=dry_run),
+        "search_history": run_import_search(session, settings, path, limit=limit_search, dry_run=dry_run),
+        "subscriptions": run_import_subscriptions(session, settings, path, limit=limit_subscriptions, dry_run=dry_run),
+        "playlists": run_import_playlists(
+            session, settings, path, limit_playlists=limit_playlists, limit_items=limit_items, dry_run=dry_run
+        ),
+        "dry_run": dry_run,
+    }

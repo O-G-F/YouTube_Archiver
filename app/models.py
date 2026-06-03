@@ -370,6 +370,21 @@ class WatchHistoryEvent(Base):
     raw_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
+class SearchHistoryEvent(Base):
+    __tablename__ = "search_history_events"
+    __table_args__ = (
+        UniqueConstraint("source", "query", "searched_at", name="uq_search_event"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    # Personal data; query is index-bounded (truncated) to stay btree-safe.
+    query: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    searched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    raw_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class DiaryEntry(Base):
     __tablename__ = "diary_entries"
 

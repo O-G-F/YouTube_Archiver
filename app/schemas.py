@@ -260,6 +260,17 @@ class TakeoutPreviewRequest(BaseModel):
     path: str
 
 
+class SubscriptionSampleOut(BaseModel):
+    channel_id: str | None = None
+    channel_title: str | None = None
+
+
+class PlaylistSampleOut(BaseModel):
+    title: str
+    playlist_id: str | None = None
+    item_count: int = 0
+
+
 class TakeoutPreviewOut(BaseModel):
     path: str
     files: list[TakeoutFileOut] = Field(default_factory=list)
@@ -269,6 +280,10 @@ class TakeoutPreviewOut(BaseModel):
     subscriptions_count: int = 0
     playlists_count: int = 0
     samples: list[TakeoutSampleOut] = Field(default_factory=list)
+    search_samples: list[str] = Field(default_factory=list)
+    subscription_samples: list[SubscriptionSampleOut] = Field(default_factory=list)
+    playlist_samples: list[PlaylistSampleOut] = Field(default_factory=list)
+    importable: dict = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -313,3 +328,93 @@ class WatchHistoryStatsOut(BaseModel):
     earliest: datetime | None = None
     latest: datetime | None = None
     top_channels: list[ChannelCount] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3B: search history / subscriptions / playlists
+# --------------------------------------------------------------------------- #
+class SearchHistoryEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    source: str | None = None
+    query: str | None = None
+    searched_at: datetime | None = None
+    raw_json: dict | None = None  # only when include_raw=true
+
+
+class QueryCount(BaseModel):
+    query: str | None = None
+    count: int
+
+
+class SearchHistoryStatsOut(BaseModel):
+    total: int
+    distinct_queries: int
+    earliest: datetime | None = None
+    latest: datetime | None = None
+    top_queries: list[QueryCount] = Field(default_factory=list)
+
+
+class SubscriptionOut(BaseModel):
+    id: int
+    channel_id: str | None = None
+    channel_title: str | None = None
+    url: str | None = None
+    enabled: bool = False
+
+
+class PlaylistsImportOut(BaseModel):
+    playlists_imported: int
+    items_imported: int
+    items_skipped: int
+    videos_created: int
+    scanned_playlists: int
+    dry_run: bool
+    job_id: int | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TakeoutImportPlaylistsRequest(BaseModel):
+    path: str
+    limit_playlists: int | None = None
+    limit_items: int | None = None
+    dry_run: bool = False
+
+
+class TakeoutImportAllRequest(BaseModel):
+    path: str
+    limit_watch: int | None = None
+    limit_search: int | None = None
+    limit_subscriptions: int | None = None
+    limit_playlists: int | None = None
+    limit_items: int | None = None
+    dry_run: bool = False
+
+
+class TakeoutImportAllOut(BaseModel):
+    watch_history: TakeoutImportOut
+    search_history: TakeoutImportOut
+    subscriptions: TakeoutImportOut
+    playlists: PlaylistsImportOut
+    dry_run: bool
+
+
+class SubscriptionEnqueueRequest(BaseModel):
+    videos: bool = False
+    shorts: bool = False
+    streams: bool = False
+    profile: str | None = None
+    max_items: int | None = None
+    limit: int | None = None  # max channels to enqueue (safety)
+
+
+class SubscriptionEnqueueOut(BaseModel):
+    channels: int
+    jobs_created: int
+    job_ids: list[int] = Field(default_factory=list)
+
+
+class TakeoutPlaylistsPreviewOut(BaseModel):
+    path: str
+    playlists: list[PlaylistSampleOut] = Field(default_factory=list)
