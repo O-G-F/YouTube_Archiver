@@ -16,6 +16,7 @@ Key invariants:
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from sqlalchemy import select
@@ -23,25 +24,19 @@ from sqlalchemy import select
 from app.config import Settings, get_settings
 from app.db import session_scope
 from app.logging_setup import get_logger
-from app.models import (
-    Collection,
-    CollectionItem,
-    Job,
-    MetadataSnapshot,
-    Source,
-    Video,
-    utcnow,
-)
+from app.models import Job, MetadataSnapshot, Video, utcnow
+from app.services import expand as expand_svc
 from app.services import jobs as jobs_svc
 from app.services import storage
 from app.services.command_builder import download_build_context, external_ctx
 from app.services.ingest import (
     ingest_comments_from_info,
+    link_collection_items,
     register_outputs,
     upsert_video_from_info,
 )
 from app.services.profiles import BuildContext, build_ytdlp_args, get_profile_spec
-from app.services.urls import canonical_video_url, is_video_id, normalize_url
+from app.services.urls import canonical_video_url, normalize_url
 from app.services.ytdlp import extract_info, run_ytdlp
 
 logger = get_logger(__name__)
@@ -85,6 +80,11 @@ def run_job(job_id: int) -> None:
 # download
 # --------------------------------------------------------------------------- #
 def _run_download(settings: Settings, job_id: int) -> None:
+    # Rate control: space out consecutive download jobs on a single worker so a
+    # large expand does not hammer YouTube (helps avoid HTTP 429).
+    if settings.download_job_delay_seconds and settings.download_job_delay_seconds > 0:
+        time.sleep(settings.download_job_delay_seconds)
+
     with session_scope() as s:
         job = s.get(Job, job_id)
         url = job.url
@@ -146,6 +146,8 @@ def _run_download(settings: Settings, job_id: int) -> None:
         # writes info.json / description / subtitles before failing on one item
         # (e.g. a single subtitle language 429ing). This drives partial_success.
         counts = register_outputs(s, video, out_dir, profile_name, settings)
+        # Link any collection_items that reference this video id (Phase 2B).
+        link_collection_items(s, video)
         flags = spec.resolved_flags()
         if video.raw_info_json_path:
             disk_info = _load_json(
@@ -158,24 +160,29 @@ def _run_download(settings: Settings, job_id: int) -> None:
                     logger.info("download: comments %s", summary)
 
         produced = sum(counts.values()) > 0
+        err_tail = _tail(run.stderr_path)
+        rate_limited = ("HTTP Error 429" in err_tail) or ("Too Many Requests" in err_tail)
         if run.ok:
             jobs_svc.mark_success(s, job)
             logger.info("download: job %s success (%s)", job_id, youtube_video_id)
         elif produced:
-            jobs_svc.mark_partial_success(
-                s,
-                job,
-                f"yt-dlp exited {run.returncode} but partial outputs were saved. "
-                f"{_tail(run.stderr_path)}",
-            )
+            note = f"yt-dlp exited {run.returncode} but partial outputs were saved. {err_tail}"
+            jobs_svc.mark_partial_success(s, job, note)
+            if rate_limited:
+                job.meta = {**(job.meta or {}), "retryable": True, "reason": "http_429"}
             logger.warning("download: job %s PARTIAL rc=%s", job_id, run.returncode)
         else:
-            jobs_svc.mark_failed(
-                s,
-                job,
-                f"yt-dlp exited {run.returncode}\n{_tail(run.stderr_path)}",
+            jobs_svc.mark_failed(s, job, f"yt-dlp exited {run.returncode}\n{err_tail}")
+            # 429 with no output is a transient rate-limit: flag as retryable so
+            # `archiver jobs retry` / the next crawl re-attempts it.
+            if rate_limited:
+                job.meta = {**(job.meta or {}), "retryable": True, "reason": "http_429"}
+            logger.warning(
+                "download: job %s failed rc=%s rate_limited=%s",
+                job_id,
+                run.returncode,
+                rate_limited,
             )
-            logger.warning("download: job %s failed rc=%s", job_id, run.returncode)
 
 
 # --------------------------------------------------------------------------- #
@@ -186,80 +193,58 @@ def _run_expand(settings: Settings, job_id: int) -> None:
         job = s.get(Job, job_id)
         url = job.url
         profile_name = job.profile_name or settings.default_profile
+        meta_in = job.meta or {}
+        override = meta_in.get("max_items")
+        detect_removed = bool(meta_in.get("detect_removed", True))
         jobs_svc.mark_running(s, job)
 
-    parsed = normalize_url(url)
-    info = extract_info(url, flat=True, settings=settings)
-    entries = [e for e in (info.get("entries") or []) if e]
-    total = len(entries)
+    cap = override if isinstance(override, int) and override > 0 else settings.expand_max_items
+    log_dir = storage.job_log_dir(settings, job_id)
 
-    cap = settings.expand_max_items
-    if cap and cap > 0 and total > cap:
-        logger.warning(
-            "expand: capping to %d of %d entries (EXPAND_MAX_ITEMS=%d)", cap, total, cap
-        )
-        entries = entries[:cap]
+    # Flat extraction (subprocess -> command.txt/stdout/stderr in log_dir).
+    try:
+        info, entries, capped = expand_svc.flat_extract(settings, url, log_dir, cap)
+    except Exception as exc:  # noqa: BLE001
+        with session_scope() as s:
+            job = s.get(Job, job_id)
+            job.log_path = storage.log_relative(settings, log_dir)
+            job.command_path = storage.log_relative(settings, log_dir / "command.txt")
+            jobs_svc.mark_failed(s, job, f"flat extraction failed: {exc}")
+        logger.warning("expand: job %s extraction failed: %s", job_id, exc)
+        return
 
     with session_scope() as s:
-        source = Source(
-            type=parsed.kind,
-            url=parsed.canonical_url,
-            name=info.get("title"),
-            api_source="manual",
+        result = expand_svc.process_entries(
+            s,
+            settings,
+            url=url,
+            info=info,
+            entries=entries,
+            capped=capped,
+            profile_name=profile_name,
+            parent_job_id=job_id,
+            detect_removed=detect_removed,
         )
-        s.add(source)
-        s.flush()
-        collection = Collection(
-            source_id=source.id,
-            type="playlist" if parsed.kind == "playlist" else "channel_videos",
-            youtube_playlist_id=parsed.playlist_id,
-            youtube_channel_id=parsed.channel_id or info.get("channel_id"),
-            title=info.get("title"),
-            url=parsed.canonical_url,
-        )
-        s.add(collection)
-        s.flush()
-        collection_id = collection.id
-
-    child_ids: list[int] = []
-    skipped = 0
-    with session_scope() as s:
-        for pos, entry in enumerate(entries):
-            vid = entry.get("id")
-            if not is_video_id(vid):
-                skipped += 1
-                continue
-            s.add(
-                CollectionItem(
-                    collection_id=collection_id,
-                    youtube_video_id=vid,
-                    position=pos,
-                    last_seen_at=utcnow(),
-                    raw_json={
-                        k: entry.get(k)
-                        for k in ("id", "title", "url", "ie_key", "_type")
-                    },
-                )
-            )
-            child = jobs_svc.create_download_child_job(
-                s, vid, profile_name, parent_job_id=job_id, collection_id=collection_id
-            )
-            child_ids.append(child.id)
+        job = s.get(Job, job_id)
+        job.collection_id = result.collection_id
+        job.log_path = storage.log_relative(settings, log_dir)
+        job.command_path = storage.log_relative(settings, log_dir / "command.txt")
+        job.meta = {**(job.meta or {}), **result.as_meta()}
+        child_ids = list(result.child_job_ids)
+        jobs_svc.mark_success(s, job)
 
     submitted = _submit_children(child_ids)
-
-    with session_scope() as s:
-        job = s.get(Job, job_id)
-        job.collection_id = collection_id
-        jobs_svc.mark_success(s, job)
     logger.info(
-        "expand: job %s -> %d entries, %d children enqueued (%d submitted to RQ), "
-        "%d skipped (non-video)",
+        "expand: job %s collection=%s discovered=%d created=%d skipped_existing=%d "
+        "removed=%d capped=%s submitted_to_rq=%d",
         job_id,
-        total,
-        len(child_ids),
+        result.collection_id,
+        result.discovered_count,
+        result.created_jobs_count,
+        result.skipped_existing_count,
+        result.removed_count,
+        result.capped,
         submitted,
-        skipped,
     )
 
 
@@ -309,6 +294,7 @@ def _run_metadata_refresh(settings: Settings, job_id: int) -> None:
         default_sub_langs=settings.default_sub_langs,
         archive_sub_langs=settings.archive_sub_langs,
         max_comments=settings.ytdlp_max_comments,
+        retry_sleep=settings.ytdlp_retry_backoff_seconds,
         **external_ctx(settings),
     )
     argv = build_ytdlp_args(spec, ctx)

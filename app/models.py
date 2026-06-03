@@ -95,6 +95,10 @@ class CollectionItem(Base):
     __tablename__ = "collection_items"
     __table_args__ = (
         UniqueConstraint("collection_id", "video_id", name="uq_collection_video"),
+        # Phase 2B: DB-level dedup on the external id (the field expand populates).
+        UniqueConstraint(
+            "collection_id", "youtube_video_id", name="uq_collection_youtube_video"
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -332,6 +336,9 @@ class Job(Base):
     # Directory holding stdout/stderr/command logs (relative to LOG_ROOT).
     log_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     command_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Free-form job inputs (e.g. expand max_items) and results
+    # (e.g. discovered_count / created_jobs_count / skipped_existing_count).
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow, onupdate=utcnow

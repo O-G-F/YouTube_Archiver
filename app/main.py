@@ -12,7 +12,17 @@ from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
 from app import __version__
-from app.api import archive, doctor, health, jobs, profiles, videos
+from app.api import (
+    archive,
+    collections,
+    doctor,
+    health,
+    jobs,
+    profiles,
+    scheduler,
+    sources,
+    videos,
+)
 from app.bootstrap import startup_bootstrap
 from app.logging_setup import setup_logging
 
@@ -35,6 +45,9 @@ app = FastAPI(
 app.include_router(health.router)
 app.include_router(doctor.router)
 app.include_router(archive.router)
+app.include_router(sources.router)
+app.include_router(collections.router)
+app.include_router(scheduler.router)
 app.include_router(jobs.router)
 app.include_router(profiles.router)
 app.include_router(videos.router)

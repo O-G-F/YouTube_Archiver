@@ -13,11 +13,12 @@ from app.schemas import (
     ArchiveUrlRequest,
     BatchItemResult,
     BatchResult,
+    ExpandRequest,
     JobOut,
 )
 from app.services import jobs as jobs_svc
 from app.services.profiles import get_profile_spec
-from app.services.urls import UrlError
+from app.services.urls import UrlError, normalize_url
 
 router = APIRouter(prefix="/api/archive", tags=["archive"])
 logger = get_logger(__name__)
@@ -60,6 +61,22 @@ def archive_url(req: ArchiveUrlRequest, db: Session = Depends(get_db)) -> JobOut
 @router.post("/current-tab", response_model=JobOut, status_code=201)
 def archive_current_tab(req: ArchiveUrlRequest, db: Session = Depends(get_db)) -> JobOut:
     return archive_url(req, db)
+
+
+@router.post("/expand", response_model=JobOut, status_code=201)
+def archive_expand(req: ExpandRequest, db: Session = Depends(get_db)) -> JobOut:
+    """Create an expand job for a playlist / channel(-tab) URL."""
+    profile = _resolve_profile(db, req.profile)
+    try:
+        parsed = normalize_url(req.url)
+    except UrlError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if parsed.kind not in ("playlist", "channel"):
+        raise HTTPException(
+            status_code=400, detail="not an expandable (playlist/channel) URL"
+        )
+    job = jobs_svc.create_and_submit(db, req.url, profile, max_items=req.max_items)
+    return JobOut.model_validate(_get_job(db, job.id))
 
 
 @router.post("/batch", response_model=BatchResult)

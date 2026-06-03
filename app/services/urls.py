@@ -214,6 +214,77 @@ def _with_tab(base: str, tab: str | None) -> str:
     return f"{base}/{tab}" if tab else base
 
 
+# Channel tab -> collection type (DB ``collections.type``).
+_TAB_TO_COLLECTION = {
+    "videos": "channel_videos",
+    "shorts": "channel_shorts",
+    "streams": "channel_streams",
+}
+
+
+def classify(raw_url: str) -> str:
+    """Fine-grained classification string.
+
+    One of: ``video``, ``playlist``, ``channel``, ``channel_videos``,
+    ``channel_shorts``, ``channel_streams``, ``unknown``. ``channel`` is the
+    root/ambiguous channel page; the tab-specific forms come from /videos,
+    /shorts, /streams.
+    """
+    try:
+        parsed = normalize_url(raw_url)
+    except UrlError:
+        return "unknown"
+    if parsed.kind == "channel":
+        return _TAB_TO_COLLECTION.get(parsed.channel_tab or "", "channel")
+    return parsed.kind
+
+
+def collection_type_for(parsed: ParsedUrl) -> str:
+    """Collection type to store in the DB for an expandable URL.
+
+    A bare channel root is treated as ``channel_videos`` (its uploads tab).
+    """
+    if parsed.kind == "playlist":
+        return "playlist"
+    if parsed.kind == "channel":
+        return _TAB_TO_COLLECTION.get(parsed.channel_tab or "", "channel_videos")
+    return parsed.kind
+
+
+def channel_tab_url(parsed: ParsedUrl, tab: str) -> str:
+    """Build the URL for a specific tab of a channel (drops any existing tab)."""
+    base = parsed.canonical_url
+    if parsed.channel_tab:
+        base = base.rsplit("/", 1)[0]
+    return f"{base}/{tab}"
+
+
+_CRAWLABLE_TABS = ("videos", "shorts", "streams")
+
+
+def resolve_channel_tabs(
+    parsed: ParsedUrl, videos: bool, shorts: bool, streams: bool
+) -> list[str]:
+    """Decide which channel tabs to crawl.
+
+    - Explicit flags win.
+    - No flags but the URL already targets a crawlable tab -> just that tab.
+    - No flags on a channel *root* URL -> error (avoid accidental full crawl).
+    """
+    tabs = [
+        t
+        for t, on in (("videos", videos), ("shorts", shorts), ("streams", streams))
+        if on
+    ]
+    if tabs:
+        return tabs
+    if parsed.channel_tab in _CRAWLABLE_TABS:
+        return [parsed.channel_tab]
+    raise UrlError(
+        "channel root URL: specify at least one of --videos / --shorts / --streams"
+    )
+
+
 def _first(values: list[str] | None) -> str | None:
     if not values:
         return None

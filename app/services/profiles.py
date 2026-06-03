@@ -248,6 +248,8 @@ class BuildContext:
     default_sub_langs: str = "ja,en"
     archive_sub_langs: str = "ja,en"
     max_comments: int = 0
+    # Seconds between yt-dlp retries (e.g. on HTTP 429). 0 = yt-dlp default.
+    retry_sleep: int = 0
     extra_args: list[str] = field(default_factory=list)
 
 
@@ -356,6 +358,10 @@ def build_ytdlp_args(spec: ProfileSpec, ctx: BuildContext) -> list[str]:
 
     if ctx.no_playlist:
         args.append("--no-playlist")
+
+    # ----- retry backoff (e.g. for HTTP 429) -----
+    if ctx.retry_sleep and ctx.retry_sleep > 0:
+        args += ["--retry-sleep", str(ctx.retry_sleep)]
 
     # ----- external tools -----
     if ctx.ffmpeg_location:

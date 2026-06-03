@@ -76,5 +76,26 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # Periodic collection re-crawl. Idle unless SCHEDULER_ENABLED=true (it still
+  # runs, but each pass is a no-op when disabled). Tunable via
+  # SCHEDULER_INTERVAL_SECONDS.
+  scheduler:
+    build: .
+    command: ["scheduler"]
+    env_file: .env
+    volumes:
+      - ${ARCHIVE_HOST_PATH:-./data/archive}:/archive
+      - ${CONFIG_HOST_PATH:-./data/config}:/config
+      - ${LOG_HOST_PATH:-./data/logs}:/logs
+      - ${TAKEOUT_HOST_PATH:-./data/takeout}:/takeout_imports
+      - ./secrets:/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
 volumes:
   pgdata:

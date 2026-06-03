@@ -15,18 +15,21 @@ YouTube の動画・メタデータ・字幕・コメントを `yt-dlp` でロ�
 
 ---
 
-## 実装済み機能（Phase 0–1）
+## 実装済み機能（Phase 0–2B）
 
-- URL 登録 → 種別判定（動画 / 再生リスト / チャンネル）→ ジョブ化
-- 7 種の組み込みダウンロードプロファイル（最高画質 mkv / 1080p / proxy mp4 / flac / opus / metadata / comments）
+- URL 登録 → 種別判定（動画 / 再生リスト / チャンネル / タブ）→ ジョブ化
+- 7 種の組み込みダウンロードプロファイル（最高画質 mkv / 1080p / proxy mp4 / flac / opus / metadata / comments）+ 全字幕版
 - `yt-dlp` を **subprocess** 実行し、**実行コマンド・stdout・stderr を分離して保存**
 - ダウンロード結果（動画・音声・サムネ・info.json・説明文・字幕・リンク）を DB に**相対パス**で登録
 - **ダウンロードジョブ**と**メタデータ更新ジョブの分離** — コメント更新時に動画本体を再取得しない（要件 4.3 / 5.5）
-- 再生リスト / チャンネル URL を子の単体ダウンロードジョブへ展開（`expand`）
-- 失敗ジョブ管理（ステータス・エラーメッセージ・再実行・キャンセル）
-- Web API（登録 / ジョブ / プロファイル / 動画一覧 / ヘルス）と CLI の両方
-- Docker Compose（web / worker / postgres / redis / migrate）
-- Alembic マイグレーション + pytest
+- **再生リスト / チャンネル展開（Phase 2A）** — flat extraction → `collections`/`collection_items` 差分検出 → 新規のみ子 download ジョブ投入
+- **再クロール・scheduler（Phase 2B）** — `crawl_policy`（manual/new_only/refresh）、`removed_at` 検出、scheduler 常駐、チャンネルルート URL のタブ自動展開、レート制御・429 retryable、DB ユニーク制約
+- 字幕は安全な許可リスト（`ja,en`、`all` は明示時のみ）、YouTube JS チャレンジ対応（`--remote-components ejs:github` + deno）、`curl_cffi` 同梱
+- 失敗ジョブ管理（ステータス・エラーメッセージ・再実行・キャンセル）+ `partial_success` / retryable
+- 運用補強（Phase 1.5）: `doctor` 診断、ジョブログ API/CLI（path traversal 対策）、profile dry-run
+- Web API（登録 / 展開 / コレクション / 再クロール / scheduler / ジョブ / プロファイル / 動画 / 診断）と CLI の両方
+- Docker Compose（web / worker / scheduler / postgres / redis / migrate）
+- Alembic マイグレーション（0001 初期 + 0002 jobs.meta + 0003 unique制約）+ pytest（123 tests）
 
 ---
 
@@ -166,6 +169,125 @@ archiver jobs list
 
 ---
 
+## Phase 2A: 再生リスト・チャンネル展開（expand）
+
+再生リスト/チャンネル URL を **flat extraction**（`yt-dlp --flat-playlist --dump-single-json --skip-download`、本体は落とさない）で動画 ID 一覧へ展開し、`collections` / `collection_items` に保存して、**新規動画のみ**子 `download` ジョブを作成します。
+
+```bash
+# 小さな再生リストを metadata_only で検証（まずはこれ）
+docker compose exec web archiver source add-playlist "https://www.youtube.com/playlist?list=XXXX" \
+  --profile metadata_only --max-items 5 --now
+
+# チャンネルのタブ別登録（タブごとに expand job）
+docker compose exec web archiver source add-channel "https://www.youtube.com/@handle" \
+  --videos --shorts --streams --profile metadata_only --max-items 20
+
+# 任意の playlist/channel URL を展開
+docker compose exec web archiver source expand "https://www.youtube.com/@handle/videos" --profile metadata_only
+
+# 結果確認
+docker compose exec web archiver jobs show 1          # meta: discovered/created/skipped/removed/capped
+docker compose exec web archiver collections list
+docker compose exec web archiver collections items 1
+```
+
+### 差分検出（diff）
+
+- 同じ URL を再展開すると **同一 collection** を再利用します（URL 正規化で突き合わせ）。
+- 既存 item は `last_seen_at` を更新。今回見つからなかった item は `removed_at` を設定（**ただし `--max-items` で打ち切った回は誤検出を避けるため removed を付けません**）。
+- 同一 collection 内で **同じ video_id を重複登録しません**。
+- 既に**有効な download ジョブ**（queued/running/success/partial_success）がある動画には**重複ジョブを作りません**（`skipped_existing_count`）。失敗ジョブのみの動画は再投入されます。
+
+### EXPAND_MAX_ITEMS（暴走防止）
+
+- env `EXPAND_MAX_ITEMS`（既定 `0` = 無制限）。正の整数なら、その件数で**抽出を打ち切り**ます（`yt-dlp -I 1:N`）。
+- ジョブ単位の一時上書きは CLI/API の `--max-items` / `max_items`（`jobs.meta.max_items` に保存）。
+- **注意**: 大規模チャンネル（数千〜数万本）を `EXPAND_MAX_ITEMS=0` で展開すると、その数だけ子 download ジョブが作られます。初回は必ず小さな playlist + `metadata_only` + `--max-items` で挙動を確認してください。
+
+### expand の結果とログ
+
+- 件数は `jobs.meta`（`discovered_count` / `created_jobs_count` / `skipped_existing_count` / `removed_count` / `capped` / `collection_id`）に記録され、`GET /api/jobs/{id}` と `archiver jobs show` で確認できます。
+- flat extraction の **`command.txt` / `yt-dlp.stdout.log`（JSON）/ `yt-dlp.stderr.log`** は通常の download ジョブと同じ場所（`LOG_ROOT/jobs/<id>/`）に保存され、失敗時は `archiver jobs logs <id> --stderr` や `GET /api/jobs/{id}/logs/stderr` で追えます。
+- YouTube 抽出でも `--remote-components ejs:github` と `--js-runtimes deno:<path>` を付与します。`--sub-langs all` は使いません。
+
+> チャンネル**ルート**URL（`/@handle`）はタブ一覧を返すことがあり、動画 ID が 0 件になる場合があります。確実に動画を取るには `/videos` `/shorts` `/streams` のタブ URL を使ってください（`add-channel` は自動でタブ URL を生成します）。
+
+---
+
+## Phase 2B: 再クロール・scheduler・レート制御
+
+### チャンネルルート URL の自動展開
+
+`add-channel` はルート URL（`/@handle` や `/channel/UC...`）を受け取り、**指定したタブだけ**を `/videos` `/shorts` `/streams` の URL に展開して expand job を作ります。**フラグなしのルート URL は誤爆防止のためエラー**になります（タブ URL を直接渡した場合はそのタブだけ実行）。
+
+```bash
+docker compose exec web archiver source add-channel "https://www.youtube.com/@handle" \
+  --videos --shorts --streams --profile metadata_only --max-items 3 --now
+docker compose exec web archiver source add-channel "https://www.youtube.com/@handle" --videos --max-items 3 --now
+# フラグなしのルート URL はエラー:
+docker compose exec web archiver source add-channel "https://www.youtube.com/@handle"   # -> error
+```
+
+### crawl_policy と再クロール
+
+各 collection は `crawl_policy` を持ちます（既定 `new_only`）。
+
+| policy | 動作 |
+|---|---|
+| `manual` | scheduler はスキップ。手動 refresh のみ |
+| `new_only` | 新規動画のみ子 download job を作成（**removed 検出なし**） |
+| `refresh` | last_seen_at 更新 + **removed_at 検出**も行う |
+
+```bash
+docker compose exec web archiver collections set-policy 1 refresh
+docker compose exec web archiver collections refresh 1 --now           # 手動再クロール（removed検出あり）
+docker compose exec web archiver collections refresh-all --now         # enabled全件（各policy尊重）
+docker compose exec web archiver collections enable 1     # / disable 1
+```
+
+API: `POST /api/collections/{id}/refresh`、`POST /api/collections/refresh-all`、`PATCH /api/collections/{id}`（`enabled`/`crawl_policy`/`profile`）。
+
+### scheduler サービス
+
+`scheduler` コンテナは常駐し、`SCHEDULER_INTERVAL_SECONDS` ごとに enabled かつ非 manual の collection へ expand job を投入します。**`SCHEDULER_ENABLED=false`（既定）の間は各パスが no-op**（ループ自体は回ります）。有効化は `.env`:
+
+```env
+SCHEDULER_ENABLED=true
+SCHEDULER_INTERVAL_SECONDS=3600
+```
+
+- 手動 1 パス: `archiver scheduler run-once`（`SCHEDULER_ENABLED` に関係なく実行）/ `POST /api/scheduler/run-once`。
+- 状態: `GET /api/scheduler/status`。
+- scheduler のログは `LOG_ROOT/scheduler/scheduler.log` に追記されます。
+- scheduler が作った job は `job.meta.scheduled_by`（`scheduler` / `manual` / `manual_refresh` 等）で識別できます。
+
+### removed_at の意味と capped
+
+- `removed_at` は「**前回までは在ったが今回の再クロールで見つからなかった**」項目に付きます（削除/非公開/限定公開などの目安）。再発見時は `removed_at` を解除し `last_seen_at` を更新します。
+- **`capped=true`（`EXPAND_MAX_ITEMS` や `--max-items` で抽出を打ち切った回）では removed_at を更新しません。** 一覧の途中までしか見ていないため、見えなかった = 削除とは限らないからです。
+
+### レート制御・429・partial_success
+
+連続投入で YouTube の HTTP 429 を誘発しにくくするための設定（`.env`）:
+
+| 設定 | 既定 | 効果 |
+|---|---|---|
+| `DOWNLOAD_JOB_DELAY_SECONDS` | `0` | 各 download job 開始前に待機（1ワーカーでも間隔を空ける） |
+| `YTDLP_RETRY_BACKOFF_SECONDS` | `0` | yt-dlp `--retry-sleep`（429 等のリトライ間隔） |
+| `MAX_CONCURRENT_DOWNLOAD_JOBS` | `1` | 想定同時数（実体は `docker compose up --scale worker=N` で調整） |
+
+- 子 download job が一部だけ取得できた場合（例: 1 言語の字幕が 429）は **`failed` ではなく `partial_success`**（取得済みは DB 登録済み・`jobs retry` 可）。
+- 出力ゼロの 429 は `failed` にしつつ **`job.meta.retryable=true` / `reason=http_429`** を記録します。`archiver jobs retry <id>` や次回の再クロールで再試行されます（failed は「有効ジョブ」に数えないため再クロールで再投入対象になります）。
+- `curl_cffi` を同梱しており、yt-dlp のブラウザ impersonation により impersonation 警告と一部 403/429 を低減します。
+
+### 大量チャンネル登録時の注意
+
+- **必ず小さく始める**: 初回は `--max-items 3` + `metadata_only` で挙動確認。
+- `EXPAND_MAX_ITEMS=0`（無制限）で巨大チャンネルを `refresh` policy + scheduler 有効にすると、毎周期で大量の子 job が生成され得ます。`EXPAND_MAX_ITEMS` と `DOWNLOAD_JOB_DELAY_SECONDS` を併用してください。
+- `collection_items` には `(collection_id, youtube_video_id)` の **DB ユニーク制約**があり、コードレベルに加え DB 側でも重複を防ぎます（migration `0003`）。
+
+---
+
 ## ストレージ構成
 
 ```
@@ -196,7 +318,13 @@ archiver download enqueue URL [--profile NAME] [--now] [--priority N]
 archiver download run [--limit N]   # キュー済みジョブをインライン実行(Redis不要)
 
 archiver source add-url URL [--profile NAME] [--now]
-archiver source add-channel URL [--videos] [--shorts] [--streams] [--profile NAME] [--now]
+archiver source add-playlist URL [--profile NAME] [--now] [--max-items N]
+archiver source add-channel URL [--videos] [--shorts] [--streams] [--profile NAME] [--now] [--max-items N]
+archiver source expand URL [--profile NAME] [--now] [--max-items N]   # playlist/channel 展開
+
+archiver collections list
+archiver collections show COLLECTION_ID
+archiver collections items COLLECTION_ID [--include-removed] [--limit N]
 
 archiver comments refresh --video-id VIDEO_ID [--profile NAME] [--now]
 archiver comments refresh-all [--limit N] [--now]
@@ -209,6 +337,15 @@ archiver jobs cancel JOB_ID
 
 archiver profiles command PROFILE URL             # dry-run: 実行せずコマンドだけ表示
 archiver doctor                                   # 環境診断（書込/ツール/DB/Redis）
+
+# --- Phase 2B: 再クロール / scheduler ---
+archiver collections refresh COLLECTION_ID [--now] [--max-items N]   # 1件再クロール（removed検出あり）
+archiver collections refresh-all [--now] [--max-items N]            # enabled全件（policy尊重）
+archiver collections enable COLLECTION_ID
+archiver collections disable COLLECTION_ID
+archiver collections set-policy COLLECTION_ID new_only|refresh|manual
+archiver scheduler run-once [--max-items N]        # 1パスだけ実行（SCHEDULER_ENABLED無関係）
+archiver scheduler run                             # ループ常駐（scheduler コンテナが使用）
 ```
 
 > macOS でローカルに `archiver worker` を使うと fork 由来の問題が出る場合があります。ローカル確認では `--now` / `download run` のインライン実行を推奨します。Docker（Linux）では worker が正常動作します。
@@ -224,6 +361,18 @@ archiver doctor                                   # 環境診断（書込/ツー
 | POST | `/api/archive/url` | URL を 1 件登録（`{"url","profile","priority"}`） |
 | POST | `/api/archive/current-tab` | 同上（ブラウザ拡張/ブックマークレット用、要件 5.1.4） |
 | POST | `/api/archive/batch` | URL を複数登録（`{"urls":[...],"profile"}`） |
+| POST | `/api/archive/expand` | playlist/channel を展開（`{"url","profile","max_items"}`） |
+| POST | `/api/sources/playlist` | 再生リスト登録（`{"url","profile","max_items"}`） |
+| POST | `/api/sources/channel` | チャンネル登録（`{"url","videos","shorts","streams","profile","max_items"}` → タブ毎に expand job） |
+| GET | `/api/collections` | コレクション一覧（item_count 付き） |
+| GET | `/api/collections/{id}` | コレクション詳細 |
+| GET | `/api/collections/{id}/items` | アイテム一覧（`?include_removed=&limit=&offset=`） |
+| POST | `/api/collections/{id}/refresh` | 1件再クロール（`?max_items=`） |
+| POST | `/api/collections/refresh-all` | enabled 全件を再クロール |
+| POST | `/api/collections/{id}/enable` ・ `/disable` | scheduler 対象の有効/無効 |
+| PATCH | `/api/collections/{id}` | `{"enabled","crawl_policy","profile"}` を更新 |
+| GET | `/api/scheduler/status` | scheduler 設定と対象数 |
+| POST | `/api/scheduler/run-once` | 手動で1パス実行 |
 | GET | `/api/doctor` | 環境診断（書込可否 / ツール版 / DB / Redis） |
 | GET | `/api/jobs` | ジョブ一覧（`?status=&type=&limit=&offset=`） |
 | GET | `/api/jobs/{id}` | ジョブ詳細（status/error/ログパス/出力先/動画/profile） |
@@ -318,8 +467,11 @@ docker compose exec web archiver jobs retry 1       # failed/partial_success を
 live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_events, diary_entries`。
 
 - PostgreSQL: **Alembic** で管理（`alembic upgrade head`）。Docker の `migrate` サービスが自動実行。
+  - `0001` 初期スキーマ（全13テーブル）
+  - `0002` `jobs.meta`（expand の入力 `max_items` と結果カウント・scheduler タグを保持する JSON 列）
+  - `0003` `collection_items` に `(collection_id, youtube_video_id)` のユニーク制約（重複防止。既存重複は migration 内で安全に dedup）
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
-- 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。
+- 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 
 マイグレーション生成（モデル変更時）:
 

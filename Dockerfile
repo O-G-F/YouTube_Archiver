@@ -27,10 +27,10 @@ RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 # (e.g. files written as 0 bytes when the Docker VM disk fills up mid-install).
 # This turns a silent runtime ImportError into a loud build failure.
 RUN python - <<'PY'
-import pydantic, pydantic_core, fastapi, sqlalchemy, rq, yt_dlp
+import pydantic, pydantic_core, fastapi, sqlalchemy, rq, yt_dlp, curl_cffi
 from pydantic_settings import BaseSettings, SettingsConfigDict
 assert pydantic.VERSION.startswith("2."), f"unexpected pydantic {pydantic.VERSION}"
-print("dependency verify OK: pydantic", pydantic.VERSION, "| BaseSettings", BaseSettings.__module__)
+print("dependency verify OK: pydantic", pydantic.VERSION, "| curl_cffi", curl_cffi.__version__)
 PY
 
 # Application. requirements.txt is the single source of runtime dependencies,

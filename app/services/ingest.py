@@ -14,11 +14,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.models import Comment, MediaFile, Subtitle, Video
+from app.models import CollectionItem, Comment, MediaFile, Subtitle, Video
 from app.models import utcnow
 from app.services import storage
 
@@ -78,6 +78,19 @@ def upsert_video_from_info(
 
     session.flush()
     return video
+
+
+def link_collection_items(session: Session, video: Video) -> int:
+    """Link any collection_items for this video id to the Video row (video_id)."""
+    result = session.execute(
+        update(CollectionItem)
+        .where(
+            CollectionItem.youtube_video_id == video.youtube_video_id,
+            CollectionItem.video_id.is_(None),
+        )
+        .values(video_id=video.id)
+    )
+    return result.rowcount or 0
 
 
 def register_outputs(

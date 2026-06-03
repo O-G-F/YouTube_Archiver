@@ -6,6 +6,9 @@ import pytest
 
 from app.services.urls import (
     UrlError,
+    channel_tab_url,
+    classify,
+    collection_type_for,
     extract_video_id,
     is_video_id,
     normalize_url,
@@ -95,3 +98,35 @@ def test_is_video_id():
 def test_rejects_non_youtube(bad):
     with pytest.raises(UrlError):
         normalize_url(bad)
+
+
+# ----- Phase 2A: fine-grained classification -----
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://youtu.be/dQw4w9WgXcQ", "video"),
+        ("https://www.youtube.com/playlist?list=PLabc", "playlist"),
+        ("https://www.youtube.com/@ex", "channel"),
+        ("https://www.youtube.com/@ex/videos", "channel_videos"),
+        ("https://www.youtube.com/@ex/shorts", "channel_shorts"),
+        ("https://www.youtube.com/@ex/streams", "channel_streams"),
+        ("https://www.youtube.com/channel/UC1234567890123456789012/shorts", "channel_shorts"),
+        ("https://example.com/x", "unknown"),
+    ],
+)
+def test_classify(url, expected):
+    assert classify(url) == expected
+
+
+def test_channel_tab_url():
+    root = normalize_url("https://www.youtube.com/@ex")
+    assert channel_tab_url(root, "videos") == "https://www.youtube.com/@ex/videos"
+    tab = normalize_url("https://www.youtube.com/@ex/videos")
+    assert channel_tab_url(tab, "shorts") == "https://www.youtube.com/@ex/shorts"
+
+
+def test_collection_type_for():
+    assert collection_type_for(normalize_url("https://www.youtube.com/playlist?list=PLx")) == "playlist"
+    assert collection_type_for(normalize_url("https://www.youtube.com/@ex/shorts")) == "channel_shorts"
+    # bare channel root maps to its uploads (videos) tab
+    assert collection_type_for(normalize_url("https://www.youtube.com/@ex")) == "channel_videos"

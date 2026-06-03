@@ -13,8 +13,11 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from app.logging_setup import get_logger
 from app.models import Job, Video, utcnow
 from app.services.urls import canonical_video_url, normalize_url
+
+logger = get_logger(__name__)
 
 # RQ entrypoint is referenced by string to avoid an import cycle
 # (jobs -> worker.tasks -> jobs).
@@ -27,8 +30,14 @@ def create_job_for_url(
     profile_name: str,
     *,
     priority: int = 0,
+    max_items: int | None = None,
+    extra_meta: dict | None = None,
 ) -> Job:
-    """Create a queued job for a URL, classifying video vs playlist/channel."""
+    """Create a queued job for a URL, classifying video vs playlist/channel.
+
+    ``max_items`` (expand only) overrides EXPAND_MAX_ITEMS for this job.
+    ``extra_meta`` is merged into ``job.meta`` (e.g. scheduler tags / policy).
+    """
     parsed = normalize_url(raw_url)
     if parsed.kind == "video":
         job_type = "download"
@@ -37,12 +46,19 @@ def create_job_for_url(
     else:
         raise ValueError(f"cannot archive URL of kind {parsed.kind!r}")
 
+    meta: dict = {}
+    if job_type == "expand" and max_items is not None:
+        meta["max_items"] = int(max_items)
+    if extra_meta:
+        meta.update(extra_meta)
+
     job = Job(
         type=job_type,
         status="queued",
         url=parsed.canonical_url,
         profile_name=profile_name,
         priority=priority,
+        meta=meta or None,
     )
     session.add(job)
     session.flush()
@@ -157,3 +173,35 @@ def submit_job(job_id: int) -> str | None:
     queue = get_queue()
     rq_job = queue.enqueue(_RQ_TASK, job_id, job_timeout="12h")
     return rq_job.id
+
+
+def create_and_submit(
+    session: Session,
+    raw_url: str,
+    profile_name: str,
+    *,
+    priority: int = 0,
+    max_items: int | None = None,
+    extra_meta: dict | None = None,
+) -> Job:
+    """Create a job, commit it (so the worker can see it), then enqueue to RQ.
+
+    If Redis is unavailable the job stays ``queued`` in the DB (run later with
+    ``archiver download run`` or ``--now``). Raises ``UrlError``/``ValueError``
+    for unsupported URLs (callers should validate / translate to HTTP errors).
+    """
+    job = create_job_for_url(
+        session,
+        raw_url,
+        profile_name,
+        priority=priority,
+        max_items=max_items,
+        extra_meta=extra_meta,
+    )
+    session.commit()
+    try:
+        job.rq_job_id = submit_job(job.id)
+        session.commit()
+    except Exception as exc:  # noqa: BLE001 - Redis may be down
+        logger.warning("job %s created but not submitted to RQ: %s", job.id, exc)
+    return job

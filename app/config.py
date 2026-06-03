@@ -68,6 +68,19 @@ class Settings(BaseSettings):
     # (0 = unlimited; protects against popular videos with millions of comments).
     ytdlp_max_comments: int = 0
 
+    # ---- Scheduler (Phase 2B) ----
+    scheduler_enabled: bool = False
+    scheduler_interval_seconds: int = 3600
+
+    # ---- Rate control / retry (Phase 2B) ----
+    # Sleep before each download job starts (spaces out requests on one worker).
+    download_job_delay_seconds: float = 0.0
+    # Passed to yt-dlp --retry-sleep (seconds between retries, e.g. on HTTP 429).
+    ytdlp_retry_backoff_seconds: int = 0
+    # Intended download concurrency. With a single RQ worker this is effectively
+    # 1; scale with `docker compose up --scale worker=N`. Surfaced for tooling.
+    max_concurrent_download_jobs: int = 1
+
     # ---- App ----
     log_level: str = "INFO"
 

@@ -68,6 +68,7 @@ def download_build_context(
         default_sub_langs=settings.default_sub_langs,
         archive_sub_langs=settings.archive_sub_langs,
         max_comments=settings.ytdlp_max_comments,
+        retry_sleep=settings.ytdlp_retry_backoff_seconds,
         **external_ctx(settings),
     )
 

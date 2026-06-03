@@ -36,6 +36,7 @@ class JobOut(BaseModel):
     error_message: str | None = None
     log_path: str | None = None
     command_path: str | None = None
+    meta: dict | None = None
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -156,3 +157,83 @@ class DoctorCheck(BaseModel):
 class DoctorOut(BaseModel):
     ok: bool
     checks: list[DoctorCheck]
+
+
+# --------------------------------------------------------------------------- #
+# Collections (Phase 2A)
+# --------------------------------------------------------------------------- #
+class CollectionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    type: str
+    title: str | None = None
+    url: str | None = None
+    youtube_playlist_id: str | None = None
+    youtube_channel_id: str | None = None
+    download_profile_id: int | None = None
+    crawl_policy: str | None = None
+    enabled: bool = True
+    created_at: datetime
+    updated_at: datetime
+    item_count: int = 0
+
+
+class CollectionItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    collection_id: int
+    youtube_video_id: str | None = None
+    video_id: int | None = None
+    position: int | None = None
+    discovered_at: datetime
+    last_seen_at: datetime | None = None
+    removed_at: datetime | None = None
+
+
+class PlaylistSourceRequest(BaseModel):
+    url: str
+    profile: str | None = None
+    max_items: int | None = None
+
+
+class ChannelSourceRequest(BaseModel):
+    url: str
+    profile: str | None = None
+    videos: bool = False
+    shorts: bool = False
+    streams: bool = False
+    max_items: int | None = None
+
+
+class ExpandRequest(BaseModel):
+    url: str
+    profile: str | None = None
+    max_items: int | None = None
+
+
+class CollectionPatch(BaseModel):
+    enabled: bool | None = None
+    crawl_policy: str | None = None  # manual | new_only | refresh
+    profile: str | None = None       # download profile name
+
+
+class CollectionRefreshResult(BaseModel):
+    collection_id: int
+    job_id: int
+    status: str
+    meta: dict | None = None
+
+
+class RefreshAllResult(BaseModel):
+    collections_checked: int
+    jobs_created: int
+    job_ids: list[int]
+
+
+class SchedulerStatusOut(BaseModel):
+    enabled: bool
+    interval_seconds: int
+    enabled_collections: int
+    crawlable_collections: int

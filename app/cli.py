@@ -40,11 +40,15 @@ download_app = typer.Typer(help="Enqueue and run download jobs.")
 jobs_app = typer.Typer(help="Inspect and control jobs.")
 comments_app = typer.Typer(help="Comment / metadata refresh (no body re-download).")
 profiles_app = typer.Typer(help="Download profiles.")
+collections_app = typer.Typer(help="Inspect and re-crawl playlist/channel collections.")
+scheduler_app = typer.Typer(help="Run the collection re-crawl scheduler.")
 app.add_typer(source_app, name="source")
 app.add_typer(download_app, name="download")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(comments_app, name="comments")
 app.add_typer(profiles_app, name="profiles")
+app.add_typer(collections_app, name="collections")
+app.add_typer(scheduler_app, name="scheduler")
 
 
 # --------------------------------------------------------------------------- #
@@ -203,6 +207,44 @@ def source_add_url(
     download_enqueue(url=url, profile=profile, now=now, priority=0)
 
 
+@source_app.command("add-playlist")
+def source_add_playlist(
+    url: str = typer.Argument(..., help="Playlist URL."),
+    profile: str = typer.Option(None, "--profile", "-p"),
+    now: bool = typer.Option(False, "--now"),
+    max_items: int = typer.Option(0, "--max-items", help="Cap items (0 = EXPAND_MAX_ITEMS)."),
+) -> None:
+    """Register a playlist and enqueue an expand job."""
+    profile = profile or get_settings().default_profile
+    _ensure_profile(profile)
+    try:
+        parsed = normalize_url(url)
+    except UrlError as exc:
+        raise typer.BadParameter(str(exc))
+    if parsed.kind != "playlist":
+        raise typer.BadParameter("not a playlist URL")
+    _expand_and_dispatch(url, profile, now, max_items)
+
+
+@source_app.command("expand")
+def source_expand(
+    url: str = typer.Argument(..., help="Playlist or channel(-tab) URL."),
+    profile: str = typer.Option(None, "--profile", "-p"),
+    now: bool = typer.Option(False, "--now"),
+    max_items: int = typer.Option(0, "--max-items", help="Cap items (0 = EXPAND_MAX_ITEMS)."),
+) -> None:
+    """Expand a playlist/channel URL into child download jobs (diff-aware)."""
+    profile = profile or get_settings().default_profile
+    _ensure_profile(profile)
+    try:
+        parsed = normalize_url(url)
+    except UrlError as exc:
+        raise typer.BadParameter(str(exc))
+    if parsed.kind not in ("playlist", "channel"):
+        raise typer.BadParameter("not an expandable (playlist/channel) URL")
+    _expand_and_dispatch(url, profile, now, max_items)
+
+
 @source_app.command("add-channel")
 def source_add_channel(
     url: str = typer.Argument(..., help="Channel URL (/@handle, /channel/UC...)."),
@@ -211,8 +253,16 @@ def source_add_channel(
     shorts: bool = typer.Option(False, "--shorts", help="Crawl the Shorts tab."),
     streams: bool = typer.Option(False, "--streams", help="Crawl the Streams tab."),
     now: bool = typer.Option(False, "--now"),
+    max_items: int = typer.Option(0, "--max-items", help="Cap items per tab (0 = EXPAND_MAX_ITEMS)."),
 ) -> None:
-    """Register a channel by enqueuing one expand job per requested tab."""
+    """Register a channel by enqueuing one expand job per requested tab.
+
+    A channel ROOT URL with no --videos/--shorts/--streams flag is rejected
+    (avoids an accidental full crawl). A /videos|/shorts|/streams tab URL works
+    without flags.
+    """
+    from app.services.urls import channel_tab_url, resolve_channel_tabs
+
     profile = profile or get_settings().default_profile
     _ensure_profile(profile)
     try:
@@ -222,20 +272,13 @@ def source_add_channel(
     if parsed.kind != "channel":
         raise typer.BadParameter("not a channel URL")
 
-    tabs = [t for t, on in (("videos", videos), ("shorts", shorts), ("streams", streams)) if on]
-    if not tabs:
-        tabs = ["videos"]
+    try:
+        tabs = resolve_channel_tabs(parsed, videos, shorts, streams)
+    except UrlError as exc:
+        raise typer.BadParameter(str(exc))
 
-    base = parsed.canonical_url.rsplit("/", 1)[0] if parsed.channel_tab else parsed.canonical_url
-    job_ids: list[int] = []
     for tab in tabs:
-        tab_url = f"{base}/{tab}"
-        with session_scope() as s:
-            job = jobs_svc.create_job_for_url(s, tab_url, profile, priority=0)
-            job_ids.append(job.id)
-        typer.echo(f"Created expand job #{job_ids[-1]} for {tab_url}")
-    for jid in job_ids:
-        _dispatch(jid, now)
+        _expand_and_dispatch(channel_tab_url(parsed, tab), profile, now, max_items)
 
 
 # --------------------------------------------------------------------------- #
@@ -409,13 +452,226 @@ def jobs_show(job_id: int = typer.Argument(...)) -> None:
                             settings, prow.media_mode, v.channel_id, v.youtube_video_id
                         )
                         typer.echo(f"  output dir  : {storage.to_relative(settings, out)}")
+        if job.meta:
+            typer.echo(f"  meta        : {job.meta}")
         if job.error_message:
             typer.echo(f"  error/notes : {job.error_message.splitlines()[0]}")
 
 
 # --------------------------------------------------------------------------- #
+# collections
+# --------------------------------------------------------------------------- #
+@collections_app.command("list")
+def collections_list() -> None:
+    """List playlist/channel collections."""
+    from sqlalchemy import func
+
+    from app.models import Collection, CollectionItem
+
+    with session_scope() as s:
+        rows = list(s.scalars(select(Collection).order_by(Collection.id.desc())))
+        if not rows:
+            typer.echo("No collections.")
+            return
+        for c in rows:
+            n = s.scalar(
+                select(func.count(CollectionItem.id)).where(
+                    CollectionItem.collection_id == c.id
+                )
+            ) or 0
+            typer.echo(f"#{c.id:<4} {c.type:<16} items={n:<5} {c.title or c.url}")
+
+
+@collections_app.command("show")
+def collections_show(collection_id: int = typer.Argument(...)) -> None:
+    """Show a collection's metadata and item counts."""
+    from sqlalchemy import func
+
+    from app.models import Collection, CollectionItem
+
+    with session_scope() as s:
+        c = s.get(Collection, collection_id)
+        if c is None:
+            raise typer.BadParameter("collection not found")
+        total = s.scalar(
+            select(func.count(CollectionItem.id)).where(
+                CollectionItem.collection_id == c.id
+            )
+        ) or 0
+        active = s.scalar(
+            select(func.count(CollectionItem.id)).where(
+                CollectionItem.collection_id == c.id,
+                CollectionItem.removed_at.is_(None),
+            )
+        ) or 0
+        typer.echo(f"Collection #{c.id}")
+        typer.echo(f"  type        : {c.type}")
+        typer.echo(f"  title       : {c.title}")
+        typer.echo(f"  url         : {c.url}")
+        typer.echo(f"  playlist_id : {c.youtube_playlist_id}")
+        typer.echo(f"  channel_id  : {c.youtube_channel_id}")
+        typer.echo(f"  profile_id  : {c.download_profile_id}")
+        typer.echo(f"  items       : {total} (active {active}, removed {total - active})")
+
+
+@collections_app.command("items")
+def collections_items(
+    collection_id: int = typer.Argument(...),
+    include_removed: bool = typer.Option(False, "--include-removed"),
+    limit: int = typer.Option(50, "--limit"),
+) -> None:
+    """List a collection's video items."""
+    from app.models import Collection, CollectionItem
+
+    with session_scope() as s:
+        if s.get(Collection, collection_id) is None:
+            raise typer.BadParameter("collection not found")
+        stmt = select(CollectionItem).where(
+            CollectionItem.collection_id == collection_id
+        )
+        if not include_removed:
+            stmt = stmt.where(CollectionItem.removed_at.is_(None))
+        stmt = stmt.order_by(CollectionItem.position, CollectionItem.id).limit(limit)
+        items = list(s.scalars(stmt))
+        if not items:
+            typer.echo("No items.")
+            return
+        for it in items:
+            flag = "  (removed)" if it.removed_at else ""
+            typer.echo(f"  [{it.position}] {it.youtube_video_id}{flag}")
+
+
+@collections_app.command("refresh")
+def collections_refresh(
+    collection_id: int = typer.Argument(...),
+    now: bool = typer.Option(False, "--now"),
+    max_items: int = typer.Option(0, "--max-items", help="Cap items (0 = EXPAND_MAX_ITEMS)."),
+) -> None:
+    """Re-crawl one collection (refresh semantics: detects removed items)."""
+    from app.models import Collection, DownloadProfile
+
+    with session_scope() as s:
+        c = s.get(Collection, collection_id)
+        if c is None:
+            raise typer.BadParameter("collection not found")
+        profile = get_settings().default_profile
+        if c.download_profile_id:
+            prow = s.get(DownloadProfile, c.download_profile_id)
+            if prow is not None:
+                profile = prow.name
+        job = jobs_svc.create_job_for_url(
+            s,
+            c.url,
+            profile,
+            max_items=(max_items or None),
+            extra_meta={
+                "scheduled_by": "manual_refresh",
+                "crawl_policy": c.crawl_policy or "new_only",
+                "detect_removed": True,
+                "collection_id": c.id,
+            },
+        )
+        job_id = job.id
+    typer.echo(f"Created refresh (expand) job #{job_id} for collection #{collection_id}")
+    _dispatch(job_id, now)
+
+
+@collections_app.command("refresh-all")
+def collections_refresh_all(
+    now: bool = typer.Option(False, "--now"),
+    max_items: int = typer.Option(0, "--max-items"),
+) -> None:
+    """Re-crawl all enabled, non-manual collections (honours each crawl_policy)."""
+    from app.services.scheduler import run_once
+
+    summary = run_once(get_settings(), reason="manual_refresh_all", max_items=(max_items or None))
+    typer.echo(
+        f"Refreshed: collections_checked={summary['collections_checked']} "
+        f"jobs_created={summary['jobs_created']}"
+    )
+    if now:
+        for jid in summary["job_ids"]:
+            _dispatch(jid, now=True)
+
+
+@collections_app.command("enable")
+def collections_enable(collection_id: int = typer.Argument(...)) -> None:
+    """Enable a collection for scheduled re-crawl."""
+    _set_collection_enabled(collection_id, True)
+
+
+@collections_app.command("disable")
+def collections_disable(collection_id: int = typer.Argument(...)) -> None:
+    """Disable a collection (scheduler will skip it)."""
+    _set_collection_enabled(collection_id, False)
+
+
+@collections_app.command("set-policy")
+def collections_set_policy(
+    collection_id: int = typer.Argument(...),
+    policy: str = typer.Argument(..., help="manual | new_only | refresh"),
+) -> None:
+    """Set a collection's crawl policy."""
+    from app.models import Collection
+
+    if policy not in ("manual", "new_only", "refresh"):
+        raise typer.BadParameter("policy must be one of: manual, new_only, refresh")
+    with session_scope() as s:
+        c = s.get(Collection, collection_id)
+        if c is None:
+            raise typer.BadParameter("collection not found")
+        c.crawl_policy = policy
+    typer.echo(f"Collection #{collection_id} crawl_policy set to {policy}")
+
+
+# --------------------------------------------------------------------------- #
+# scheduler
+# --------------------------------------------------------------------------- #
+@scheduler_app.command("run-once")
+def scheduler_run_once(
+    max_items: int = typer.Option(0, "--max-items"),
+) -> None:
+    """Run a single scheduler pass now (works even if SCHEDULER_ENABLED=false)."""
+    from app.services.scheduler import run_once
+
+    summary = run_once(get_settings(), reason="manual", max_items=(max_items or None))
+    typer.echo(
+        f"scheduler run-once: collections_checked={summary['collections_checked']} "
+        f"jobs_created={summary['jobs_created']} submitted={summary['submitted']}"
+    )
+
+
+@scheduler_app.command("run")
+def scheduler_run() -> None:
+    """Run the scheduler loop forever (used by the `scheduler` container)."""
+    from app.services.scheduler import run_forever
+
+    run_forever(get_settings())
+
+
+# --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+def _set_collection_enabled(collection_id: int, enabled: bool) -> None:
+    from app.models import Collection
+
+    with session_scope() as s:
+        c = s.get(Collection, collection_id)
+        if c is None:
+            raise typer.BadParameter("collection not found")
+        c.enabled = enabled
+    typer.echo(f"Collection #{collection_id} {'enabled' if enabled else 'disabled'}.")
+
+
+def _expand_and_dispatch(url: str, profile: str, now: bool, max_items: int) -> None:
+    mi = max_items if max_items and max_items > 0 else None
+    with session_scope() as s:
+        job = jobs_svc.create_job_for_url(s, url, profile, max_items=mi)
+        job_id = job.id
+    typer.echo(f"Created expand job #{job_id} ({profile}) for {url}")
+    _dispatch(job_id, now)
+
+
 def _ensure_profile(name: str) -> None:
     with session_scope() as s:
         try:

@@ -13,6 +13,10 @@ case "$cmd" in
     echo "[entrypoint] starting RQ worker ..."
     exec archiver worker
     ;;
+  scheduler)
+    echo "[entrypoint] starting collection re-crawl scheduler ..."
+    exec archiver scheduler run
+    ;;
   migrate)
     echo "[entrypoint] applying migrations ..."
     alembic upgrade head
