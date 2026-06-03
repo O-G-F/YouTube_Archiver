@@ -15,6 +15,7 @@ from app import __version__
 from app.api import (
     archive,
     collections,
+    comments,
     doctor,
     health,
     jobs,
@@ -56,6 +57,7 @@ app.include_router(takeout.router)
 app.include_router(watch_history.router)
 app.include_router(search_history.router)
 app.include_router(subscriptions.router)
+app.include_router(comments.router)
 app.include_router(jobs.router)
 app.include_router(profiles.router)
 app.include_router(videos.router)

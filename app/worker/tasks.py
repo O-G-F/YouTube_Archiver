@@ -15,6 +15,7 @@ Key invariants:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -25,6 +26,7 @@ from app.config import Settings, get_settings
 from app.db import session_scope
 from app.logging_setup import get_logger
 from app.models import Job, MetadataSnapshot, Video, utcnow
+from app.services import comment_policy
 from app.services import expand as expand_svc
 from app.services import jobs as jobs_svc
 from app.services import storage
@@ -64,7 +66,7 @@ def run_job(job_id: int) -> None:
             _run_download(settings, job_id)
         elif jtype == "expand":
             _run_expand(settings, job_id)
-        elif jtype == "metadata_refresh":
+        elif jtype in ("metadata_refresh", "comments_refresh"):
             _run_metadata_refresh(settings, job_id)
         else:
             raise ValueError(f"unknown job type: {jtype!r}")
@@ -269,17 +271,28 @@ def _submit_children(child_ids: list[int]) -> int:
 # metadata_refresh (comments/info only; never re-downloads the body)
 # --------------------------------------------------------------------------- #
 def _run_metadata_refresh(settings: Settings, job_id: int) -> None:
+    """Handles both ``metadata_refresh`` and ``comments_refresh`` job types.
+
+    Never re-downloads the video body (``--skip-download`` + the metadata/comment
+    profiles). Writes an info.json snapshot to a per-run snapshot dir (the
+    original video.info.json is never overwritten), normalizes comments with
+    diff detection, and (for comments_refresh) updates adaptive scheduling.
+    """
     with session_scope() as s:
         job = s.get(Job, job_id)
         video = s.get(Video, job.video_id) if job.video_id else None
         if video is None:
-            jobs_svc.mark_failed(s, job, "metadata_refresh: job has no associated video")
+            jobs_svc.mark_failed(s, job, "refresh: job has no associated video")
             return
         youtube_video_id = video.youtube_video_id
         video_pk = video.id
         profile_name = job.profile_name or "comments_refresh_only"
+        is_comments = job.type == "comments_refresh"
         jobs_svc.mark_running(s, job)
 
+    max_comments = (
+        settings.comment_refresh_max_comments if is_comments else settings.ytdlp_max_comments
+    )
     url = canonical_video_url(youtube_video_id)
     with session_scope() as s:
         spec = get_profile_spec(s, profile_name)
@@ -293,7 +306,7 @@ def _run_metadata_refresh(settings: Settings, job_id: int) -> None:
         no_playlist=True,
         default_sub_langs=settings.default_sub_langs,
         archive_sub_langs=settings.archive_sub_langs,
-        max_comments=settings.ytdlp_max_comments,
+        max_comments=max_comments,
         retry_sleep=settings.ytdlp_retry_backoff_seconds,
         **external_ctx(settings),
     )
@@ -303,6 +316,10 @@ def _run_metadata_refresh(settings: Settings, job_id: int) -> None:
         argv, log_dir, url=url, settings=settings, timeout=settings.ytdlp_timeout or None
     )
 
+    err_tail = _tail(run.stderr_path)
+    rate_limited = ("HTTP Error 429" in err_tail) or ("Too Many Requests" in err_tail)
+    state = comment_policy.classify_comment_state(err_tail)
+
     with session_scope() as s:
         job = s.get(Job, job_id)
         job.log_path = storage.log_relative(settings, log_dir)
@@ -311,39 +328,82 @@ def _run_metadata_refresh(settings: Settings, job_id: int) -> None:
 
         info_json = work_dir / f"{youtube_video_id}.info.json"
         got_info = info_json.is_file()
+        snapshot_id: int | None = None
+        summary = {"fetched": 0, "new": 0, "updated": 0, "refound": 0,
+                   "marked_missing": 0, "unchanged": 0}
+        fetched = 0
+        capped = False
         if got_info:
             snap = MetadataSnapshot(
                 video_id=video_pk,
                 source="yt-dlp",
-                snapshot_type="info_json",
+                snapshot_type="comments_refresh" if is_comments else "metadata_refresh",
                 path=storage.to_relative(settings, info_json),
+                checksum=_sha256_file(info_json),
                 fetched_at=utcnow(),
             )
             s.add(snap)
             s.flush()
+            snapshot_id = snap.id
             disk_info = _load_json(info_json)
             if disk_info:
+                # Refresh the video row's metadata (title/upload_date/availability)
+                # from the fetched info.json (the original file is untouched).
+                upsert_video_from_info(s, disk_info, settings)
+                fetched = len(disk_info.get("comments") or [])
+                capped = bool(max_comments and max_comments > 0 and fetched >= max_comments)
+                # mark_missing only on a complete (not capped) successful comment
+                # fetch with comments enabled -> avoids mislabeling real comments.
+                mark_missing = is_comments and run.ok and not capped and state is None
                 summary = ingest_comments_from_info(
-                    s, video, disk_info, snapshot_id=snap.id
+                    s, video, disk_info, snapshot_id=snapshot_id, mark_missing=mark_missing
                 )
-                logger.info("metadata_refresh: job %s comments %s", job_id, summary)
             video.last_metadata_refresh_at = utcnow()
+
+        # ----- adaptive comment scheduling / state (comments_refresh only) -----
+        if is_comments:
+            now = utcnow()
+            video.comments_state = state  # None when ok
+            video.last_comments_refresh_at = now
+            video.next_comments_refresh_at = comment_policy.compute_next_comment_refresh(
+                video, now
+            )
+
+        job.meta = {
+            **(job.meta or {}),
+            "target_video_id": youtube_video_id,
+            "fetched_comments_count": fetched,
+            "inserted_count": summary["new"],
+            "updated_count": summary["updated"],
+            "marked_missing_count": summary["marked_missing"],
+            "refound_count": summary["refound"],
+            "snapshot_id": snapshot_id,
+            "capped": capped,
+            "comments_state": state,
+            "rate_limited": rate_limited,
+        }
 
         if run.ok:
             jobs_svc.mark_success(s, job)
+            logger.info(
+                "%s: job %s fetched=%d new=%d updated=%d missing=%d state=%s",
+                job.type, job_id, fetched, summary["new"], summary["updated"],
+                summary["marked_missing"], state,
+            )
         elif got_info:
-            # info/comments were captured despite a non-zero exit (e.g. a single
-            # subtitle language failed) -> partial success, not a hard failure.
             jobs_svc.mark_partial_success(
                 s,
                 job,
-                f"yt-dlp exited {run.returncode} but info/comments were saved. "
-                f"{_tail(run.stderr_path)}",
+                f"yt-dlp exited {run.returncode} but info/comments were saved. {err_tail}",
             )
+            if rate_limited:
+                job.meta = {**(job.meta or {}), "retryable": True, "reason": "http_429"}
         else:
             jobs_svc.mark_failed(
-                s, job, f"yt-dlp exited {run.returncode}\n{_tail(run.stderr_path)}"
+                s, job, f"yt-dlp exited {run.returncode}\n{err_tail}"
             )
+            if rate_limited:
+                job.meta = {**(job.meta or {}), "retryable": True, "reason": "http_429"}
 
 
 # --------------------------------------------------------------------------- #
@@ -365,6 +425,17 @@ def _upsert_minimal_video(session, parsed) -> Video:
         session.add(video)
         session.flush()
     return video
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with Path(path).open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
 
 
 def _load_json(path: Path) -> dict | None:

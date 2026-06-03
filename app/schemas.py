@@ -418,3 +418,85 @@ class SubscriptionEnqueueOut(BaseModel):
 class TakeoutPlaylistsPreviewOut(BaseModel):
     path: str
     playlists: list[PlaylistSampleOut] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4A: comments refresh
+# --------------------------------------------------------------------------- #
+class CommentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    video_id: int
+    comment_id: str
+    parent_comment_id: str | None = None
+    author_name: str | None = None
+    author_channel_id: str | None = None
+    text: str | None = None
+    like_count: int | None = None
+    published_at: datetime | None = None
+    updated_at: datetime | None = None
+    fetched_at: datetime | None = None
+    is_deleted_or_missing: bool = False
+    source: str | None = None
+    raw_json: dict | None = None  # only when include_raw=true
+
+
+class AuthorCount(BaseModel):
+    author_name: str | None = None
+    count: int
+
+
+class CommentStatsOut(BaseModel):
+    video_id: int
+    youtube_video_id: str | None = None
+    total: int
+    active: int
+    missing: int
+    distinct_authors: int
+    last_comments_refresh_at: datetime | None = None
+    next_comments_refresh_at: datetime | None = None
+    comments_state: str | None = None
+    top_authors: list[AuthorCount] = Field(default_factory=list)
+
+
+class CommentsRefreshRequest(BaseModel):
+    # Official field: a YouTube video id, a YouTube URL, or any value that
+    # resolves to a video (see services.jobs.resolve_or_create_video).
+    target: str | None = None
+    # Backward-compatible alias for `target` (deprecated; do not send both).
+    video: str | None = None
+    profile: str | None = None
+    # Accepted for client compatibility; the API always enqueues to the worker.
+    now: bool = False
+
+    def resolved_target(self) -> str | None:
+        """The effective target, or None if neither field was supplied."""
+        return self.target if self.target is not None else self.video
+
+    def has_conflict(self) -> bool:
+        """True if both `target` and `video` were supplied (ambiguous)."""
+        return self.target is not None and self.video is not None
+
+
+class CommentsRefreshAllRequest(BaseModel):
+    limit_videos: int | None = None
+    profile: str | None = None
+
+
+class CommentsRefreshAllOut(BaseModel):
+    videos_selected: int
+    jobs_created: int
+    job_ids: list[int] = Field(default_factory=list)
+
+
+class MetadataSnapshotOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    video_id: int | None = None
+    source: str | None = None
+    snapshot_type: str
+    path: str
+    checksum: str | None = None
+    fetched_at: datetime | None = None

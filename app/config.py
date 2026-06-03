@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     # Cap total comments fetched per video when --write-comments is active
     # (0 = unlimited; protects against popular videos with millions of comments).
     ytdlp_max_comments: int = 0
+    # Cap for comments_refresh jobs (Phase 4A). Default finite for safety;
+    # 0 = unlimited. yt-dlp --extractor-args youtube:max_comments.
+    comment_refresh_max_comments: int = 200
 
     # ---- Scheduler (Phase 2B) ----
     scheduler_enabled: bool = False

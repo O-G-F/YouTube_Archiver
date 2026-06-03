@@ -207,16 +207,26 @@ def ingest_comments_from_info(
     *,
     source: str = "yt-dlp",
     snapshot_id: int | None = None,
+    mark_missing: bool = False,
 ) -> dict[str, int]:
-    """Upsert comments from an info.json ``comments`` array.
+    """Upsert comments from an info.json ``comments`` array, with diff detection.
 
-    Returns counts of fetched/new/updated. Deletion detection is deliberately
-    left to Phase 4 (the ``is_deleted_or_missing`` column exists for it).
+    Returns counts: ``fetched``, ``new``, ``updated`` (text/like changed or
+    re-found), ``refound``, ``marked_missing``, ``unchanged``.
+
+    ``mark_missing`` (Phase 4A): when True, existing comments NOT present in this
+    fetch are flagged ``is_deleted_or_missing=True``. Only enable this on a
+    COMPLETE fetch (not capped) — a capped fetch would mislabel real comments.
     """
     comments = info.get("comments") or []
-    summary = {"fetched": len(comments), "new": 0, "updated": 0}
-    if not comments:
-        return summary
+    summary = {
+        "fetched": len(comments),
+        "new": 0,
+        "updated": 0,
+        "refound": 0,
+        "marked_missing": 0,
+        "unchanged": 0,
+    }
 
     existing = {
         c.comment_id: c
@@ -225,30 +235,51 @@ def ingest_comments_from_info(
         )
     }
     now = utcnow()
+    seen: set[str] = set()
     for c in comments:
         cid = c.get("id")
         if not cid:
             continue
+        seen.add(cid)
         parent = c.get("parent")
         parent_id = None if parent in (None, "root") else parent
+        text = c.get("text")
+        like = c.get("like_count")
         row = existing.get(cid)
         if row is None:
             row = Comment(video_id=video.id, comment_id=cid)
             session.add(row)
             summary["new"] += 1
+            changed = True
         else:
-            summary["updated"] += 1
+            was_missing = bool(row.is_deleted_or_missing)
+            changed = (row.text != text) or (row.like_count != like) or was_missing
+            if was_missing:
+                summary["refound"] += 1
+            if changed:
+                summary["updated"] += 1
+            else:
+                summary["unchanged"] += 1
         row.parent_comment_id = parent_id
         row.author_name = c.get("author")
         row.author_channel_id = c.get("author_id")
-        row.text = c.get("text")
-        row.like_count = c.get("like_count")
+        row.text = text
+        row.like_count = like
         row.published_at = _dt_from_unix(c.get("timestamp"))
+        if changed:
+            row.updated_at = now
         row.fetched_at = now
         row.is_deleted_or_missing = False
         row.source = source
         row.snapshot_id = snapshot_id
         row.raw_json = c
+
+    if mark_missing:
+        for cid, row in existing.items():
+            if cid not in seen and not row.is_deleted_or_missing:
+                row.is_deleted_or_missing = True
+                row.updated_at = now
+                summary["marked_missing"] += 1
 
     session.flush()
     return summary

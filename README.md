@@ -15,7 +15,7 @@ YouTube の動画・メタデータ・字幕・コメントを `yt-dlp` でロ�
 
 ---
 
-## 実装済み機能（Phase 0–3B）
+## 実装済み機能（Phase 0–4A）
 
 - URL 登録 → 種別判定（動画 / 再生リスト / チャンネル / タブ）→ ジョブ化
 - 7 種の組み込みダウンロードプロファイル（最高画質 mkv / 1080p / proxy mp4 / flac / opus / metadata / comments）+ 全字幕版
@@ -25,6 +25,7 @@ YouTube の動画・メタデータ・字幕・コメントを `yt-dlp` でロ�
 - **再生リスト / チャンネル展開（Phase 2A）** — flat extraction → `collections`/`collection_items` 差分検出 → 新規のみ子 download ジョブ投入
 - **再クロール・scheduler（Phase 2B）** — `crawl_policy`（manual/new_only/refresh）、`removed_at` 検出、scheduler 常駐、チャンネルルート URL のタブ自動展開、レート制御・429 retryable、DB ユニーク制約
 - **Google Takeout インポート（Phase 3A/3B）** — ZIP を内容ベース判定（多言語対応）、視聴履歴 / 検索履歴 / 登録チャンネル / 再生リストを正規化保存（`watch_history_events` / `search_history_events` / `collections`(channel/takeout_playlist) / `collection_items` / Video stub）、重複統合、`import-all`、subscriptions enqueue、preview / dry-run / limit、path traversal・zip slip 対策
+- **コメント / メタデータ更新（Phase 4A）** — 本体を再DLせず info.json・コメント更新、`comments` 正規化保存と新規/更新/消失/再発見の差分、adaptive refresh policy（土台）、metadata_snapshots（checksum 付き）、429/コメント無効/削除の分類、`COMMENT_REFRESH_MAX_COMMENTS`
 - 字幕は安全な許可リスト（`ja,en`、`all` は明示時のみ）、YouTube JS チャレンジ対応（`--remote-components ejs:github` + deno）、`curl_cffi` 同梱
 - 失敗ジョブ管理（ステータス・エラーメッセージ・再実行・キャンセル）+ `partial_success` / retryable
 - 運用補強（Phase 1.5）: `doctor` 診断、ジョブログ API/CLI（path traversal 対策）、profile dry-run
@@ -378,6 +379,78 @@ docker compose exec web archiver subscriptions enqueue --videos --profile metada
 
 ---
 
+## Phase 4A: コメント / メタデータ更新（本体を再DLしない）
+
+保存済み/登録済み動画に対し、**動画本体を再ダウンロードせず** info.json・コメントを更新します。`comments_refresh` ジョブは `comments_refresh_only` プロファイル（`--skip-download --write-info-json --write-comments --no-download-archive`）を使い、専用の一時スナップショットディレクトリに出力します（**元の `video.info.json` は上書きしません**）。
+
+```bash
+# 保存済みの小さな動画でまず確認（COMMENT_REFRESH_MAX_COMMENTS=20 など小さく）
+docker compose exec web archiver comments refresh "dQw4w9WgXcQ" --now
+docker compose exec web archiver comments stats "dQw4w9WgXcQ"
+docker compose exec web archiver comments list "dQw4w9WgXcQ" --limit 20
+docker compose exec web archiver comments snapshots "dQw4w9WgXcQ"
+# adaptive policy で「更新すべき動画」を抽出して一括
+docker compose exec web archiver comments refresh-all --limit-videos 5 --now
+```
+
+API: `POST /api/comments/refresh`（公式は `{"target":"<id|url>"}`。後方互換で `{"video":"<id|url>"}` も可。両方同時指定は 400）、`POST /api/videos/{id}/comments/refresh`、`GET /api/videos/{id}/comments`・`/stats`、`POST /api/comments/refresh-all`。
+
+```bash
+# 公式（target）
+curl -s -XPOST localhost:8000/api/comments/refresh -H 'content-type: application/json' -d '{"target":"dQw4w9WgXcQ"}'
+# 後方互換（video）も動作
+curl -s -XPOST localhost:8000/api/comments/refresh -H 'content-type: application/json' -d '{"video":"dQw4w9WgXcQ"}'
+```
+
+### コメントの差分検出
+
+`comments` テーブル（`(video_id, comment_id)` ユニーク）へ正規化保存し、毎回の取得集合と既存を比較します。
+
+- **新規** → 追加（`inserted_count`）
+- **text/like_count 変化** → 更新（`updated_count`、`updated_at` を更新）
+- **今回見つからなかった既存コメント** → `is_deleted_or_missing=true`（`marked_missing_count`）
+- **再発見** → `is_deleted_or_missing=false`（`refound_count`）
+
+> **capped（取得上限に達した）回は missing を付けません。** 上限で打ち切ったときに「見えなかった＝削除」と誤判定しないためです（コメント無効と判定された回も同様にスキップ）。
+
+### COMMENT_REFRESH_MAX_COMMENTS
+
+`COMMENT_REFRESH_MAX_COMMENTS`（既定 `200`、`0`=無制限）。yt-dlp の `--extractor-args youtube:max_comments=N` で**取得量を制御**します。バイラル動画は数十万コメントになり得るため、初回は小さい値（例 20）で確認してください。
+
+### adaptive refresh policy（土台）
+
+`videos` に `last_comments_refresh_at` / `next_comments_refresh_at` / `comments_state` を持ち、`comments refresh-all` が「更新すべき動画」を抽出します（`app/services/comment_policy.py`、scheduler から呼べる関数として分離）。
+
+| 動画の経過日数 | 次回更新間隔 |
+|---|---|
+| 〜7日 | 毎日 |
+| 〜30日 | 3日ごと |
+| 〜180日 | 週1 |
+| 180日超 | 月1 |
+| `comments_disabled` / `unavailable` / `frozen` | 更新停止（frozen） |
+
+### 429 / コメント無効 / 削除・非公開
+
+- **HTTP 429**: 即 failed にせず、取得済み snapshot/コメントがあれば `partial_success`、無ければ failed だが `job.meta.retryable=true`（`reason=http_429`）。`jobs retry` や次回 refresh-all で再試行されます。
+- **コメント無効**: `comments_state=comments_disabled` を記録し frozen（自動更新対象外）。
+- **削除/非公開/メンバー限定**: `comments_state=unavailable`。
+- 判定は yt-dlp stderr の内容ベース（`comment_policy.classify_comment_state`）。
+
+### metadata_snapshots
+
+取得した info.json は `ARCHIVE_ROOT/youtube/metadata_snapshots/<video_id>/<UTC>/` に保存し、`metadata_snapshots`（`snapshot_type=comments_refresh|metadata_refresh`、`checksum`(sha256)、相対 `path`）に記録。`GET /api/videos/{id}/snapshots` / `archiver comments snapshots VIDEO_ID` で一覧。
+
+### job.meta / ログ
+
+`comments_refresh` ジョブも `command.txt` / `yt-dlp.stdout.log` / `yt-dlp.stderr.log` を保存し、`job.meta` に `target_video_id` / `fetched_comments_count` / `inserted_count` / `updated_count` / `marked_missing_count` / `refound_count` / `snapshot_id` / `capped` / `comments_state` を記録（`jobs show <id>` で確認）。
+
+### プライバシー
+
+- コメントは author 名・チャンネル ID・本文を含む**個人情報**です。`comments.raw_json` は API 既定で返しません（`include_raw=true` のみ）。
+- import/refresh ログにコメント本文を大量出力しません（件数のみ）。
+
+---
+
 ## ストレージ構成
 
 ```
@@ -452,6 +525,14 @@ archiver takeout playlists PATH                    # 再生リスト一覧（tit
 archiver search-history list [--limit N] / stats
 archiver subscriptions list
 archiver subscriptions enqueue --videos --shorts --streams --profile metadata_only --max-items 3 [--limit N] [--now]
+
+# --- Phase 4A: コメント / メタデータ更新（本体は再DLしない） ---
+archiver comments refresh VIDEO_OR_URL --now        # video id か URL
+archiver comments refresh-video VIDEO_ID --now
+archiver comments refresh-all --limit-videos N --now   # adaptive policy で「対象」を抽出
+archiver comments list VIDEO_ID [--limit N] [--active-only]
+archiver comments stats VIDEO_ID
+archiver comments snapshots VIDEO_ID                 # metadata snapshot 一覧
 ```
 
 > macOS でローカルに `archiver worker` を使うと fork 由来の問題が出る場合があります。ローカル確認では `--now` / `download run` のインライン実行を推奨します。Docker（Linux）では worker が正常動作します。
@@ -491,6 +572,12 @@ archiver subscriptions enqueue --videos --shorts --streams --profile metadata_on
 | GET | `/api/search-history/stats` | 検索履歴の統計（件数 / 期間 / top queries） |
 | GET | `/api/subscriptions` | 登録チャンネル一覧 |
 | POST | `/api/subscriptions/enqueue` | 登録チャンネルを expand job 化（`{"videos","shorts","streams","profile","max_items","limit"}`） |
+| POST | `/api/comments/refresh` | コメント更新（公式 `{"target":"<id|url>"}`、互換 `{"video":...}`、両方は400） |
+| POST | `/api/videos/{id}/comments/refresh` | 指定動画のコメント更新 |
+| POST | `/api/comments/refresh-all` | adaptive policy で対象を抽出して一括（`{"limit_videos","profile"}`） |
+| GET | `/api/videos/{id}/comments` | コメント一覧（`?include_missing=&include_raw=&limit=&offset=`） |
+| GET | `/api/videos/{id}/comments/stats` | コメント統計（total/active/missing/状態/次回更新） |
+| GET | `/api/videos/{id}/snapshots` | metadata snapshot 一覧 |
 | GET | `/api/doctor` | 環境診断（書込可否 / ツール版 / DB / Redis） |
 | GET | `/api/jobs` | ジョブ一覧（`?status=&type=&limit=&offset=`） |
 | GET | `/api/jobs/{id}` | ジョブ詳細（status/error/ログパス/出力先/動画/profile） |
@@ -590,6 +677,7 @@ live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_e
   - `0003` `collection_items` に `(collection_id, youtube_video_id)` のユニーク制約（重複防止。既存重複は migration 内で安全に dedup）
   - `0004` `watch_history_events` に `(source, youtube_video_id, watched_at)` のユニーク制約（Takeout 視聴履歴の重複防止。既存重複は安全に dedup）
   - `0005` `search_history_events` テーブル追加（`(source, query, searched_at)` ユニーク）
+  - `0006` `videos` に `last_comments_refresh_at` / `next_comments_refresh_at` / `comments_state`（adaptive コメント更新）
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
 - 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 

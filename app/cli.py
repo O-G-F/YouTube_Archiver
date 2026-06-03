@@ -294,42 +294,134 @@ def source_add_channel(
 # --------------------------------------------------------------------------- #
 @comments_app.command("refresh")
 def comments_refresh(
-    video_id: str = typer.Option(..., "--video-id", help="YouTube video id."),
+    video_or_url: str = typer.Argument(..., help="YouTube video id or URL."),
     profile: str = typer.Option("comments_refresh_only", "--profile", "-p"),
     now: bool = typer.Option(False, "--now"),
 ) -> None:
-    """Refresh comments/metadata for one video WITHOUT re-downloading the body."""
-    _ensure_profile(profile)
-    with session_scope() as s:
-        video = s.scalar(select(Video).where(Video.youtube_video_id == video_id))
-        if video is None:
-            raise typer.BadParameter(f"video {video_id!r} is not in the DB yet")
-        job = jobs_svc.create_metadata_refresh_job(s, video, profile_name=profile)
-        job_id = job.id
-    typer.echo(f"Created metadata_refresh job #{job_id} for {video_id}")
-    _dispatch(job_id, now)
+    """Refresh comments for a video WITHOUT re-downloading the body."""
+    _comments_refresh_one(video_or_url, profile, now)
+
+
+@comments_app.command("refresh-video")
+def comments_refresh_video(
+    video_id: str = typer.Argument(..., help="YouTube video id."),
+    profile: str = typer.Option("comments_refresh_only", "--profile", "-p"),
+    now: bool = typer.Option(False, "--now"),
+) -> None:
+    """Refresh comments for a video id (alias of `refresh`)."""
+    _comments_refresh_one(video_id, profile, now)
 
 
 @comments_app.command("refresh-all")
 def comments_refresh_all(
     profile: str = typer.Option("comments_refresh_only", "--profile", "-p"),
-    limit: int = typer.Option(0, help="Max videos (0 = all)."),
+    limit_videos: int = typer.Option(0, "--limit-videos", help="Max due videos (0 = all)."),
     now: bool = typer.Option(False, "--now"),
 ) -> None:
-    """Enqueue comment refresh for all stored videos (adaptive policy is Phase 4)."""
+    """Enqueue comment refresh for videos DUE per the adaptive policy."""
+    from datetime import datetime, timezone
+
+    from app.services import comment_policy
+
     _ensure_profile(profile)
     job_ids: list[int] = []
     with session_scope() as s:
-        stmt = select(Video).order_by(Video.id.asc())
-        if limit:
-            stmt = stmt.limit(limit)
-        videos = list(s.scalars(stmt))
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        videos = comment_policy.select_due_videos(s, now_dt, (limit_videos or None))
         for v in videos:
-            job = jobs_svc.create_metadata_refresh_job(s, v, profile_name=profile)
-            job_ids.append(job.id)
-    typer.echo(f"Created {len(job_ids)} metadata_refresh job(s).")
+            job_ids.append(
+                jobs_svc.create_comments_refresh_job(s, v, profile_name=profile).id
+            )
+        selected = len(videos)
+    typer.echo(f"Selected {selected} due video(s); created {len(job_ids)} comments_refresh job(s).")
     for jid in job_ids:
         _dispatch(jid, now)
+
+
+@comments_app.command("list")
+def comments_list(
+    video_id: str = typer.Argument(..., help="YouTube video id."),
+    limit: int = typer.Option(50, "--limit"),
+    active_only: bool = typer.Option(False, "--active-only", help="Exclude missing/deleted."),
+) -> None:
+    """List comments for a video."""
+    from app.models import Comment
+
+    with session_scope() as s:
+        video = s.scalar(select(Video).where(Video.youtube_video_id == video_id))
+        if video is None:
+            raise typer.BadParameter(f"video {video_id!r} is not in the DB")
+        stmt = select(Comment).where(Comment.video_id == video.id)
+        if active_only:
+            stmt = stmt.where(Comment.is_deleted_or_missing.is_(False))
+        stmt = stmt.order_by(Comment.like_count.desc().nulls_last(), Comment.id.asc()).limit(limit)
+        rows = list(s.scalars(stmt))
+        if not rows:
+            typer.echo("No comments. Run `comments refresh` first.")
+            return
+        for c in rows:
+            flag = " (missing)" if c.is_deleted_or_missing else ""
+            typer.echo(f"  [{c.like_count or 0:>5}] {c.author_name or '-'}{flag}: {(c.text or '')[:60]}")
+
+
+@comments_app.command("stats")
+def comments_stats(video_id: str = typer.Argument(..., help="YouTube video id.")) -> None:
+    """Show comment statistics for a video."""
+    from sqlalchemy import func
+
+    from app.models import Comment
+
+    with session_scope() as s:
+        video = s.scalar(select(Video).where(Video.youtube_video_id == video_id))
+        if video is None:
+            raise typer.BadParameter(f"video {video_id!r} is not in the DB")
+        total = s.scalar(select(func.count(Comment.id)).where(Comment.video_id == video.id)) or 0
+        missing = s.scalar(
+            select(func.count(Comment.id)).where(
+                Comment.video_id == video.id, Comment.is_deleted_or_missing.is_(True)
+            )
+        ) or 0
+        distinct = s.scalar(
+            select(func.count(func.distinct(Comment.author_channel_id))).where(
+                Comment.video_id == video.id
+            )
+        ) or 0
+    typer.echo(f"video            : {video_id}")
+    typer.echo(f"total comments   : {total}")
+    typer.echo(f"active           : {total - missing}")
+    typer.echo(f"missing/deleted  : {missing}")
+    typer.echo(f"distinct authors : {distinct}")
+    typer.echo(f"comments_state   : {video.comments_state}")
+    typer.echo(f"last refresh     : {video.last_comments_refresh_at}")
+    typer.echo(f"next refresh     : {video.next_comments_refresh_at}")
+
+
+@comments_app.command("snapshots")
+def comments_snapshots(
+    video_id: str = typer.Argument(..., help="YouTube video id."),
+    limit: int = typer.Option(20, "--limit"),
+) -> None:
+    """List metadata snapshots captured for a video."""
+    from app.models import MetadataSnapshot
+
+    with session_scope() as s:
+        video = s.scalar(select(Video).where(Video.youtube_video_id == video_id))
+        if video is None:
+            raise typer.BadParameter(f"video {video_id!r} is not in the DB")
+        snaps = list(
+            s.scalars(
+                select(MetadataSnapshot)
+                .where(MetadataSnapshot.video_id == video.id)
+                .order_by(MetadataSnapshot.id.desc())
+                .limit(limit)
+            )
+        )
+        if not snaps:
+            typer.echo("No snapshots.")
+            return
+        for sn in snaps:
+            cs = sn.checksum[:12] if sn.checksum else "-"
+            typer.echo(f"  #{sn.id} {sn.snapshot_type:<18} {sn.fetched_at}  {cs}  {sn.path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1036,6 +1128,18 @@ def _expand_and_dispatch(url: str, profile: str, now: bool, max_items: int) -> N
         job = jobs_svc.create_job_for_url(s, url, profile, max_items=mi)
         job_id = job.id
     typer.echo(f"Created expand job #{job_id} ({profile}) for {url}")
+    _dispatch(job_id, now)
+
+
+def _comments_refresh_one(video_or_url: str, profile: str, now: bool) -> None:
+    _ensure_profile(profile)
+    with session_scope() as s:
+        video = jobs_svc.resolve_or_create_video(s, video_or_url)
+        if video is None:
+            raise typer.BadParameter(f"could not resolve video: {video_or_url!r}")
+        job = jobs_svc.create_comments_refresh_job(s, video, profile_name=profile)
+        job_id = job.id
+    typer.echo(f"Created comments_refresh job #{job_id} for {video_or_url}")
     _dispatch(job_id, now)
 
 

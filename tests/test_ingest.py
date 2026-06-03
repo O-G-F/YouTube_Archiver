@@ -84,14 +84,14 @@ def test_ingest_comments_upsert(session, settings):
         ]
     }
     summary = ingest_comments_from_info(session, video, info)
-    assert summary == {"fetched": 2, "new": 2, "updated": 0}
+    assert summary["fetched"] == 2 and summary["new"] == 2 and summary["updated"] == 0
     assert session.query(Comment).filter_by(video_id=video.id).count() == 2
 
     reply = session.query(Comment).filter_by(comment_id="c2").one()
     assert reply.parent_comment_id == "c1"
 
-    # second ingest with an edited like_count -> update, no new rows
+    # second ingest with an edited like_count -> only c1 counts as updated
     info["comments"][0]["like_count"] = 99
     summary2 = ingest_comments_from_info(session, video, info)
-    assert summary2["new"] == 0 and summary2["updated"] == 2
+    assert summary2["new"] == 0 and summary2["updated"] == 1 and summary2["unchanged"] == 1
     assert session.query(Comment).filter_by(comment_id="c1").one().like_count == 99

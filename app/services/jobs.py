@@ -11,11 +11,17 @@ DB helpers here are pure (no Redis), so jobs can be created and executed inline
 
 from __future__ import annotations
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.logging_setup import get_logger
 from app.models import Job, Video, utcnow
-from app.services.urls import canonical_video_url, normalize_url
+from app.services.urls import (
+    UrlError,
+    canonical_video_url,
+    is_video_id,
+    normalize_url,
+)
 
 logger = get_logger(__name__)
 
@@ -103,6 +109,50 @@ def create_metadata_refresh_job(
         video_id=video.id,
         profile_name=profile_name,
         priority=priority,
+    )
+    session.add(job)
+    session.flush()
+    return job
+
+
+def resolve_or_create_video(session: Session, video_or_url: str) -> Video | None:
+    """Resolve a youtube video id or URL to a Video row, creating a stub if needed."""
+    value = (video_or_url or "").strip()
+    vid = value if is_video_id(value) else None
+    if vid is None:
+        try:
+            parsed = normalize_url(value)
+        except UrlError:
+            return None
+        vid = parsed.video_id
+    if not vid:
+        return None
+    video = session.scalar(select(Video).where(Video.youtube_video_id == vid))
+    if video is None:
+        video = Video(
+            youtube_video_id=vid, url=canonical_video_url(vid), first_seen_at=utcnow()
+        )
+        session.add(video)
+        session.flush()
+    return video
+
+
+def create_comments_refresh_job(
+    session: Session,
+    video: Video,
+    *,
+    profile_name: str = "comments_refresh_only",
+    priority: int = 0,
+) -> Job:
+    """Create a comments_refresh job (Phase 4A): comments + diff, never re-DL body."""
+    job = Job(
+        type="comments_refresh",
+        status="queued",
+        url=canonical_video_url(video.youtube_video_id),
+        video_id=video.id,
+        profile_name=profile_name,
+        priority=priority,
+        meta={"target_video_id": video.youtube_video_id},
     )
     session.add(job)
     session.flush()

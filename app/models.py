@@ -149,6 +149,15 @@ class Video(Base):
     comments_refresh_policy: Mapped[str] = mapped_column(
         String(32), default="all_videos_adaptive"
     )
+    # Phase 4A adaptive comment refresh scheduling / state.
+    last_comments_refresh_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    next_comments_refresh_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    # comments_state: None (ok) | comments_disabled | unavailable | frozen
+    comments_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow, onupdate=utcnow
