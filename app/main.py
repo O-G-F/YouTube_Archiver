@@ -21,7 +21,9 @@ from app.api import (
     profiles,
     scheduler,
     sources,
+    takeout,
     videos,
+    watch_history,
 )
 from app.bootstrap import startup_bootstrap
 from app.logging_setup import setup_logging
@@ -48,6 +50,8 @@ app.include_router(archive.router)
 app.include_router(sources.router)
 app.include_router(collections.router)
 app.include_router(scheduler.router)
+app.include_router(takeout.router)
+app.include_router(watch_history.router)
 app.include_router(jobs.router)
 app.include_router(profiles.router)
 app.include_router(videos.router)

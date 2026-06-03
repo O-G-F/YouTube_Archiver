@@ -350,6 +350,13 @@ class Job(Base):
 # --------------------------------------------------------------------------- #
 class WatchHistoryEvent(Base):
     __tablename__ = "watch_history_events"
+    __table_args__ = (
+        # Backstop dedup for events with a video id + timestamp (Phase 3A).
+        # Rows with NULL youtube_video_id are deduped in code (by title+time).
+        UniqueConstraint(
+            "source", "youtube_video_id", "watched_at", name="uq_watch_event"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # source: takeout | youtube_data_api

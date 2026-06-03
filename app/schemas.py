@@ -237,3 +237,79 @@ class SchedulerStatusOut(BaseModel):
     interval_seconds: int
     enabled_collections: int
     crawlable_collections: int
+
+
+# --------------------------------------------------------------------------- #
+# Takeout (Phase 3A)
+# --------------------------------------------------------------------------- #
+class TakeoutFileOut(BaseModel):
+    name: str
+    kind: str
+    format: str
+    size: int
+
+
+class TakeoutSampleOut(BaseModel):
+    youtube_video_id: str | None = None
+    title: str | None = None
+    channel_title: str | None = None
+    watched_at: str | None = None
+
+
+class TakeoutPreviewRequest(BaseModel):
+    path: str
+
+
+class TakeoutPreviewOut(BaseModel):
+    path: str
+    files: list[TakeoutFileOut] = Field(default_factory=list)
+    watch_history_count: int = 0
+    search_history_count: int = 0
+    likes_count: int = 0
+    subscriptions_count: int = 0
+    playlists_count: int = 0
+    samples: list[TakeoutSampleOut] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TakeoutImportRequest(BaseModel):
+    path: str
+    limit: int | None = None
+    dry_run: bool = False
+
+
+class TakeoutImportOut(BaseModel):
+    imported_count: int
+    skipped_duplicate_count: int
+    failed_count: int
+    scanned: int
+    dry_run: bool
+    job_id: int | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class WatchHistoryEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    source: str | None = None
+    youtube_video_id: str | None = None
+    title: str | None = None
+    channel_title: str | None = None
+    watched_at: datetime | None = None
+    raw_json: dict | None = None  # only populated when include_raw=true
+
+
+class ChannelCount(BaseModel):
+    channel_title: str | None = None
+    count: int
+
+
+class WatchHistoryStatsOut(BaseModel):
+    total: int
+    with_video_id: int
+    distinct_videos: int
+    distinct_channels: int
+    earliest: datetime | None = None
+    latest: datetime | None = None
+    top_channels: list[ChannelCount] = Field(default_factory=list)

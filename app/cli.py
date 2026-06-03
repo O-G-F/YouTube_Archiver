@@ -42,6 +42,8 @@ comments_app = typer.Typer(help="Comment / metadata refresh (no body re-download
 profiles_app = typer.Typer(help="Download profiles.")
 collections_app = typer.Typer(help="Inspect and re-crawl playlist/channel collections.")
 scheduler_app = typer.Typer(help="Run the collection re-crawl scheduler.")
+takeout_app = typer.Typer(help="Google Takeout preview / import.")
+watch_history_app = typer.Typer(help="Inspect imported watch history.")
 app.add_typer(source_app, name="source")
 app.add_typer(download_app, name="download")
 app.add_typer(jobs_app, name="jobs")
@@ -49,6 +51,8 @@ app.add_typer(comments_app, name="comments")
 app.add_typer(profiles_app, name="profiles")
 app.add_typer(collections_app, name="collections")
 app.add_typer(scheduler_app, name="scheduler")
+app.add_typer(takeout_app, name="takeout")
+app.add_typer(watch_history_app, name="watch-history")
 
 
 # --------------------------------------------------------------------------- #
@@ -647,6 +651,140 @@ def scheduler_run() -> None:
     from app.services.scheduler import run_forever
 
     run_forever(get_settings())
+
+
+# --------------------------------------------------------------------------- #
+# takeout
+# --------------------------------------------------------------------------- #
+@takeout_app.command("list-files")
+def takeout_list_files(path: str = typer.Argument(..., help="ZIP under TAKEOUT_IMPORT_ROOT.")) -> None:
+    """List the YouTube-related files detected in a Takeout ZIP."""
+    from app.services import takeout as tk
+
+    try:
+        zip_path = tk.resolve_takeout_path(get_settings(), path)
+        with tk.open_archive(zip_path) as a:
+            for f in a.list_files():
+                typer.echo(f"  {f.kind:<16} {f.format:<5} {f.size:>10}  {f.name}")
+    except tk.TakeoutError as exc:
+        raise typer.BadParameter(str(exc))
+
+
+@takeout_app.command("preview")
+def takeout_preview(path: str = typer.Argument(...)) -> None:
+    """Preview a Takeout ZIP (counts + samples) WITHOUT importing."""
+    from app.services import takeout as tk
+
+    try:
+        zip_path = tk.resolve_takeout_path(get_settings(), path)
+        with tk.open_archive(zip_path) as a:
+            pv = a.preview(sample=5)
+    except tk.TakeoutError as exc:
+        raise typer.BadParameter(str(exc))
+    typer.echo(
+        f"watch_history={pv['watch_history_count']} search_history={pv['search_history_count']} "
+        f"likes={pv['likes_count']} subscriptions={pv['subscriptions_count']} "
+        f"playlists={pv['playlists_count']}"
+    )
+    typer.echo("samples:")
+    for s in pv["samples"]:
+        typer.echo(f"  {s['youtube_video_id'] or '-'}  {(s['title'] or '')[:50]}  | {s['channel_title']}  | {s['watched_at']}")
+    if pv["warnings"]:
+        typer.echo(f"warnings: {pv['warnings'][:5]}")
+
+
+@takeout_app.command("import")
+def takeout_import(
+    path: str = typer.Argument(...),
+    limit: int = typer.Option(0, "--limit", help="Max events to scan (0 = all)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Do not write to the DB."),
+) -> None:
+    """Import watch history from a Takeout ZIP into watch_history_events."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        try:
+            result = tk.run_import(
+                s, get_settings(), path, limit=(limit or None), dry_run=dry_run
+            )
+        except tk.TakeoutError as exc:
+            raise typer.BadParameter(str(exc))
+    typer.echo(
+        f"imported={result['imported_count']} skipped_duplicate={result['skipped_duplicate_count']} "
+        f"failed={result['failed_count']} scanned={result['scanned']} "
+        f"dry_run={result['dry_run']} job_id={result['job_id']}"
+    )
+    if result["warnings"]:
+        typer.echo(f"warnings: {result['warnings'][:5]}")
+
+
+# --------------------------------------------------------------------------- #
+# watch-history
+# --------------------------------------------------------------------------- #
+@watch_history_app.command("list")
+def watch_history_list(
+    limit: int = typer.Option(20, "--limit"),
+    offset: int = typer.Option(0, "--offset"),
+) -> None:
+    """List recent watch-history events."""
+    from app.models import WatchHistoryEvent
+
+    with session_scope() as s:
+        rows = list(
+            s.scalars(
+                select(WatchHistoryEvent)
+                .order_by(WatchHistoryEvent.watched_at.desc(), WatchHistoryEvent.id.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+        if not rows:
+            typer.echo("No watch-history events. Import a Takeout ZIP first.")
+            return
+        for r in rows:
+            typer.echo(
+                f"  {r.watched_at}  {r.youtube_video_id or '-':<11}  "
+                f"{(r.title or '')[:48]:<48}  {r.channel_title or ''}"
+            )
+
+
+@watch_history_app.command("stats")
+def watch_history_stats() -> None:
+    """Show watch-history statistics."""
+    from sqlalchemy import func
+
+    from app.models import WatchHistoryEvent
+
+    with session_scope() as s:
+        total = s.scalar(select(func.count(WatchHistoryEvent.id))) or 0
+        with_vid = s.scalar(
+            select(func.count(WatchHistoryEvent.id)).where(
+                WatchHistoryEvent.youtube_video_id.is_not(None)
+            )
+        ) or 0
+        distinct_videos = s.scalar(
+            select(func.count(func.distinct(WatchHistoryEvent.youtube_video_id)))
+        ) or 0
+        distinct_channels = s.scalar(
+            select(func.count(func.distinct(WatchHistoryEvent.channel_title)))
+        ) or 0
+        earliest = s.scalar(select(func.min(WatchHistoryEvent.watched_at)))
+        latest = s.scalar(select(func.max(WatchHistoryEvent.watched_at)))
+        top = s.execute(
+            select(WatchHistoryEvent.channel_title, func.count(WatchHistoryEvent.id))
+            .where(WatchHistoryEvent.channel_title.is_not(None))
+            .group_by(WatchHistoryEvent.channel_title)
+            .order_by(func.count(WatchHistoryEvent.id).desc())
+            .limit(10)
+        ).all()
+    typer.echo(f"total            : {total}")
+    typer.echo(f"with video id    : {with_vid}")
+    typer.echo(f"distinct videos  : {distinct_videos}")
+    typer.echo(f"distinct channels: {distinct_channels}")
+    typer.echo(f"range            : {earliest}  ->  {latest}")
+    typer.echo("top channels:")
+    for name, n in top:
+        typer.echo(f"  {n:>6}  {name}")
 
 
 # --------------------------------------------------------------------------- #
