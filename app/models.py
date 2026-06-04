@@ -158,6 +158,18 @@ class Video(Base):
     )
     # comments_state: None (ok) | comments_disabled | unavailable | frozen
     comments_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Phase 4B: consecutive comment-refresh failures (429 backoff / max retry).
+    comment_refresh_failures: Mapped[int] = mapped_column(Integer, default=0)
+    # Phase 4B: live chat refresh scheduling / state.
+    last_live_chat_refresh_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    next_live_chat_refresh_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    # live_chat_state: None | available | not_available | unavailable | frozen
+    live_chat_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    has_live_chat: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow, onupdate=utcnow
@@ -262,6 +274,14 @@ class LiveChatMessage(Base):
     currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
     is_superchat: Mapped[bool] = mapped_column(Boolean, default=False)
     is_member_message: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Phase 4B extra fields
+    time_text: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    amount_text: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # message_type: text | paid (super chat) | sticker | membership
+    message_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    is_deleted_or_missing: Mapped[bool] = mapped_column(Boolean, default=False)
     raw_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 

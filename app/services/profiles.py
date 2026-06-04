@@ -228,6 +228,25 @@ BUILTIN_PROFILES: dict[str, ProfileSpec] = {
             sponsorblock_mark=False,
         ),
     ),
+    "live_chat_refresh_only": ProfileSpec(
+        name="live_chat_refresh_only",
+        media_mode="metadata",
+        quality_mode="none",
+        description="No media body: live chat only (--write-subs --sub-langs live_chat).",
+        ytdlp_args=[],
+        flags=_flags(
+            skip_download=True,
+            write_comments=False,
+            write_thumbnail=False,
+            write_subs=False,
+            write_auto_subs=False,
+            write_description=False,
+            write_links=False,
+            write_live_chat=True,
+            sponsorblock_mark=False,
+        ),
+        sub_langs="live_chat",
+    ),
 }
 
 

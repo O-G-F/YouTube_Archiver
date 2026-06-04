@@ -39,6 +39,7 @@ source_app = typer.Typer(help="Register sources (URLs, playlists, channels).")
 download_app = typer.Typer(help="Enqueue and run download jobs.")
 jobs_app = typer.Typer(help="Inspect and control jobs.")
 comments_app = typer.Typer(help="Comment / metadata refresh (no body re-download).")
+live_chat_app = typer.Typer(help="Live chat refresh (no body re-download).")
 profiles_app = typer.Typer(help="Download profiles.")
 collections_app = typer.Typer(help="Inspect and re-crawl playlist/channel collections.")
 scheduler_app = typer.Typer(help="Run the collection re-crawl scheduler.")
@@ -50,6 +51,7 @@ app.add_typer(source_app, name="source")
 app.add_typer(download_app, name="download")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(comments_app, name="comments")
+app.add_typer(live_chat_app, name="live-chat")
 app.add_typer(profiles_app, name="profiles")
 app.add_typer(collections_app, name="collections")
 app.add_typer(scheduler_app, name="scheduler")
@@ -315,10 +317,16 @@ def comments_refresh_video(
 @comments_app.command("refresh-all")
 def comments_refresh_all(
     profile: str = typer.Option("comments_refresh_only", "--profile", "-p"),
-    limit_videos: int = typer.Option(0, "--limit-videos", help="Max due videos (0 = all)."),
+    limit_videos: int = typer.Option(
+        50, "--limit-videos", help="Max videos to enqueue (safety cap; 0 = unlimited)."
+    ),
+    due_only: bool = typer.Option(
+        True, "--due-only/--all",
+        help="--due-only: only videos due per policy. --all: every non-frozen video.",
+    ),
     now: bool = typer.Option(False, "--now"),
 ) -> None:
-    """Enqueue comment refresh for videos DUE per the adaptive policy."""
+    """Enqueue comment refresh for DUE videos (``--due-only``) or all (``--all``)."""
     from datetime import datetime, timezone
 
     from app.services import comment_policy
@@ -327,15 +335,71 @@ def comments_refresh_all(
     job_ids: list[int] = []
     with session_scope() as s:
         now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
-        videos = comment_policy.select_due_videos(s, now_dt, (limit_videos or None))
+        videos = comment_policy.select_refreshable_videos(
+            s, now_dt, (limit_videos or None), due_only=due_only
+        )
         for v in videos:
             job_ids.append(
                 jobs_svc.create_comments_refresh_job(s, v, profile_name=profile).id
             )
         selected = len(videos)
-    typer.echo(f"Selected {selected} due video(s); created {len(job_ids)} comments_refresh job(s).")
+    scope = "due" if due_only else "all"
+    typer.echo(
+        f"Selected {selected} {scope} video(s); created {len(job_ids)} comments_refresh job(s)."
+    )
     for jid in job_ids:
         _dispatch(jid, now)
+
+
+@comments_app.command("due")
+def comments_due(
+    limit: int = typer.Option(50, "--limit", "-n", help="Max videos to show."),
+) -> None:
+    """List videos currently DUE for a comment refresh (adaptive policy)."""
+    from datetime import datetime, timezone
+
+    from app.services import comment_policy
+
+    with session_scope() as s:
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        videos = comment_policy.select_due_videos(s, now_dt, (limit or None))
+        if not videos:
+            typer.echo("No videos are due for a comment refresh.")
+            return
+        typer.echo(f"{len(videos)} due video(s):")
+        for v in videos:
+            reason = "never" if v.next_comments_refresh_at is None else "due"
+            typer.echo(
+                f"  {v.youtube_video_id}  [{reason:<5}] next={v.next_comments_refresh_at} "
+                f"state={v.comments_state or '-'}  {(v.title or '')[:50]}"
+            )
+
+
+@comments_app.command("schedule")
+def comments_schedule(
+    video_id: str = typer.Argument(..., help="YouTube video id."),
+    now: bool = typer.Option(
+        False, "--now-due", help="Mark due immediately (next_comments_refresh_at = now)."
+    ),
+) -> None:
+    """Recompute (or force) a video's next comment refresh time."""
+    from datetime import datetime, timezone
+
+    from app.services import comment_policy
+
+    with session_scope() as s:
+        video = s.scalar(select(Video).where(Video.youtube_video_id == video_id))
+        if video is None:
+            raise typer.BadParameter(f"video {video_id!r} is not in the DB")
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        if now:
+            video.next_comments_refresh_at = now_dt
+        else:
+            video.next_comments_refresh_at = comment_policy.compute_next_comment_refresh(
+                video, now_dt
+            )
+        nxt = video.next_comments_refresh_at
+    typer.echo(f"{video_id}: next_comments_refresh_at = {nxt}")
 
 
 @comments_app.command("list")
@@ -422,6 +486,125 @@ def comments_snapshots(
         for sn in snaps:
             cs = sn.checksum[:12] if sn.checksum else "-"
             typer.echo(f"  #{sn.id} {sn.snapshot_type:<18} {sn.fetched_at}  {cs}  {sn.path}")
+
+
+# --------------------------------------------------------------------------- #
+# live chat
+# --------------------------------------------------------------------------- #
+@live_chat_app.command("refresh")
+def live_chat_refresh(
+    video_or_url: str = typer.Argument(..., help="YouTube video id or URL."),
+    profile: str = typer.Option("live_chat_refresh_only", "--profile", "-p"),
+    now: bool = typer.Option(False, "--now"),
+) -> None:
+    """Refresh a video's live chat WITHOUT re-downloading the body."""
+    _ensure_profile(profile)
+    with session_scope() as s:
+        video = jobs_svc.resolve_or_create_video(s, video_or_url)
+        if video is None:
+            raise typer.BadParameter(f"could not resolve video: {video_or_url!r}")
+        job = jobs_svc.create_live_chat_refresh_job(s, video, profile_name=profile)
+        job_id = job.id
+    typer.echo(f"Created live_chat_refresh job #{job_id} for {video_or_url}")
+    _dispatch(job_id, now)
+
+
+@live_chat_app.command("refresh-all")
+def live_chat_refresh_all(
+    profile: str = typer.Option("live_chat_refresh_only", "--profile", "-p"),
+    limit_videos: int = typer.Option(
+        25, "--limit-videos", help="Max videos to enqueue (safety cap; 0 = unlimited)."
+    ),
+    now: bool = typer.Option(False, "--now"),
+) -> None:
+    """Enqueue live chat refresh for videos that have (or had) live chat and are due."""
+    from datetime import datetime, timezone
+
+    from app.services import comment_policy
+
+    _ensure_profile(profile)
+    job_ids: list[int] = []
+    with session_scope() as s:
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        videos = comment_policy.select_due_live_chat_videos(s, now_dt, (limit_videos or None))
+        for v in videos:
+            job_ids.append(
+                jobs_svc.create_live_chat_refresh_job(s, v, profile_name=profile).id
+            )
+        selected = len(videos)
+    typer.echo(f"Selected {selected} video(s); created {len(job_ids)} live_chat_refresh job(s).")
+    for jid in job_ids:
+        _dispatch(jid, now)
+
+
+@live_chat_app.command("list")
+def live_chat_list(
+    video_id: str = typer.Argument(..., help="YouTube video id."),
+    limit: int = typer.Option(50, "--limit"),
+    superchats_only: bool = typer.Option(False, "--superchats-only"),
+) -> None:
+    """List live chat messages for a video (most-recent-by-timestamp last)."""
+    from app.models import LiveChatMessage
+
+    with session_scope() as s:
+        video = s.scalar(select(Video).where(Video.youtube_video_id == video_id))
+        if video is None:
+            raise typer.BadParameter(f"video {video_id!r} is not in the DB")
+        stmt = select(LiveChatMessage).where(LiveChatMessage.video_id == video.id)
+        if superchats_only:
+            stmt = stmt.where(LiveChatMessage.is_superchat.is_(True))
+        stmt = stmt.order_by(
+            LiveChatMessage.timestamp_ms.asc().nulls_last(), LiveChatMessage.id.asc()
+        ).limit(limit)
+        rows = list(s.scalars(stmt))
+        if not rows:
+            typer.echo("No live chat messages. Run `live-chat refresh` first.")
+            return
+        for m in rows:
+            money = f" [{m.amount_text}]" if m.amount_text else ""
+            flag = " (missing)" if m.is_deleted_or_missing else ""
+            typer.echo(
+                f"  {m.time_text or '-':>8} {m.author_name or '-'}{money}{flag}: "
+                f"{(m.message or '')[:60]}"
+            )
+
+
+@live_chat_app.command("stats")
+def live_chat_stats(video_id: str = typer.Argument(..., help="YouTube video id.")) -> None:
+    """Show live chat statistics for a video."""
+    from sqlalchemy import func
+
+    from app.models import LiveChatMessage
+
+    with session_scope() as s:
+        video = s.scalar(select(Video).where(Video.youtube_video_id == video_id))
+        if video is None:
+            raise typer.BadParameter(f"video {video_id!r} is not in the DB")
+
+        def _count(*conds) -> int:
+            return int(
+                s.scalar(
+                    select(func.count(LiveChatMessage.id)).where(
+                        LiveChatMessage.video_id == video.id, *conds
+                    )
+                )
+                or 0
+            )
+
+        total = _count()
+        missing = _count(LiveChatMessage.is_deleted_or_missing.is_(True))
+        superchats = _count(LiveChatMessage.is_superchat.is_(True))
+        members = _count(LiveChatMessage.is_member_message.is_(True))
+    typer.echo(f"video             : {video_id}")
+    typer.echo(f"total messages    : {total}")
+    typer.echo(f"active            : {total - missing}")
+    typer.echo(f"missing/deleted   : {missing}")
+    typer.echo(f"super chats       : {superchats}")
+    typer.echo(f"member messages   : {members}")
+    typer.echo(f"has_live_chat     : {video.has_live_chat}")
+    typer.echo(f"live_chat_state   : {video.live_chat_state}")
+    typer.echo(f"last refresh      : {video.last_live_chat_refresh_at}")
+    typer.echo(f"next refresh      : {video.next_live_chat_refresh_at}")
 
 
 # --------------------------------------------------------------------------- #
@@ -684,7 +867,12 @@ def collections_refresh_all(
     """Re-crawl all enabled, non-manual collections (honours each crawl_policy)."""
     from app.services.scheduler import run_once
 
-    summary = run_once(get_settings(), reason="manual_refresh_all", max_items=(max_items or None))
+    summary = run_once(
+        get_settings(),
+        reason="manual_refresh_all",
+        max_items=(max_items or None),
+        do_comments=False,  # collections-only command
+    )
     typer.echo(
         f"Refreshed: collections_checked={summary['collections_checked']} "
         f"jobs_created={summary['jobs_created']}"
@@ -730,14 +918,38 @@ def collections_set_policy(
 @scheduler_app.command("run-once")
 def scheduler_run_once(
     max_items: int = typer.Option(0, "--max-items"),
+    collections: bool = typer.Option(False, "--collections", help="Run collection re-crawl."),
+    comments: bool = typer.Option(False, "--comments", help="Run due comment refreshes."),
+    all_: bool = typer.Option(False, "--all", help="Run both collections and comments."),
 ) -> None:
-    """Run a single scheduler pass now (works even if SCHEDULER_ENABLED=false)."""
+    """Run a single scheduler pass now (works even if SCHEDULER_ENABLED=false).
+
+    Choose what to run with ``--collections`` / ``--comments`` / ``--all``.
+    With no flag, both parts run (same as ``--all``).
+    """
     from app.services.scheduler import run_once
 
-    summary = run_once(get_settings(), reason="manual", max_items=(max_items or None))
+    if all_ or (not collections and not comments):
+        do_collections = do_comments = True
+    else:
+        do_collections, do_comments = collections, comments
+
+    summary = run_once(
+        get_settings(),
+        reason="manual",
+        max_items=(max_items or None),
+        do_collections=do_collections,
+        do_comments=do_comments,
+    )
     typer.echo(
-        f"scheduler run-once: collections_checked={summary['collections_checked']} "
-        f"jobs_created={summary['jobs_created']} submitted={summary['submitted']}"
+        "scheduler run-once: "
+        f"collections_checked={summary['collections_checked']} "
+        f"collection_jobs={summary['collection_jobs_created']} "
+        f"due_comment_videos={summary['due_comment_videos_checked']} "
+        f"comment_jobs={summary['comments_jobs_created']} "
+        f"skipped_frozen={summary['skipped_frozen']} "
+        f"skipped_recent={summary['skipped_recent']} "
+        f"submitted={summary['submitted']}"
     )
 
 

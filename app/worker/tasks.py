@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from datetime import timedelta
 from pathlib import Path
 
 from sqlalchemy import select
@@ -29,6 +30,7 @@ from app.models import Job, MetadataSnapshot, Video, utcnow
 from app.services import comment_policy
 from app.services import expand as expand_svc
 from app.services import jobs as jobs_svc
+from app.services import live_chat as live_chat_svc
 from app.services import storage
 from app.services.command_builder import download_build_context, external_ctx
 from app.services.ingest import (
@@ -68,6 +70,8 @@ def run_job(job_id: int) -> None:
             _run_expand(settings, job_id)
         elif jtype in ("metadata_refresh", "comments_refresh"):
             _run_metadata_refresh(settings, job_id)
+        elif jtype == "live_chat_refresh":
+            _run_live_chat_refresh(settings, job_id)
         else:
             raise ValueError(f"unknown job type: {jtype!r}")
     except Exception as exc:  # noqa: BLE001 - we want to record every failure
@@ -290,6 +294,10 @@ def _run_metadata_refresh(settings: Settings, job_id: int) -> None:
         is_comments = job.type == "comments_refresh"
         jobs_svc.mark_running(s, job)
 
+    # Rate control: space out consecutive comment refresh jobs (avoid 429).
+    if is_comments and settings.comments_refresh_job_delay_seconds > 0:
+        time.sleep(settings.comments_refresh_job_delay_seconds)
+
     max_comments = (
         settings.comment_refresh_max_comments if is_comments else settings.ytdlp_max_comments
     )
@@ -361,13 +369,18 @@ def _run_metadata_refresh(settings: Settings, job_id: int) -> None:
             video.last_metadata_refresh_at = utcnow()
 
         # ----- adaptive comment scheduling / state (comments_refresh only) -----
+        next_refresh = None
         if is_comments:
             now = utcnow()
             video.comments_state = state  # None when ok
             video.last_comments_refresh_at = now
-            video.next_comments_refresh_at = comment_policy.compute_next_comment_refresh(
-                video, now
-            )
+            if rate_limited:
+                # 429: back off (and bump failure count / max-retry handling).
+                next_refresh = comment_policy.apply_comment_backoff(video, now, settings)
+            else:
+                video.comment_refresh_failures = 0
+                next_refresh = comment_policy.compute_next_comment_refresh(video, now)
+                video.next_comments_refresh_at = next_refresh
 
         job.meta = {
             **(job.meta or {}),
@@ -381,6 +394,7 @@ def _run_metadata_refresh(settings: Settings, job_id: int) -> None:
             "capped": capped,
             "comments_state": state,
             "rate_limited": rate_limited,
+            "next_comments_refresh_at": next_refresh.isoformat() if next_refresh else None,
         }
 
         if run.ok:
@@ -404,6 +418,146 @@ def _run_metadata_refresh(settings: Settings, job_id: int) -> None:
             )
             if rate_limited:
                 job.meta = {**(job.meta or {}), "retryable": True, "reason": "http_429"}
+
+
+# --------------------------------------------------------------------------- #
+# live_chat_refresh (live chat only; never re-downloads the body)
+# --------------------------------------------------------------------------- #
+def _run_live_chat_refresh(settings: Settings, job_id: int) -> None:
+    """Fetch & normalize a video's archived live chat.
+
+    Uses the ``live_chat_refresh_only`` profile: ``--skip-download`` +
+    ``--write-subs --sub-langs live_chat`` -> ``<id>.live_chat.json`` (JSONL).
+    The video body is NEVER re-downloaded. A normal (non-live) video simply has
+    no live chat track -> ``live_chat_state=not_available`` (not an error).
+    """
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        video = s.get(Video, job.video_id) if job.video_id else None
+        if video is None:
+            jobs_svc.mark_failed(s, job, "live_chat_refresh: job has no associated video")
+            return
+        youtube_video_id = video.youtube_video_id
+        video_pk = video.id
+        profile_name = job.profile_name or "live_chat_refresh_only"
+        jobs_svc.mark_running(s, job)
+
+    if settings.comments_refresh_job_delay_seconds > 0:
+        time.sleep(settings.comments_refresh_job_delay_seconds)
+
+    url = canonical_video_url(youtube_video_id)
+    with session_scope() as s:
+        spec = get_profile_spec(s, profile_name)
+
+    stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
+    work_dir = storage.snapshot_dir(settings, youtube_video_id) / f"livechat_{stamp}"
+    out_tpl = str(work_dir / "%(id)s.%(ext)s")
+    ctx = BuildContext(
+        output_template=out_tpl,
+        download_archive=None,  # never skipped, never re-DL
+        no_playlist=True,
+        default_sub_langs=settings.default_sub_langs,
+        archive_sub_langs=settings.archive_sub_langs,
+        retry_sleep=settings.ytdlp_retry_backoff_seconds,
+        **external_ctx(settings),
+    )
+    argv = build_ytdlp_args(spec, ctx)
+    log_dir = storage.job_log_dir(settings, job_id)
+    run = run_ytdlp(
+        argv, log_dir, url=url, settings=settings, timeout=settings.ytdlp_timeout or None
+    )
+
+    err_tail = _tail(run.stderr_path)
+    rate_limited = ("HTTP Error 429" in err_tail) or ("Too Many Requests" in err_tail)
+    unavail = comment_policy.classify_comment_state(err_tail)
+
+    live_chat_file = work_dir / f"{youtube_video_id}.live_chat.json"
+    info_json = work_dir / f"{youtube_video_id}.info.json"
+
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        job.log_path = storage.log_relative(settings, log_dir)
+        job.command_path = storage.log_relative(settings, run.command_path)
+        video = s.get(Video, video_pk)
+
+        if info_json.is_file():
+            disk_info = _load_json(info_json)
+            if disk_info:
+                upsert_video_from_info(s, disk_info, settings)
+
+        snapshot_id: int | None = None
+        summary = {"fetched": 0, "new": 0, "updated": 0, "refound": 0,
+                   "marked_missing": 0, "unchanged": 0, "capped": False}
+        got_chat = live_chat_file.is_file()
+        if got_chat:
+            snap = MetadataSnapshot(
+                video_id=video_pk,
+                source="yt-dlp",
+                snapshot_type="live_chat_refresh",
+                path=storage.to_relative(settings, live_chat_file),
+                checksum=_sha256_file(live_chat_file),
+                fetched_at=utcnow(),
+            )
+            s.add(snap)
+            s.flush()
+            snapshot_id = snap.id
+            text = _read_text(live_chat_file)
+            messages = live_chat_svc.parse_live_chat_jsonl(text)
+            summary = live_chat_svc.ingest_live_chat(
+                s, video, messages,
+                snapshot_id=snapshot_id,
+                limit=settings.live_chat_max_messages or None,
+                mark_missing=False,
+            )
+
+        # ----- live chat state -----
+        if got_chat and summary["fetched"] > 0:
+            live_chat_state = "available"
+            video.has_live_chat = True
+        elif unavail == "unavailable" and not info_json.is_file():
+            live_chat_state = "unavailable"
+        else:
+            # got info but no chat track, or an empty chat -> normal video
+            live_chat_state = "not_available"
+
+        now = utcnow()
+        video.live_chat_state = live_chat_state
+        video.last_live_chat_refresh_at = now
+        next_refresh = comment_policy.compute_next_live_chat_refresh(video, now, settings)
+        if rate_limited and not got_chat:
+            # 429: back off and retry later (don't freeze).
+            next_refresh = now + timedelta(
+                seconds=settings.comments_refresh_retry_backoff_seconds or 21600
+            )
+        video.next_live_chat_refresh_at = next_refresh
+
+        job.meta = {
+            **(job.meta or {}),
+            "target_video_id": youtube_video_id,
+            "fetched_messages_count": summary["fetched"],
+            "inserted_count": summary["new"],
+            "updated_count": summary["updated"],
+            "marked_missing_count": summary["marked_missing"],
+            "refound_count": summary["refound"],
+            "snapshot_id": snapshot_id,
+            "live_chat_state": live_chat_state,
+            "capped": summary["capped"],
+            "rate_limited": rate_limited,
+            "next_live_chat_refresh_at": next_refresh.isoformat() if next_refresh else None,
+        }
+
+        if rate_limited and not got_chat:
+            jobs_svc.mark_failed(
+                s, job, f"yt-dlp exited {run.returncode} (rate limited)\n{err_tail}"
+            )
+            job.meta = {**(job.meta or {}), "retryable": True, "reason": "http_429"}
+        else:
+            # Lenient: a missing live chat track is normal, not a failure.
+            jobs_svc.mark_success(s, job)
+            logger.info(
+                "live_chat_refresh: job %s state=%s fetched=%d new=%d",
+                job_id, live_chat_state, summary["fetched"], summary["new"],
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -443,6 +597,13 @@ def _load_json(path: Path) -> dict | None:
         return json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _tail(path: Path, max_chars: int = 4000) -> str:

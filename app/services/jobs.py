@@ -143,8 +143,12 @@ def create_comments_refresh_job(
     *,
     profile_name: str = "comments_refresh_only",
     priority: int = 0,
+    extra_meta: dict | None = None,
 ) -> Job:
     """Create a comments_refresh job (Phase 4A): comments + diff, never re-DL body."""
+    meta = {"target_video_id": video.youtube_video_id}
+    if extra_meta:
+        meta.update(extra_meta)
     job = Job(
         type="comments_refresh",
         status="queued",
@@ -152,7 +156,33 @@ def create_comments_refresh_job(
         video_id=video.id,
         profile_name=profile_name,
         priority=priority,
-        meta={"target_video_id": video.youtube_video_id},
+        meta=meta,
+    )
+    session.add(job)
+    session.flush()
+    return job
+
+
+def create_live_chat_refresh_job(
+    session: Session,
+    video: Video,
+    *,
+    profile_name: str = "live_chat_refresh_only",
+    priority: int = 0,
+    extra_meta: dict | None = None,
+) -> Job:
+    """Create a live_chat_refresh job (Phase 4B): live chat only, never re-DL body."""
+    meta = {"target_video_id": video.youtube_video_id}
+    if extra_meta:
+        meta.update(extra_meta)
+    job = Job(
+        type="live_chat_refresh",
+        status="queued",
+        url=canonical_video_url(video.youtube_video_id),
+        video_id=video.id,
+        profile_name=profile_name,
+        priority=priority,
+        meta=meta,
     )
     session.add(job)
     session.flush()

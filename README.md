@@ -26,12 +26,13 @@ YouTube の動画・メタデータ・字幕・コメントを `yt-dlp` でロ�
 - **再クロール・scheduler（Phase 2B）** — `crawl_policy`（manual/new_only/refresh）、`removed_at` 検出、scheduler 常駐、チャンネルルート URL のタブ自動展開、レート制御・429 retryable、DB ユニーク制約
 - **Google Takeout インポート（Phase 3A/3B）** — ZIP を内容ベース判定（多言語対応）、視聴履歴 / 検索履歴 / 登録チャンネル / 再生リストを正規化保存（`watch_history_events` / `search_history_events` / `collections`(channel/takeout_playlist) / `collection_items` / Video stub）、重複統合、`import-all`、subscriptions enqueue、preview / dry-run / limit、path traversal・zip slip 対策
 - **コメント / メタデータ更新（Phase 4A）** — 本体を再DLせず info.json・コメント更新、`comments` 正規化保存と新規/更新/消失/再発見の差分、adaptive refresh policy（土台）、metadata_snapshots（checksum 付き）、429/コメント無効/削除の分類、`COMMENT_REFRESH_MAX_COMMENTS`
+- **scheduler 連携コメント定期更新・live chat 取得（Phase 4B）** — scheduler が `next_comments_refresh_at` の期限切れ動画へ自動でコメント更新ジョブを投入（`SCHEDULER_COMMENTS_ENABLED`、1パス上限 `SCHEDULER_COMMENTS_LIMIT_PER_RUN`、frozen/recent 除外）、429 で `comment_refresh_failures` 加算＋backoff 再スケジュール、`live_chat_refresh` ジョブ（本体・コメント再DLなし、`--write-subs --sub-langs live_chat`）で `live_chat_messages` を正規化保存（super chat/メンバー/差分対応）、非ライブ動画は `not_available` 扱いでエラーにしない
 - 字幕は安全な許可リスト（`ja,en`、`all` は明示時のみ）、YouTube JS チャレンジ対応（`--remote-components ejs:github` + deno）、`curl_cffi` 同梱
 - 失敗ジョブ管理（ステータス・エラーメッセージ・再実行・キャンセル）+ `partial_success` / retryable
 - 運用補強（Phase 1.5）: `doctor` 診断、ジョブログ API/CLI（path traversal 対策）、profile dry-run
 - Web API（登録 / 展開 / コレクション / 再クロール / scheduler / ジョブ / プロファイル / 動画 / 診断）と CLI の両方
 - Docker Compose（web / worker / scheduler / postgres / redis / migrate）
-- Alembic マイグレーション（0001 初期 + 0002 jobs.meta + 0003 unique制約）+ pytest（123 tests）
+- Alembic マイグレーション（0001 初期 〜 0007 live chat / comment retry）+ pytest（190 tests）
 
 ---
 
@@ -113,6 +114,7 @@ archiver jobs list
 | `audio_opus_save_space` | audio | `bestaudio` → opus（可能なら再エンコード回避） | （字幕なし） |
 | `metadata_only` | metadata | 本体なし。info.json / 説明文 / 字幕 / サムネのみ | `DEFAULT_SUB_LANGS`（限定） |
 | `comments_refresh_only` | metadata | 本体なし。コメント更新専用（`metadata_refresh` ジョブが使用） | （字幕なし） |
+| `live_chat_refresh_only` | metadata | 本体・コメントなし。ライブチャット専用（`--write-subs --sub-langs live_chat`、`live_chat_refresh` ジョブが使用） | `live_chat` |
 
 プロファイルは DB（`download_profiles`）に投入され、Web/CLI から参照されます。`metadata_flags`（extras の真偽）と `ytdlp_args`（フォーマット/画質/コンテナ）に分離して保持します。
 
@@ -451,6 +453,68 @@ curl -s -XPOST localhost:8000/api/comments/refresh -H 'content-type: application
 
 ---
 
+## Phase 4B: scheduler 連携コメント定期更新 / live chat 取得
+
+### scheduler によるコメント定期更新
+
+`scheduler` は 1 パスごとに **collection 再クロール**（`SCHEDULER_ENABLED`）と **コメント定期更新**（`SCHEDULER_COMMENTS_ENABLED`）を独立トグルで実行します。コメント更新では `next_comments_refresh_at <= now` の動画を `comment_policy.select_due_videos` で抽出し（`comments_disabled` / `unavailable` / `frozen` は除外、未更新を優先）、1 パス最大 `SCHEDULER_COMMENTS_LIMIT_PER_RUN` 件の `comments_refresh` ジョブを投入します。
+
+```bash
+# .env
+SCHEDULER_ENABLED=true            # collection 再クロール
+SCHEDULER_COMMENTS_ENABLED=true   # コメント定期更新
+SCHEDULER_COMMENTS_LIMIT_PER_RUN=10
+```
+
+手動 1 パス（`SCHEDULER_ENABLED` に関係なく実行、対象を選択可能）:
+
+```bash
+archiver scheduler run-once --all            # collections + comments（無指定時も both）
+archiver scheduler run-once --comments        # コメントのみ
+archiver scheduler run-once --collections     # 再クロールのみ
+# API:
+curl -s -XPOST localhost:8000/api/scheduler/run-once -H 'content-type: application/json' \
+  -d '{"collections":true,"comments":true}'
+```
+
+`run-once` の結果は `collections_checked` / `collection_jobs_created` / `due_comment_videos_checked` / `comments_jobs_created` / `skipped_frozen` / `skipped_recent` / `submitted` / `job_ids` を返します。scheduler 投入ジョブの `job.meta` には `scheduled_by=scheduler_comments` / `due_reason`(`due`|`never_refreshed`) / `previous_next_comments_refresh_at` が入ります。
+
+期限切れ動画の確認・手動スケジュール:
+
+```bash
+archiver comments due --limit 20                 # 期限切れ一覧（GET /api/comments/due）
+archiver comments schedule VIDEO_ID              # policy で next を再計算
+archiver comments schedule VIDEO_ID --now-due    # 即時 due 扱いに
+archiver comments refresh-all --all --limit-videos 5 --now   # frozen 以外を全件（--due-only が既定）
+```
+
+### 429（レート制限）リトライ
+
+`comments_refresh` が HTTP 429 を受けると、ジョブは `failed` だが `job.meta.rate_limited=true` / `retryable=true` を記録し、`video.comment_refresh_failures` を加算、`next_comments_refresh_at = now + COMMENTS_REFRESH_RETRY_BACKOFF_SECONDS` に後ろ倒しします（scheduler が後で再投入）。連続失敗が `COMMENTS_REFRESH_MAX_RETRY` 以上になると backoff を最低 1 日に延長。連続実行間隔は `COMMENTS_REFRESH_JOB_DELAY_SECONDS` で空けられます。
+
+### live_chat_refresh（本体・コメントを再DLしない）
+
+`live_chat_refresh` ジョブは `live_chat_refresh_only` プロファイル（`--skip-download --write-info-json --write-subs --sub-langs live_chat`）で **動画本体もコメントも取得せず**、yt-dlp が出力する `<id>.live_chat.json`（JSONL）のみを取得・解析します。テキスト / super chat / super sticker / メンバーシップの各 renderer を解析し、`live_chat_messages` に正規化保存（`message_id` で重複排除、新規/更新/消失/再発見の差分、`LIVE_CHAT_MAX_MESSAGES` で上限）。
+
+```bash
+archiver live-chat refresh "dQw4w9WgXcQ" --now       # video id か URL
+archiver live-chat list VIDEO_ID [--superchats-only]
+archiver live-chat stats VIDEO_ID
+archiver live-chat refresh-all --limit-videos 25 --now   # has_live_chat/is_live かつ期限切れ
+# API: POST /api/live-chat/refresh（{"target":...}、互換 {"video":...}、両方は400）、
+#      POST /api/videos/{id}/live-chat/refresh、POST /api/live-chat/refresh-all、
+#      GET  /api/videos/{id}/live-chat（既定 raw_json 非返却）・/stats
+```
+
+`videos` は `last_live_chat_refresh_at` / `next_live_chat_refresh_at` / `live_chat_state`（`available` / `not_available` / `unavailable` / `frozen`） / `has_live_chat` を保持します。**ライブチャットの無い通常動画はエラーにならず `not_available`** として記録され、`unavailable`/`frozen` は再取得対象から外れます（`LIVE_CHAT_REFRESH_INTERVAL_SECONDS` ごとに再取得）。取得した `.live_chat.json` は `metadata_snapshots`（`snapshot_type=live_chat_refresh`、`checksum`、相対 `path`）に記録。`job.meta` に `target_video_id` / `fetched_messages_count` / `inserted_count` / `updated_count` / `marked_missing_count` / `refound_count` / `snapshot_id` / `live_chat_state` / `capped` / `rate_limited` を記録。
+
+### プライバシー（live chat）
+
+- live chat も author 名・チャンネル ID・本文を含む**個人情報**です。`live_chat_messages.raw_json` と author 情報は API 既定で返しません（`include_raw=true` のみ raw を返却）。
+- ログにメッセージ本文を大量出力しません（件数のみ）。
+
+---
+
 ## ストレージ構成
 
 ```
@@ -507,7 +571,7 @@ archiver collections refresh-all [--now] [--max-items N]            # enabled全
 archiver collections enable COLLECTION_ID
 archiver collections disable COLLECTION_ID
 archiver collections set-policy COLLECTION_ID new_only|refresh|manual
-archiver scheduler run-once [--max-items N]        # 1パスだけ実行（SCHEDULER_ENABLED無関係）
+archiver scheduler run-once [--max-items N] [--collections] [--comments] [--all]  # 1パス（SCHEDULER_ENABLED無関係）
 archiver scheduler run                             # ループ常駐（scheduler コンテナが使用）
 
 # --- Phase 3A: Google Takeout import ---
@@ -529,10 +593,18 @@ archiver subscriptions enqueue --videos --shorts --streams --profile metadata_on
 # --- Phase 4A: コメント / メタデータ更新（本体は再DLしない） ---
 archiver comments refresh VIDEO_OR_URL --now        # video id か URL
 archiver comments refresh-video VIDEO_ID --now
-archiver comments refresh-all --limit-videos N --now   # adaptive policy で「対象」を抽出
+archiver comments refresh-all [--due-only|--all] --limit-videos N --now   # 期限切れ / frozen以外を全件
+archiver comments due [--limit N]                    # 期限切れ動画一覧
+archiver comments schedule VIDEO_ID [--now-due]      # next_comments_refresh_at を再計算 / 即時due
 archiver comments list VIDEO_ID [--limit N] [--active-only]
 archiver comments stats VIDEO_ID
 archiver comments snapshots VIDEO_ID                 # metadata snapshot 一覧
+
+# --- Phase 4B: live chat 取得（本体・コメントは再DLしない） ---
+archiver live-chat refresh VIDEO_OR_URL --now        # video id か URL
+archiver live-chat refresh-all --limit-videos N --now   # has_live_chat/is_live かつ期限切れ
+archiver live-chat list VIDEO_ID [--limit N] [--superchats-only]
+archiver live-chat stats VIDEO_ID
 ```
 
 > macOS でローカルに `archiver worker` を使うと fork 由来の問題が出る場合があります。ローカル確認では `--now` / `download run` のインライン実行を推奨します。Docker（Linux）では worker が正常動作します。
@@ -558,8 +630,8 @@ archiver comments snapshots VIDEO_ID                 # metadata snapshot 一覧
 | POST | `/api/collections/refresh-all` | enabled 全件を再クロール |
 | POST | `/api/collections/{id}/enable` ・ `/disable` | scheduler 対象の有効/無効 |
 | PATCH | `/api/collections/{id}` | `{"enabled","crawl_policy","profile"}` を更新 |
-| GET | `/api/scheduler/status` | scheduler 設定と対象数 |
-| POST | `/api/scheduler/run-once` | 手動で1パス実行 |
+| GET | `/api/scheduler/status` | scheduler 設定と対象数（collections + comments） |
+| POST | `/api/scheduler/run-once` | 手動で1パス実行（`{"collections","comments","max_items"}`、詳細サマリ返却） |
 | POST | `/api/takeout/preview` | Takeout ZIP の preview（`{"path"}`、保存なし） |
 | POST | `/api/takeout/import` | 視聴履歴 import（`{"path","limit","dry_run"}`） |
 | POST | `/api/takeout/import-subscriptions` | 登録チャンネル import |
@@ -574,10 +646,16 @@ archiver comments snapshots VIDEO_ID                 # metadata snapshot 一覧
 | POST | `/api/subscriptions/enqueue` | 登録チャンネルを expand job 化（`{"videos","shorts","streams","profile","max_items","limit"}`） |
 | POST | `/api/comments/refresh` | コメント更新（公式 `{"target":"<id|url>"}`、互換 `{"video":...}`、両方は400） |
 | POST | `/api/videos/{id}/comments/refresh` | 指定動画のコメント更新 |
-| POST | `/api/comments/refresh-all` | adaptive policy で対象を抽出して一括（`{"limit_videos","profile"}`） |
+| POST | `/api/comments/refresh-all` | 一括（`{"limit_videos","profile","due_only","all"}`、既定は due_only） |
+| GET | `/api/comments/due` | 期限切れ（更新対象）動画一覧（`?limit=`） |
 | GET | `/api/videos/{id}/comments` | コメント一覧（`?include_missing=&include_raw=&limit=&offset=`） |
 | GET | `/api/videos/{id}/comments/stats` | コメント統計（total/active/missing/状態/次回更新） |
-| GET | `/api/videos/{id}/snapshots` | metadata snapshot 一覧 |
+| GET | `/api/videos/{id}/snapshots` | metadata snapshot 一覧（`?snapshot_type=`） |
+| POST | `/api/live-chat/refresh` | live chat 更新（公式 `{"target":"<id|url>"}`、互換 `{"video":...}`、両方は400） |
+| POST | `/api/videos/{id}/live-chat/refresh` | 指定動画の live chat 更新 |
+| POST | `/api/live-chat/refresh-all` | has_live_chat/is_live かつ期限切れを一括（`{"limit_videos","profile"}`） |
+| GET | `/api/videos/{id}/live-chat` | live chat 一覧（`?include_missing=&superchats_only=&include_raw=&limit=&offset=`） |
+| GET | `/api/videos/{id}/live-chat/stats` | live chat 統計（total/active/missing/superchats/members/状態） |
 | GET | `/api/doctor` | 環境診断（書込可否 / ツール版 / DB / Redis） |
 | GET | `/api/jobs` | ジョブ一覧（`?status=&type=&limit=&offset=`） |
 | GET | `/api/jobs/{id}` | ジョブ詳細（status/error/ログパス/出力先/動画/profile） |
@@ -678,6 +756,7 @@ live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_e
   - `0004` `watch_history_events` に `(source, youtube_video_id, watched_at)` のユニーク制約（Takeout 視聴履歴の重複防止。既存重複は安全に dedup）
   - `0005` `search_history_events` テーブル追加（`(source, query, searched_at)` ユニーク）
   - `0006` `videos` に `last_comments_refresh_at` / `next_comments_refresh_at` / `comments_state`（adaptive コメント更新）
+  - `0007` `videos` に `comment_refresh_failures` / `last_live_chat_refresh_at` / `next_live_chat_refresh_at`(index) / `live_chat_state` / `has_live_chat`、`live_chat_messages` に `time_text` / `amount_text` / `message_type` / `published_at` / `fetched_at` / `is_deleted_or_missing`（Phase 4B。NOT NULL 列は `server_default` 付きで既存行も安全に移行）
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
 - 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 

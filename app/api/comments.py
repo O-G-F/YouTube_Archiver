@@ -19,6 +19,8 @@ from app.models import Comment, MetadataSnapshot, Video
 from app.schemas import (
     AuthorCount,
     CommentOut,
+    CommentsDueOut,
+    CommentsDueVideoOut,
     CommentsRefreshAllOut,
     CommentsRefreshAllRequest,
     CommentsRefreshRequest,
@@ -32,6 +34,10 @@ from app.services.profiles import get_profile_spec
 
 router = APIRouter(tags=["comments"])
 logger = get_logger(__name__)
+
+# Safety cap when no explicit limit is given to refresh-all (avoids enqueuing
+# thousands of jobs by accident).
+_REFRESH_ALL_DEFAULT_LIMIT = 50
 
 
 def _resolve_profile(db: Session, profile: str | None) -> str:
@@ -92,7 +98,9 @@ def refresh_all_comments(
 ) -> CommentsRefreshAllOut:
     profile = _resolve_profile(db, req.profile)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    videos = comment_policy.select_due_videos(db, now, req.limit_videos)
+    due_only = req.effective_due_only()
+    limit = req.limit_videos or _REFRESH_ALL_DEFAULT_LIMIT
+    videos = comment_policy.select_refreshable_videos(db, now, limit, due_only=due_only)
     job_ids: list[int] = []
     for v in videos:
         job_ids.append(jobs_svc.create_comments_refresh_job(db, v, profile_name=profile).id)
@@ -105,8 +113,33 @@ def refresh_all_comments(
         except Exception as exc:  # noqa: BLE001
             logger.warning("comments refresh-all: job %s not submitted: %s", jid, exc)
     return CommentsRefreshAllOut(
-        videos_selected=len(videos), jobs_created=len(job_ids), job_ids=job_ids
+        videos_selected=len(videos),
+        jobs_created=len(job_ids),
+        due_only=due_only,
+        job_ids=job_ids,
     )
+
+
+@router.get("/api/comments/due", response_model=CommentsDueOut)
+def comments_due(
+    db: Session = Depends(get_db),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> CommentsDueOut:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    videos = comment_policy.select_due_videos(db, now, limit)
+    out = [
+        CommentsDueVideoOut(
+            video_id=v.id,
+            youtube_video_id=v.youtube_video_id,
+            title=v.title,
+            comments_state=v.comments_state,
+            last_comments_refresh_at=v.last_comments_refresh_at,
+            next_comments_refresh_at=v.next_comments_refresh_at,
+            due_reason="never_refreshed" if v.next_comments_refresh_at is None else "due",
+        )
+        for v in videos
+    ]
+    return CommentsDueOut(now=now, count=len(out), videos=out)
 
 
 @router.get("/api/videos/{video_id}/comments", response_model=list[CommentOut])
@@ -179,15 +212,12 @@ def video_comments_stats(video_id: int, db: Session = Depends(get_db)) -> Commen
 def list_video_snapshots(
     video_id: int,
     db: Session = Depends(get_db),
+    snapshot_type: str | None = Query(default=None),
     limit: int = Query(default=50, le=500),
 ) -> list[MetadataSnapshot]:
     if db.get(Video, video_id) is None:
         raise HTTPException(status_code=404, detail="video not found")
-    return list(
-        db.scalars(
-            select(MetadataSnapshot)
-            .where(MetadataSnapshot.video_id == video_id)
-            .order_by(MetadataSnapshot.id.desc())
-            .limit(limit)
-        )
-    )
+    stmt = select(MetadataSnapshot).where(MetadataSnapshot.video_id == video_id)
+    if snapshot_type:
+        stmt = stmt.where(MetadataSnapshot.snapshot_type == snapshot_type)
+    return list(db.scalars(stmt.order_by(MetadataSnapshot.id.desc()).limit(limit)))

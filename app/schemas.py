@@ -237,6 +237,31 @@ class SchedulerStatusOut(BaseModel):
     interval_seconds: int
     enabled_collections: int
     crawlable_collections: int
+    comments_enabled: bool = False
+    comments_limit_per_run: int = 0
+    due_comment_videos: int = 0
+    frozen_comment_videos: int = 0
+
+
+class SchedulerRunOnceRequest(BaseModel):
+    # Which parts to run for this manual cycle. Defaults to both.
+    collections: bool = True
+    comments: bool = True
+    max_items: int | None = None
+
+
+class SchedulerRunOnceOut(BaseModel):
+    enabled: bool
+    reason: str
+    collections_checked: int = 0
+    collection_jobs_created: int = 0
+    due_comment_videos_checked: int = 0
+    comments_jobs_created: int = 0
+    skipped_frozen: int = 0
+    skipped_recent: int = 0
+    jobs_created: int = 0
+    submitted: int = 0
+    job_ids: list[int] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -480,14 +505,38 @@ class CommentsRefreshRequest(BaseModel):
 
 
 class CommentsRefreshAllRequest(BaseModel):
+    # ``due_only`` (default) selects videos whose next_comments_refresh_at is due;
+    # set ``all=true`` to refresh every non-frozen video. A safety limit applies.
     limit_videos: int | None = None
     profile: str | None = None
+    due_only: bool = True
+    all: bool = False
+
+    def effective_due_only(self) -> bool:
+        return False if self.all else self.due_only
 
 
 class CommentsRefreshAllOut(BaseModel):
     videos_selected: int
     jobs_created: int
+    due_only: bool = True
     job_ids: list[int] = Field(default_factory=list)
+
+
+class CommentsDueVideoOut(BaseModel):
+    video_id: int
+    youtube_video_id: str
+    title: str | None = None
+    comments_state: str | None = None
+    last_comments_refresh_at: datetime | None = None
+    next_comments_refresh_at: datetime | None = None
+    due_reason: str = "due"
+
+
+class CommentsDueOut(BaseModel):
+    now: datetime
+    count: int
+    videos: list[CommentsDueVideoOut] = Field(default_factory=list)
 
 
 class MetadataSnapshotOut(BaseModel):
@@ -500,3 +549,70 @@ class MetadataSnapshotOut(BaseModel):
     path: str
     checksum: str | None = None
     fetched_at: datetime | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4B: live chat
+# --------------------------------------------------------------------------- #
+class LiveChatMessageOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    video_id: int
+    message_id: str | None = None
+    author_name: str | None = None
+    author_channel_id: str | None = None
+    message: str | None = None
+    timestamp_ms: int | None = None
+    time_text: str | None = None
+    message_type: str | None = None
+    amount: float | None = None
+    amount_text: str | None = None
+    currency: str | None = None
+    is_superchat: bool = False
+    is_member_message: bool = False
+    published_at: datetime | None = None
+    fetched_at: datetime | None = None
+    is_deleted_or_missing: bool = False
+    # raw_json intentionally omitted by default (privacy); only when include_raw=true.
+    raw_json: dict | None = None
+
+
+class LiveChatStatsOut(BaseModel):
+    video_id: int
+    youtube_video_id: str | None = None
+    total: int
+    active: int
+    missing: int
+    superchats: int
+    member_messages: int
+    distinct_authors: int
+    has_live_chat: bool = False
+    live_chat_state: str | None = None
+    last_live_chat_refresh_at: datetime | None = None
+    next_live_chat_refresh_at: datetime | None = None
+
+
+class LiveChatRefreshRequest(BaseModel):
+    # Official field: a video id / URL (see services.jobs.resolve_or_create_video).
+    target: str | None = None
+    video: str | None = None  # backward-compatible alias
+    profile: str | None = None
+    now: bool = False
+
+    def resolved_target(self) -> str | None:
+        return self.target if self.target is not None else self.video
+
+    def has_conflict(self) -> bool:
+        return self.target is not None and self.video is not None
+
+
+class LiveChatRefreshAllRequest(BaseModel):
+    limit_videos: int | None = None
+    profile: str | None = None
+
+
+class LiveChatRefreshAllOut(BaseModel):
+    videos_selected: int
+    jobs_created: int
+    job_ids: list[int] = Field(default_factory=list)

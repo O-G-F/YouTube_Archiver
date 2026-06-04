@@ -71,9 +71,24 @@ class Settings(BaseSettings):
     # 0 = unlimited. yt-dlp --extractor-args youtube:max_comments.
     comment_refresh_max_comments: int = 200
 
-    # ---- Scheduler (Phase 2B) ----
+    # ---- Scheduler (Phase 2B / 4B) ----
     scheduler_enabled: bool = False
     scheduler_interval_seconds: int = 3600
+    # Phase 4B: scheduler also enqueues due comment refreshes when enabled.
+    scheduler_comments_enabled: bool = False
+    scheduler_comments_limit_per_run: int = 10
+
+    # ---- Comments refresh rate control / retry (Phase 4B) ----
+    comments_refresh_job_delay_seconds: float = 0.0
+    comments_refresh_retry_backoff_seconds: int = 21600  # 6h backoff after 429
+    comments_refresh_max_retry: int = 5
+
+    # ---- Live chat (Phase 4B) ----
+    # Cap messages ingested per live_chat refresh (0 = unlimited). Live chats can
+    # be very large; a finite cap keeps a single refresh bounded.
+    live_chat_max_messages: int = 0
+    # Default interval (seconds) before re-refreshing a live chat (default 30d).
+    live_chat_refresh_interval_seconds: int = 2592000
 
     # ---- Rate control / retry (Phase 2B) ----
     # Sleep before each download job starts (spaces out requests on one worker).

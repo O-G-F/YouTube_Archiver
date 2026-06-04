@@ -29,7 +29,7 @@ def test_profiles_listed(client):
     names = {p["name"] for p in resp.json()}
     assert "video_best_archive" in names
     assert "video_best_archive_all_subs" in names
-    assert len(names) == 8
+    assert len(names) == 9
 
 
 def test_archive_url_creates_queued_job(client):

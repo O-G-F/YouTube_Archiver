@@ -24,9 +24,14 @@ from app.config import Settings, get_settings
 from app.db import session_scope
 from app.logging_setup import get_logger
 from app.models import Collection, DownloadProfile
+from app.services import comment_policy
 from app.services import jobs as jobs_svc
 
 logger = get_logger(__name__)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _utc_stamp() -> str:
@@ -51,64 +56,124 @@ def _profile_name_for(session, collection: Collection, settings: Settings) -> st
     return settings.default_profile
 
 
+def _enqueue_collections(s, settings: Settings, reason: str, cap: int | None) -> list[int]:
+    """Create one expand job per crawlable collection. Returns created job ids."""
+    job_ids: list[int] = []
+    collections = list(s.scalars(select(Collection).where(Collection.enabled.is_(True))))
+    for c in collections:
+        policy = c.crawl_policy or "new_only"
+        if policy == "manual":
+            continue
+        profile = _profile_name_for(s, c, settings)
+        try:
+            job = jobs_svc.create_job_for_url(
+                s,
+                c.url,
+                profile,
+                max_items=cap,
+                extra_meta={
+                    "scheduled_by": reason,
+                    "crawl_policy": policy,
+                    "detect_removed": policy == "refresh",
+                    "collection_id": c.id,
+                },
+            )
+            job_ids.append(job.id)
+        except Exception as exc:  # noqa: BLE001 - bad/non-expandable url
+            logger.warning("scheduler: skipping collection %s (%s): %s", c.id, c.url, exc)
+    return job_ids
+
+
+def _crawlable_count(s) -> int:
+    return sum(
+        1
+        for c in s.scalars(select(Collection).where(Collection.enabled.is_(True)))
+        if (c.crawl_policy or "new_only") != "manual"
+    )
+
+
+def _enqueue_due_comments(s, settings: Settings, now: datetime, limit: int | None) -> list[int]:
+    """Create comments_refresh jobs for videos due for a comment refresh."""
+    job_ids: list[int] = []
+    due = comment_policy.select_due_videos(s, now, limit=limit)
+    for v in due:
+        prev = v.next_comments_refresh_at
+        job = jobs_svc.create_comments_refresh_job(
+            s,
+            v,
+            extra_meta={
+                "scheduled_by": "scheduler_comments",
+                "due_reason": "never_refreshed" if prev is None else "due",
+                "previous_next_comments_refresh_at": prev.isoformat() if prev else None,
+                "comments_policy": getattr(v, "comments_refresh_policy", None),
+            },
+        )
+        job_ids.append(job.id)
+    return job_ids
+
+
 def run_once(
     settings: Settings | None = None,
     *,
     reason: str = "scheduler",
     max_items: int | None = None,
+    do_collections: bool = True,
+    do_comments: bool = True,
 ) -> dict:
-    """Create one expand job per crawlable collection. Returns a summary dict.
+    """One scheduler cycle: re-crawl collections and/or enqueue due comment refreshes.
 
-    With ``reason="scheduler"`` the run is skipped when SCHEDULER_ENABLED is
-    false. A manual run (``reason="manual"``) always runs.
+    With ``reason="scheduler"`` each part runs only if its toggle is enabled
+    (``SCHEDULER_ENABLED`` for collections, ``SCHEDULER_COMMENTS_ENABLED`` for
+    comments). A manual run (``reason="manual"``) honours the ``do_*`` flags
+    directly (used by the run-once CLI/API ``--collections``/``--comments``).
     """
     settings = settings or get_settings()
     settings.ensure_dirs()
 
-    if reason == "scheduler" and not settings.scheduler_enabled:
-        _scheduler_log(settings, "skip: SCHEDULER_ENABLED is false")
-        return {
-            "enabled": False,
-            "reason": reason,
-            "collections_checked": 0,
-            "jobs_created": 0,
-            "submitted": 0,
-            "job_ids": [],
-        }
+    is_scheduler = reason == "scheduler"
+    run_collections = do_collections and (settings.scheduler_enabled if is_scheduler else True)
+    run_comments = do_comments and (settings.scheduler_comments_enabled if is_scheduler else True)
 
+    empty = {
+        "enabled": run_collections or run_comments,
+        "reason": reason,
+        "collections_checked": 0,
+        "collection_jobs_created": 0,
+        "due_comment_videos_checked": 0,
+        "comments_jobs_created": 0,
+        "skipped_frozen": 0,
+        "skipped_recent": 0,
+        "jobs_created": 0,
+        "submitted": 0,
+        "job_ids": [],
+    }
+    if not run_collections and not run_comments:
+        _scheduler_log(settings, f"skip: nothing to do (reason={reason})")
+        return empty
+
+    now = _now()
     cap = max_items if max_items is not None else settings.expand_max_items
-    job_ids: list[int] = []
-    checked = 0
+    collection_job_ids: list[int] = []
+    comment_job_ids: list[int] = []
+    collections_checked = 0
+    due_checked = 0
+    skipped_frozen = 0
+    skipped_recent = 0
+
     with session_scope() as s:
-        collections = list(
-            s.scalars(select(Collection).where(Collection.enabled.is_(True)))
-        )
-        for c in collections:
-            policy = c.crawl_policy or "new_only"
-            if policy == "manual":
-                continue
-            checked += 1
-            profile = _profile_name_for(s, c, settings)
-            try:
-                job = jobs_svc.create_job_for_url(
-                    s,
-                    c.url,
-                    profile,
-                    max_items=cap,
-                    extra_meta={
-                        "scheduled_by": reason,
-                        "crawl_policy": policy,
-                        "detect_removed": policy == "refresh",
-                        "collection_id": c.id,
-                    },
-                )
-                job_ids.append(job.id)
-            except Exception as exc:  # noqa: BLE001 - bad/non-expandable url
-                logger.warning(
-                    "scheduler: skipping collection %s (%s): %s", c.id, c.url, exc
-                )
+        if run_collections:
+            collections_checked = _crawlable_count(s)
+            collection_job_ids = _enqueue_collections(s, settings, reason, cap)
+        if run_comments:
+            skipped_frozen = comment_policy.count_frozen(s)
+            skipped_recent = comment_policy.count_recent(s, now)
+            comment_job_ids = _enqueue_due_comments(
+                s, settings, now, settings.scheduler_comments_limit_per_run
+            )
+            due_checked = len(comment_job_ids)
         s.commit()
 
+    job_ids = collection_job_ids + comment_job_ids
     submitted = 0
     for jid in job_ids:
         try:
@@ -120,7 +185,12 @@ def run_once(
     summary = {
         "enabled": True,
         "reason": reason,
-        "collections_checked": checked,
+        "collections_checked": collections_checked,
+        "collection_jobs_created": len(collection_job_ids),
+        "due_comment_videos_checked": due_checked,
+        "comments_jobs_created": len(comment_job_ids),
+        "skipped_frozen": skipped_frozen,
+        "skipped_recent": skipped_recent,
         "jobs_created": len(job_ids),
         "submitted": submitted,
         "job_ids": job_ids,
@@ -152,6 +222,7 @@ def run_forever(settings: Settings | None = None) -> None:
 
 def status(settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
+    now = _now()
     with session_scope() as s:
         enabled_collections = int(
             s.scalar(
@@ -171,9 +242,15 @@ def status(settings: Settings | None = None) -> dict:
             )
             or 0
         )
+        due_comment_videos = len(comment_policy.select_due_videos(s, now))
+        frozen_comment_videos = comment_policy.count_frozen(s)
     return {
         "enabled": settings.scheduler_enabled,
         "interval_seconds": settings.scheduler_interval_seconds,
         "enabled_collections": enabled_collections,
         "crawlable_collections": crawlable,
+        "comments_enabled": settings.scheduler_comments_enabled,
+        "comments_limit_per_run": settings.scheduler_comments_limit_per_run,
+        "due_comment_videos": due_comment_videos,
+        "frozen_comment_videos": frozen_comment_videos,
     }

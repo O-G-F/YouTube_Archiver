@@ -1,11 +1,15 @@
-"""Scheduler status / manual trigger endpoints (Phase 2B)."""
+"""Scheduler status / manual trigger endpoints (Phase 2B / 4B)."""
 
 from __future__ import annotations
 
 from fastapi import APIRouter
 
 from app.config import get_settings
-from app.schemas import RefreshAllResult, SchedulerStatusOut
+from app.schemas import (
+    SchedulerRunOnceOut,
+    SchedulerRunOnceRequest,
+    SchedulerStatusOut,
+)
 from app.services import scheduler as scheduler_svc
 
 router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
@@ -16,12 +20,21 @@ def scheduler_status() -> SchedulerStatusOut:
     return SchedulerStatusOut(**scheduler_svc.status(get_settings()))
 
 
-@router.post("/run-once", response_model=RefreshAllResult)
-def scheduler_run_once() -> RefreshAllResult:
-    """Manually trigger one scheduler pass (runs even if SCHEDULER_ENABLED=false)."""
-    summary = scheduler_svc.run_once(get_settings(), reason="manual")
-    return RefreshAllResult(
-        collections_checked=summary["collections_checked"],
-        jobs_created=summary["jobs_created"],
-        job_ids=summary["job_ids"],
+@router.post("/run-once", response_model=SchedulerRunOnceOut)
+def scheduler_run_once(
+    req: SchedulerRunOnceRequest | None = None,
+) -> SchedulerRunOnceOut:
+    """Manually trigger one scheduler pass (runs even if SCHEDULER_ENABLED=false).
+
+    Body selects which parts to run: ``{"collections": true, "comments": true}``
+    (both default true). The summary reports collection + comment job counts.
+    """
+    req = req or SchedulerRunOnceRequest()
+    summary = scheduler_svc.run_once(
+        get_settings(),
+        reason="manual",
+        max_items=req.max_items,
+        do_collections=req.collections,
+        do_comments=req.comments,
     )
+    return SchedulerRunOnceOut(**summary)

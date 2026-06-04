@@ -95,10 +95,10 @@ def _profile_name(db: Session, collection: Collection) -> str:
 def refresh_all(db: Session = Depends(get_db)) -> RefreshAllResult:
     from app.services.scheduler import run_once
 
-    summary = run_once(get_settings(), reason="manual_refresh_all")
+    summary = run_once(get_settings(), reason="manual_refresh_all", do_comments=False)
     return RefreshAllResult(
         collections_checked=summary["collections_checked"],
-        jobs_created=summary["jobs_created"],
+        jobs_created=summary["collection_jobs_created"],
         job_ids=summary["job_ids"],
     )
 

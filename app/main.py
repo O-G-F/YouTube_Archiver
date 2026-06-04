@@ -19,6 +19,7 @@ from app.api import (
     doctor,
     health,
     jobs,
+    live_chat,
     profiles,
     scheduler,
     search_history,
@@ -58,6 +59,7 @@ app.include_router(watch_history.router)
 app.include_router(search_history.router)
 app.include_router(subscriptions.router)
 app.include_router(comments.router)
+app.include_router(live_chat.router)
 app.include_router(jobs.router)
 app.include_router(profiles.router)
 app.include_router(videos.router)

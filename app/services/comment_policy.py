@@ -16,12 +16,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from app.config import Settings
 from app.models import Video
 
 FROZEN_STATES = ("comments_disabled", "unavailable", "frozen")
+LIVE_CHAT_FROZEN_STATES = ("frozen", "unavailable")
 
 
 def _upload_datetime(video: Video) -> datetime | None:
@@ -72,6 +74,111 @@ def select_due_videos(session: Session, now: datetime, limit: int | None = None)
         .order_by(
             Video.next_comments_refresh_at.is_(None).desc(),
             Video.next_comments_refresh_at.asc(),
+            Video.id.asc(),
+        )
+    )
+    if limit:
+        stmt = stmt.limit(limit)
+    return list(session.scalars(stmt))
+
+
+def select_refreshable_videos(
+    session: Session, now: datetime, limit: int | None = None, *, due_only: bool = True
+) -> list[Video]:
+    """Refreshable videos. ``due_only`` uses next_comments_refresh_at; otherwise
+    every non-frozen video (used by ``comments refresh-all --all``)."""
+    stmt = select(Video).where(
+        or_(Video.comments_state.is_(None), Video.comments_state.notin_(FROZEN_STATES))
+    )
+    if due_only:
+        stmt = stmt.where(
+            or_(
+                Video.next_comments_refresh_at.is_(None),
+                Video.next_comments_refresh_at <= now,
+            )
+        )
+    stmt = stmt.order_by(
+        Video.next_comments_refresh_at.is_(None).desc(),
+        Video.next_comments_refresh_at.asc(),
+        Video.id.asc(),
+    )
+    if limit:
+        stmt = stmt.limit(limit)
+    return list(session.scalars(stmt))
+
+
+def count_frozen(session: Session) -> int:
+    return int(
+        session.scalar(
+            select(func.count(Video.id)).where(Video.comments_state.in_(FROZEN_STATES))
+        )
+        or 0
+    )
+
+
+def count_recent(session: Session, now: datetime) -> int:
+    """Videos not yet due (next_comments_refresh_at in the future)."""
+    return int(
+        session.scalar(
+            select(func.count(Video.id)).where(
+                or_(
+                    Video.comments_state.is_(None),
+                    Video.comments_state.notin_(FROZEN_STATES),
+                ),
+                Video.next_comments_refresh_at.is_not(None),
+                Video.next_comments_refresh_at > now,
+            )
+        )
+        or 0
+    )
+
+
+def apply_comment_backoff(video: Video, now: datetime, settings: Settings) -> datetime:
+    """On HTTP 429: bump failure count and back off ``next_comments_refresh_at``.
+
+    After ``COMMENTS_REFRESH_MAX_RETRY`` consecutive failures, back off at least
+    one day so we stop hammering a persistently rate-limited video.
+    """
+    video.comment_refresh_failures = (video.comment_refresh_failures or 0) + 1
+    backoff = settings.comments_refresh_retry_backoff_seconds or 21600
+    if video.comment_refresh_failures >= (settings.comments_refresh_max_retry or 5):
+        backoff = max(backoff, 86400)
+    nxt = now + timedelta(seconds=backoff)
+    video.next_comments_refresh_at = nxt
+    return nxt
+
+
+# --------------------------------------------------------------------------- #
+# Live chat scheduling (Phase 4B)
+# --------------------------------------------------------------------------- #
+def compute_next_live_chat_refresh(
+    video: Video, now: datetime, settings: Settings
+) -> datetime | None:
+    if (video.live_chat_state or "") in LIVE_CHAT_FROZEN_STATES:
+        return None
+    return now + timedelta(seconds=settings.live_chat_refresh_interval_seconds or 2592000)
+
+
+def select_due_live_chat_videos(
+    session: Session, now: datetime, limit: int | None = None
+) -> list[Video]:
+    """Videos known to have (or to be) live, due for a live-chat refresh."""
+    stmt = (
+        select(Video)
+        .where(
+            or_(Video.has_live_chat.is_(True), Video.is_live.is_(True)),
+            or_(
+                Video.live_chat_state.is_(None),
+                Video.live_chat_state.notin_(LIVE_CHAT_FROZEN_STATES),
+            ),
+            or_(
+                Video.next_live_chat_refresh_at.is_(None),
+                Video.next_live_chat_refresh_at <= now,
+            ),
+        )
+        .order_by(
+            Video.next_live_chat_refresh_at.is_(None).desc(),
+            Video.next_live_chat_refresh_at.asc(),
             Video.id.asc(),
         )
     )
