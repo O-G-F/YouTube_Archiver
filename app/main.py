@@ -26,9 +26,11 @@ from app.api import (
     doctor,
     health,
     jobs,
+    library,
     live_chat,
     profiles,
     scheduler,
+    search,
     search_history,
     settings as settings_api,
     sources,
@@ -86,6 +88,8 @@ app.include_router(live_chat.router)
 app.include_router(jobs.router)
 app.include_router(profiles.router)
 app.include_router(videos.router)
+app.include_router(search.router)
+app.include_router(library.router)
 
 
 # --------------------------------------------------------------------------- #

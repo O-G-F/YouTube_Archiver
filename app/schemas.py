@@ -93,9 +93,25 @@ class VideoOut(BaseModel):
 
 
 class VideoListItemOut(VideoOut):
-    """Video list row with a media-file count (Phase 5A UI)."""
+    """Video list row with media-body count + thumbnail flag (Phase 5A/5B UI)."""
 
-    media_files_count: int = 0
+    media_files_count: int = 0  # video/audio BODY files only (0 -> 未保存)
+    has_thumbnail: bool = False
+
+
+class RelatedVideosOut(BaseModel):
+    """Related videos for the player sidebar (Phase 5B)."""
+
+    same_channel: list[VideoListItemOut] = Field(default_factory=list)
+    same_collection: list[VideoListItemOut] = Field(default_factory=list)
+
+
+class ChannelOut(BaseModel):
+    """A distinct channel with its video count (Videos filter dropdown)."""
+
+    channel_id: str | None = None
+    channel_title: str | None = None
+    count: int = 0
 
 
 class MediaFileOut(BaseModel):
@@ -112,6 +128,7 @@ class MediaFileOut(BaseModel):
 
 
 class VideoDetailOut(VideoOut):
+    description: str | None = None  # public video description (detail view only)
     media_files: list[MediaFileOut] = Field(default_factory=list)
     subtitle_count: int = 0
     comment_count: int = 0
@@ -141,6 +158,22 @@ class JobLogsOut(BaseModel):
     stderr: str | None = None
 
 
+class JobClassification(BaseModel):
+    """Derived, human-friendly hints about a job's outcome (Phase 5B)."""
+
+    rate_limited: bool = False  # HTTP 429 seen
+    partial: bool = False  # finished with usable output despite non-zero exit
+    retryable: bool = False
+    warnings: list[str] = Field(default_factory=list)  # low-severity notes
+    summary: str | None = None  # short headline for the UI
+
+
+class JobOutClassified(JobOut):
+    """Job list row plus a derived classification (Phase 5B job UI)."""
+
+    classification: JobClassification = Field(default_factory=JobClassification)
+
+
 class JobDetailOut(JobOut):
     stdout_log_path: str | None = None
     stderr_log_path: str | None = None
@@ -148,6 +181,7 @@ class JobDetailOut(JobOut):
     output_dir: str | None = None
     video: VideoOut | None = None
     profile: ProfileOut | None = None
+    classification: JobClassification = Field(default_factory=JobClassification)
 
 
 class BuildCommandRequest(BaseModel):
@@ -689,3 +723,42 @@ class SettingsOut(BaseModel):
 
     items: list[SettingsItem] = Field(default_factory=list)
     profiles: list[ProfileOut] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5B: search + library
+# --------------------------------------------------------------------------- #
+class SearchResultOut(BaseModel):
+    """One search hit. ``type`` is video | comment | live_chat | collection.
+
+    Privacy: raw_json is never included; snippets are short text excerpts.
+    """
+
+    type: str
+    title: str | None = None  # video/collection title (or context)
+    snippet: str | None = None  # matched text excerpt (comment/live_chat/desc)
+    video_id: int | None = None
+    youtube_video_id: str | None = None
+    collection_id: int | None = None
+    author_name: str | None = None  # for comment/live_chat hits
+    extra: str | None = None  # e.g. like_count / message_type / channel
+
+
+class SearchOut(BaseModel):
+    query: str
+    total: int
+    results: list[SearchResultOut] = Field(default_factory=list)
+
+
+class LibraryCategoryOut(BaseModel):
+    """A library section (Phase 5B forward-compat for liked/history/etc.)."""
+
+    key: str  # liked_videos | watch_history | search_history | subscriptions | playlists
+    label: str
+    count: int = 0
+    available: bool = True  # False -> planned (e.g. liked videos sync)
+    note: str | None = None
+
+
+class LibrarySummaryOut(BaseModel):
+    categories: list[LibraryCategoryOut] = Field(default_factory=list)

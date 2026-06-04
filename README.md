@@ -28,12 +28,13 @@ YouTube の動画・メタデータ・字幕・コメントを `yt-dlp` でロ�
 - **コメント / メタデータ更新（Phase 4A）** — 本体を再DLせず info.json・コメント更新、`comments` 正規化保存と新規/更新/消失/再発見の差分、adaptive refresh policy（土台）、metadata_snapshots（checksum 付き）、429/コメント無効/削除の分類、`COMMENT_REFRESH_MAX_COMMENTS`
 - **scheduler 連携コメント定期更新・live chat 取得（Phase 4B）** — scheduler が `next_comments_refresh_at` の期限切れ動画へ自動でコメント更新ジョブを投入（`SCHEDULER_COMMENTS_ENABLED`、1パス上限 `SCHEDULER_COMMENTS_LIMIT_PER_RUN`、frozen/recent 除外）、429 で `comment_refresh_failures` 加算＋backoff 再スケジュール、`live_chat_refresh` ジョブ（本体・コメント再DLなし、`--write-subs --sub-langs live_chat`）で `live_chat_messages` を正規化保存（super chat/メンバー/差分対応）、非ライブ動画は `not_available` 扱いでエラーにしない
 - **管理用 Web UI（Phase 5A）** — React + Vite + TypeScript の管理コンソールを FastAPI が同一オリジンで配信（`/`）。Dashboard / Jobs / Job 詳細（ログ tab・secret マスク）/ Videos / Video 詳細（簡易プレイヤー・comments/live chat・snapshots・refresh ボタン）/ Collections / Collection 詳細 / Add(URL・expand・channel) / Takeout / Settings・Doctor。CLI/curl なしで登録・refresh・ログ確認が可能。secret/cookie/token は UI・ログに出さない
+- **視聴 UI / プレイヤー・検索（Phase 5B）** — 保存済み動画を**ブラウザでシーク再生**（HTTP Range 対応の `media` 配信）。YouTube 風 Video 詳細（プレイヤー＋タイトル＋チャンネル＋説明折りたたみ＋コメント親子表示＋ライブチャット super chat/メンバー区別＋同 channel/同 collection の関連動画）。横断検索（`/api/search`：動画/コメント/ライブチャット/コレクション）、Videos のチャンネル/状態フィルタ・並び替え・サムネ・ページング、Job の 429/partial_success 分類表示、Library（liked/history/subscriptions/playlists の将来分類）。body 未保存（metadata_only）は「未保存」と明示
 - 字幕は安全な許可リスト（`ja,en`、`all` は明示時のみ）、YouTube JS チャレンジ対応（`--remote-components ejs:github` + deno）、`curl_cffi` 同梱
 - 失敗ジョブ管理（ステータス・エラーメッセージ・再実行・キャンセル）+ `partial_success` / retryable
 - 運用補強（Phase 1.5）: `doctor` 診断、ジョブログ API/CLI（path traversal 対策）、profile dry-run
 - Web API（登録 / 展開 / コレクション / 再クロール / scheduler / ジョブ / プロファイル / 動画 / 診断）と CLI の両方
 - Docker Compose（web / worker / scheduler / postgres / redis / migrate）
-- Alembic マイグレーション（0001 初期 〜 0007 live chat / comment retry）+ pytest（201 tests）+ フロント Vitest（8 tests）
+- Alembic マイグレーション（0001 初期 〜 0007 live chat / comment retry）+ pytest（211 tests）+ フロント Vitest（14 tests）
 
 ---
 
@@ -578,7 +579,59 @@ npm test             # vitest
 
 ### 未実装（今後）
 
-- 本格的な YouTube 風プレイヤー（Phase 5B 以降）、ユーザー認証 / RBAC、YouTube Data API OAuth。
+- ユーザー認証 / RBAC、YouTube Data API OAuth（Phase 6A 以降）。
+
+---
+
+## Phase 5B: 視聴 UI / プレイヤー・検索
+
+Phase 5A の管理 UI を壊さずに、**保存済み動画の視聴体験**と**検索/ライブラリ**を追加しています。
+
+### 動画再生（HTTP Range 対応）
+
+`GET /api/videos/{id}/media/{media_file_id}` が **HTTP Range** に対応し（Starlette の `FileResponse`）、HTML `<video>` でのシーク再生ができます。
+
+- 全件取得: `200` + `Accept-Ranges: bytes` + `Content-Type`（拡張子から判定：mp4/webm/mkv/m4a/opus…）+ `Content-Length`
+- 範囲取得: `Range: bytes=start-end` → `206 Partial Content` + `Content-Range: bytes start-end/total`
+- 配信は **DB 登録済み MediaFile のみ**（パスはユーザー入力ではなく DB 由来）。`ARCHIVE_ROOT` 配下に強制し、traversal は不可。
+- 本体（video/audio）が無い動画（`metadata_only` のみ等）は Video 詳細で **「未保存」** と表示し、再生 UI は出しません。
+
+```bash
+# Range が効くことの確認（保存済み動画 + その video media file id）
+curl -s -D - -o /dev/null -H "Range: bytes=0-1023" \
+  "http://localhost:8000/api/videos/<VIDEO_ID>/media/<MEDIA_FILE_ID>"
+# -> HTTP/1.1 206 Partial Content / Content-Range: bytes 0-1023/<total> / Accept-Ranges: bytes
+```
+
+### 保存済み動画 vs metadata_only
+
+- `video_compressed_1080p` / `video_best_archive` 等の**動画保存プロファイル**だけが本体（video/audio）を保存します。Videos 一覧の **body** 列・Video 詳細のプレイヤーはこの**本体ファイル数**を見ます（info.json/サムネ等のメタファイルは body に数えません）。
+- `metadata_only` / `comments_refresh` / `live_chat_refresh` は**本体を保存しません**（body=0、「未保存」）。
+
+### YouTube 風 Video 詳細
+
+メインプレイヤー＋タイトル＋チャンネル＋アップロード日/長さ＋**説明の折りたたみ**＋タブ（Comments / Live chat / Details）。
+
+- **Comments**: author / text / like_count / published_at、top-level と reply の**親子表示**（取得済みの範囲で）、長文は折りたたみ、`raw_json` は既定非表示。
+- **Live chat**: timestamp / author / message / `amount_text` / `message_type`、**super chat / membership を色分け**、`not_available` を明示、`raw_json`/author 詳細は既定非表示。
+- **関連動画**（サイドバー）: 同 channel・同 collection（将来 watch history / liked / playlists を足せる構造）。
+- Details: メタデータ・media files（再生リンク）・snapshots・関連 jobs/collections。
+- コメント/ライブチャットの **refresh ボタン**でジョブ作成。
+
+### 検索 / Videos 強化 / Library
+
+- **検索** `GET /api/search?q=&types=&limit=` — 動画(title/channel/id) / コメント(text) / ライブチャット(text) / コレクション(title) を ILIKE 横断。`type` 別に結果を返し、**`raw_json` は返さない**（短い snippet のみ）。UI は `/search`。
+- **Videos** `/videos` — 検索 + **channel フィルタ**（`/api/videos/channels`）+ comments_state/live_chat_state/body フィルタ + 並び替え（recently added / oldest / newest upload / title）+ **サムネ表示** + ページング。
+- **Library** `/library`（`/api/library/summary`）— liked videos / watch history / search history / subscriptions / playlists の**将来分類**。liked videos は未同期（`available=false`）で、**Google Takeout と YouTube Data API の両方**を後続フェーズ（6A+）で検討します。
+
+### Job UI（429 / partial_success）
+
+ジョブ応答に**分類**（`classification`）を付与：`rate_limited`（meta or stderr の `HTTP Error 429`）/ `partial`（`partial_success`）/ `retryable` / `warnings`（impersonation 等の任意依存不足は**低重要度**）。Jobs 一覧に `429` / `partial` バッジ、Job 詳細に分かりやすい説明（「字幕取得の一時的なレート制限。少し待って Retry」）を表示。
+
+### セキュリティ（5B）
+
+- media 配信は **DB 登録済みファイルのみ**・`ARCHIVE_ROOT` 配下強制（Range でも範囲外/別パスは読めない）。
+- comments / live chat / 検索 snippet は React で HTML エスケープ。`raw_json` は既定非返却。secret/cookie/token は UI・ログに出さない（5A の `mask_secrets` 継続）。
 
 ---
 
@@ -739,10 +792,16 @@ archiver live-chat stats VIDEO_ID
 | GET | `/api/videos/{id}` | 動画詳細（メディアファイル/字幕数/コメント数 + comments/live_chat 状態） |
 | GET | `/api/videos/{id}/jobs` | その動画の関連ジョブ【Phase 5A】 |
 | GET | `/api/videos/{id}/collections` | その動画が属する collection【Phase 5A】 |
-| GET | `/api/videos/{id}/media/{media_file_id}` | media body 配信（DB 登録ファイルのみ・`ARCHIVE_ROOT` 配下強制）【Phase 5A】 |
+| GET | `/api/videos/{id}/media/{media_file_id}` | media body 配信（**HTTP Range 対応**・DB 登録ファイルのみ・`ARCHIVE_ROOT` 配下強制）【Phase 5A/5B】 |
+| GET | `/api/videos/{id}/thumbnail` | サムネ配信（guarded）【Phase 5B】 |
+| GET | `/api/videos/{id}/related` | 関連動画（同 channel + 同 collection）【Phase 5B】 |
+| GET | `/api/videos/channels` | 動画を持つ channel 一覧（件数付き、フィルタ用）【Phase 5B】 |
+| GET | `/api/search` | 横断検索（`?q=&types=video,comment,live_chat,collection&limit=`、raw 非返却）【Phase 5B】 |
+| GET | `/api/library/summary` | ライブラリ分類サマリ（liked は planned）【Phase 5B】 |
 | GET | `/api/takeout/files` | `TAKEOUT_IMPORT_ROOT` 配下の ZIP 一覧（root 外は不可）【Phase 5A】 |
 
-UI は `/`（管理コンソール）、OpenAPI は `/docs`（Swagger UI）/ `/redoc`。
+`/api/jobs`・`/api/jobs/{id}` は **`classification`**（429/partial/retryable/warnings）を含みます【Phase 5B】。Videos 一覧は `?channel_id=&sort=` を追加。
+UI は `/`（管理コンソール + 視聴）、OpenAPI は `/docs`（Swagger UI）/ `/redoc`。
 
 ログ API は **`LOG_ROOT/jobs/<id>/` 配下の 3 ファイルのみ**を読み、解決後パスが `LOG_ROOT` 内にあることを検証します（path traversal 対策）。それ以外は 404。
 

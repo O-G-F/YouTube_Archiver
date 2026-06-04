@@ -3,7 +3,8 @@ import { Link } from "react-router-dom";
 import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
 import { fmtDate } from "../lib/format";
-import { ErrorBox, Loading, StatusBadge } from "../components/ui";
+import { ErrorBox, Loading } from "../components/ui";
+import { JobBadges } from "../components/JobBadges";
 import type { Job } from "../api/types";
 
 const STATUSES = ["", "queued", "running", "success", "partial_success", "failed", "canceled"];
@@ -95,7 +96,7 @@ export default function Jobs() {
                   <Link to={`/jobs/${j.id}`}>#{j.id}</Link>
                 </td>
                 <td>
-                  <StatusBadge status={j.status} />
+                  <JobBadges job={j} />
                 </td>
                 <td>{j.type}</td>
                 <td className="muted">{j.profile_name ?? "—"}</td>

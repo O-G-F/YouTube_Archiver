@@ -1,5 +1,6 @@
 import { apiGet, apiPost, apiPatch, apiText } from "./client";
 import type {
+  Channel,
   Collection,
   CollectionItem,
   Comment,
@@ -10,20 +11,31 @@ import type {
   JobDetail,
   JobLogs,
   JobStats,
+  LibrarySummary,
   LiveChatMessage,
   LiveChatStats,
   MetadataSnapshot,
   Profile,
+  RelatedVideos,
   SchedulerRunOnceResult,
   SchedulerStatus,
+  SearchResponse,
   SettingsView,
   TakeoutFiles,
   TakeoutImportAll,
   TakeoutPreview,
-  Video,
   VideoDetail,
   VideoListItem,
 } from "./types";
+
+export function mediaUrl(videoId: number, mediaFileId: number): string {
+  const base = (import.meta.env.VITE_API_BASE as string | undefined) ?? "";
+  return `${base}/api/videos/${videoId}/media/${mediaFileId}`;
+}
+export function thumbnailUrl(videoId: number): string {
+  const base = (import.meta.env.VITE_API_BASE as string | undefined) ?? "";
+  return `${base}/api/videos/${videoId}/thumbnail`;
+}
 
 const qs = (params: Record<string, string | number | boolean | undefined>) => {
   const u = new URLSearchParams();
@@ -58,15 +70,19 @@ export const api = {
   // Videos
   videos: (p: {
     q?: string;
+    channel_id?: string;
     comments_state?: string;
     live_chat_state?: string;
     has_media?: boolean;
+    sort?: string;
     limit?: number;
     offset?: number;
   }) => apiGet<VideoListItem[]>(`/api/videos${qs(p)}`),
+  videoChannels: () => apiGet<Channel[]>("/api/videos/channels"),
   video: (id: number) => apiGet<VideoDetail>(`/api/videos/${id}`),
   videoJobs: (id: number) => apiGet<Job[]>(`/api/videos/${id}/jobs`),
   videoCollections: (id: number) => apiGet<Collection[]>(`/api/videos/${id}/collections`),
+  videoRelated: (id: number) => apiGet<RelatedVideos>(`/api/videos/${id}/related`),
   videoComments: (id: number, p: { limit?: number; include_missing?: boolean } = {}) =>
     apiGet<Comment[]>(`/api/videos/${id}/comments${qs(p)}`),
   videoCommentStats: (id: number) => apiGet<CommentStats>(`/api/videos/${id}/comments/stats`),
@@ -108,4 +124,9 @@ export const api = {
   takeoutPreview: (path: string) => apiPost<TakeoutPreview>("/api/takeout/preview", { path }),
   takeoutImportAll: (body: Record<string, unknown>) =>
     apiPost<TakeoutImportAll>("/api/takeout/import-all", body),
+
+  // Search / Library (Phase 5B)
+  search: (p: { q: string; types?: string; limit?: number }) =>
+    apiGet<SearchResponse>(`/api/search${qs(p)}`),
+  librarySummary: () => apiGet<LibrarySummary>("/api/library/summary"),
 };

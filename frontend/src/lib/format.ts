@@ -39,6 +39,13 @@ export function fmtUploadDate(s: string | null | undefined): string {
   return s;
 }
 
+export function fmtCount(n: number | null | undefined): string {
+  if (n == null) return "0";
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}K`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
 export function statusKind(status: string): "ok" | "err" | "warn" | "run" | "muted" {
   switch (status) {
     case "success":

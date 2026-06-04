@@ -4,6 +4,16 @@ import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
 import { fmtDate } from "../lib/format";
 import { Bool, ErrorBox, KV, Loading } from "../components/ui";
+import { Thumb } from "../components/Thumb";
+
+const TYPE_LABELS: Record<string, string> = {
+  playlist: "Playlist",
+  takeout_playlist: "Playlist (Takeout)",
+  channel: "Channel (subscription)",
+  channel_videos: "Channel · videos",
+  channel_shorts: "Channel · shorts",
+  channel_streams: "Channel · streams",
+};
 
 export default function CollectionDetail() {
   const { id } = useParams();
@@ -53,7 +63,7 @@ export default function CollectionDetail() {
           <h2>Info</h2>
           <KV
             rows={[
-              ["Type", c.type],
+              ["Type", <span className="badge muted">{TYPE_LABELS[c.type] ?? c.type}</span>],
               ["Enabled", <Bool value={c.enabled} />],
               ["Crawl policy", c.crawl_policy ?? "—"],
               ["Items", String(c.item_count)],
@@ -103,7 +113,7 @@ export default function CollectionDetail() {
               <thead>
                 <tr>
                   <th>Pos</th>
-                  <th>Video id</th>
+                  <th>Video</th>
                   <th>Discovered</th>
                   <th>Last seen</th>
                   <th>Removed</th>
@@ -111,14 +121,25 @@ export default function CollectionDetail() {
               </thead>
               <tbody>
                 {items.data?.map((it) => (
-                  <tr key={it.id} style={it.removed_at ? { opacity: 0.55 } : undefined}>
+                  <tr key={it.id} style={it.removed_at ? { opacity: 0.5 } : undefined}>
                     <td className="muted small">{it.position ?? "—"}</td>
-                    <td className="mono small">
-                      {it.video_id ? (
-                        <Link to={`/videos/${it.video_id}`}>{it.youtube_video_id ?? `#${it.video_id}`}</Link>
-                      ) : (
-                        it.youtube_video_id ?? "—"
-                      )}
+                    <td>
+                      <div className="video-thumb-cell">
+                        {it.video_id ? (
+                          <Link to={`/videos/${it.video_id}`}>
+                            <Thumb videoId={it.video_id} has={true} size="row" />
+                          </Link>
+                        ) : (
+                          <div className="thumb thumb-ph row">no image</div>
+                        )}
+                        <span className="mono small">
+                          {it.video_id ? (
+                            <Link to={`/videos/${it.video_id}`}>{it.youtube_video_id ?? `#${it.video_id}`}</Link>
+                          ) : (
+                            it.youtube_video_id ?? "—"
+                          )}
+                        </span>
+                      </div>
                     </td>
                     <td className="muted small">{fmtDate(it.discovered_at)}</td>
                     <td className="muted small">{fmtDate(it.last_seen_at)}</td>

@@ -4,6 +4,7 @@ import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
 import { fmtDate } from "../lib/format";
 import { ErrorBox, JsonBlock, KV, Loading, StatusBadge } from "../components/ui";
+import { JobClassificationNote } from "../components/JobBadges";
 
 type Tab = "command" | "stdout" | "stderr";
 
@@ -55,6 +56,7 @@ export default function JobDetail() {
         <Link to="/jobs">← back to jobs</Link>
       </p>
       <ErrorBox error={actionErr} />
+      <JobClassificationNote job={job} />
 
       <div className="grid2">
         <div className="panel">

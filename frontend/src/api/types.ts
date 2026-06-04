@@ -9,6 +9,14 @@ export interface Health {
   redis: boolean;
 }
 
+export interface JobClassification {
+  rate_limited: boolean;
+  partial: boolean;
+  retryable: boolean;
+  warnings: string[];
+  summary: string | null;
+}
+
 export interface Job {
   id: number;
   type: string;
@@ -28,6 +36,7 @@ export interface Job {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  classification?: JobClassification;
 }
 
 export interface Profile {
@@ -82,7 +91,19 @@ export interface Video {
 }
 
 export interface VideoListItem extends Video {
-  media_files_count: number;
+  media_files_count: number; // video/audio BODY files only (0 -> 未保存)
+  has_thumbnail: boolean;
+}
+
+export interface RelatedVideos {
+  same_channel: VideoListItem[];
+  same_collection: VideoListItem[];
+}
+
+export interface Channel {
+  channel_id: string | null;
+  channel_title: string | null;
+  count: number;
 }
 
 export interface MediaFile {
@@ -97,6 +118,7 @@ export interface MediaFile {
 }
 
 export interface VideoDetail extends Video {
+  description: string | null;
   media_files: MediaFile[];
   subtitle_count: number;
   comment_count: number;
@@ -197,6 +219,7 @@ export interface Comment {
   comment_id: string;
   parent_comment_id: string | null;
   author_name: string | null;
+  author_channel_id?: string | null;
   text: string | null;
   like_count: number | null;
   published_at: string | null;
@@ -298,6 +321,33 @@ export interface TakeoutImportAll {
   subscriptions: TakeoutImportResult;
   playlists: PlaylistsImportResult;
   dry_run: boolean;
+}
+
+export interface SearchResult {
+  type: "video" | "comment" | "live_chat" | "collection";
+  title: string | null;
+  snippet: string | null;
+  video_id: number | null;
+  youtube_video_id: string | null;
+  collection_id: number | null;
+  author_name: string | null;
+  extra: string | null;
+}
+export interface SearchResponse {
+  query: string;
+  total: number;
+  results: SearchResult[];
+}
+
+export interface LibraryCategory {
+  key: string;
+  label: string;
+  count: number;
+  available: boolean;
+  note: string | null;
+}
+export interface LibrarySummary {
+  categories: LibraryCategory[];
 }
 
 export interface SchedulerRunOnceResult {

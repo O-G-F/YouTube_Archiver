@@ -3,7 +3,9 @@ import { NavLink, Outlet } from "react-router-dom";
 const LINKS: { to: string; label: string; section?: string }[] = [
   { to: "/", label: "Dashboard", section: "Overview" },
   { to: "/jobs", label: "Jobs" },
-  { to: "/videos", label: "Videos" },
+  { to: "/videos", label: "Videos", section: "Browse" },
+  { to: "/search", label: "Search" },
+  { to: "/library", label: "Library" },
   { to: "/collections", label: "Collections" },
   { to: "/archive", label: "Add / Archive", section: "Actions" },
   { to: "/takeout", label: "Takeout" },

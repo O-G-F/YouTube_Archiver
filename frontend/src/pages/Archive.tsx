@@ -3,25 +3,34 @@ import { Link } from "react-router-dom";
 import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
 import { ErrorBox, Loading } from "../components/ui";
+import type { Profile } from "../api/types";
 
 function ProfileSelect({
   profiles,
   value,
   onChange,
 }: {
-  profiles: { name: string }[];
+  profiles: Profile[];
   value: string;
   onChange: (v: string) => void;
 }) {
+  const sel = profiles.find((p) => p.name === value);
   return (
-    <select value={value} onChange={(e) => onChange(e.target.value)}>
-      <option value="">(default profile)</option>
-      {profiles.map((p) => (
-        <option key={p.name} value={p.name}>
-          {p.name}
-        </option>
-      ))}
-    </select>
+    <div>
+      <select value={value} onChange={(e) => onChange(e.target.value)}>
+        <option value="">(default profile)</option>
+        {profiles.map((p) => (
+          <option key={p.name} value={p.name}>
+            {p.name} — {p.media_mode}
+          </option>
+        ))}
+      </select>
+      {sel?.description && (
+        <div className="muted small" style={{ marginTop: 4, maxWidth: 360 }}>
+          {sel.description}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -69,6 +78,24 @@ export default function Archive() {
     <div>
       <h1 className="page-title">Add / Archive</h1>
       <p className="page-sub">Register URLs, expand playlists/channels — jobs run on the worker.</p>
+
+      <div className="panel">
+        <h2>Profiles & outcomes</h2>
+        <div className="kv">
+          <div className="k mono">metadata_only</div>
+          <div className="v small">info.json / 説明 / 字幕 / サムネのみ。<strong>本体は保存しない</strong>（Video Detail は「未保存」）。</div>
+          <div className="k mono">video_compressed_1080p</div>
+          <div className="v small">既定。1080p 以下・Web 再生向け。<strong>本体を保存</strong>するのでブラウザ再生可。</div>
+          <div className="k mono">video_best_archive</div>
+          <div className="v small">最高画質 mkv で長期保存（重い）。コメント/ライブチャット/サムネも保存。</div>
+        </div>
+        <p className="muted small" style={{ marginTop: 10 }}>
+          ジョブが <span className="badge warn">partial_success</span> や{" "}
+          <span className="badge warn">429</span> になることがあります。<strong>429</strong> は YouTube
+          側の一時的なレート制限（主に字幕取得）で、Phase 上のブロッカーではありません。少し待って Jobs 画面から{" "}
+          <strong>Retry</strong> してください。
+        </p>
+      </div>
 
       <ErrorBox error={err} />
       <ErrorBox error={profiles.error} />

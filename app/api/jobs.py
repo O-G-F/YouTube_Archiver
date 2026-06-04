@@ -12,36 +12,44 @@ from app.config import get_settings
 from app.logging_setup import get_logger
 from app.models import DownloadProfile, Job, Video
 from app.schemas import (
+    JobClassification,
     JobDetailOut,
     JobLogOut,
     JobLogsOut,
     JobOut,
+    JobOutClassified,
     ProfileOut,
     VideoOut,
 )
 from app.services import jobs as jobs_svc
 from app.services import logs as logs_svc
 from app.services import storage
+from app.services.job_classify import classify_job
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 logger = get_logger(__name__)
 
 
-@router.get("", response_model=list[JobOut])
+@router.get("", response_model=list[JobOutClassified])
 def list_jobs(
     db: Session = Depends(get_db),
     status: str | None = Query(default=None),
     type: str | None = Query(default=None),
     limit: int = Query(default=50, le=500),
     offset: int = Query(default=0, ge=0),
-) -> list[Job]:
+) -> list[JobOutClassified]:
     stmt = select(Job).order_by(Job.id.desc())
     if status:
         stmt = stmt.where(Job.status == status)
     if type:
         stmt = stmt.where(Job.type == type)
     stmt = stmt.limit(limit).offset(offset)
-    return list(db.scalars(stmt))
+    out: list[JobOutClassified] = []
+    for j in db.scalars(stmt):
+        item = JobOutClassified.model_validate(j)
+        item.classification = JobClassification(**classify_job(j))
+        out.append(item)
+    return out
 
 
 @router.get("/{job_id}", response_model=JobDetailOut)
@@ -139,6 +147,8 @@ def _build_job_detail(db: Session, job: Job) -> JobDetailOut:
     detail.stdout_log_path = paths["stdout"]
     detail.stderr_log_path = paths["stderr"]
     detail.command_log_path = paths["command"]
+
+    detail.classification = JobClassification(**classify_job(job))
 
     video = db.get(Video, job.video_id) if job.video_id else None
     if video is not None:
