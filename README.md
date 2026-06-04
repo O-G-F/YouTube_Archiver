@@ -27,12 +27,13 @@ YouTube の動画・メタデータ・字幕・コメントを `yt-dlp` でロ�
 - **Google Takeout インポート（Phase 3A/3B）** — ZIP を内容ベース判定（多言語対応）、視聴履歴 / 検索履歴 / 登録チャンネル / 再生リストを正規化保存（`watch_history_events` / `search_history_events` / `collections`(channel/takeout_playlist) / `collection_items` / Video stub）、重複統合、`import-all`、subscriptions enqueue、preview / dry-run / limit、path traversal・zip slip 対策
 - **コメント / メタデータ更新（Phase 4A）** — 本体を再DLせず info.json・コメント更新、`comments` 正規化保存と新規/更新/消失/再発見の差分、adaptive refresh policy（土台）、metadata_snapshots（checksum 付き）、429/コメント無効/削除の分類、`COMMENT_REFRESH_MAX_COMMENTS`
 - **scheduler 連携コメント定期更新・live chat 取得（Phase 4B）** — scheduler が `next_comments_refresh_at` の期限切れ動画へ自動でコメント更新ジョブを投入（`SCHEDULER_COMMENTS_ENABLED`、1パス上限 `SCHEDULER_COMMENTS_LIMIT_PER_RUN`、frozen/recent 除外）、429 で `comment_refresh_failures` 加算＋backoff 再スケジュール、`live_chat_refresh` ジョブ（本体・コメント再DLなし、`--write-subs --sub-langs live_chat`）で `live_chat_messages` を正規化保存（super chat/メンバー/差分対応）、非ライブ動画は `not_available` 扱いでエラーにしない
+- **管理用 Web UI（Phase 5A）** — React + Vite + TypeScript の管理コンソールを FastAPI が同一オリジンで配信（`/`）。Dashboard / Jobs / Job 詳細（ログ tab・secret マスク）/ Videos / Video 詳細（簡易プレイヤー・comments/live chat・snapshots・refresh ボタン）/ Collections / Collection 詳細 / Add(URL・expand・channel) / Takeout / Settings・Doctor。CLI/curl なしで登録・refresh・ログ確認が可能。secret/cookie/token は UI・ログに出さない
 - 字幕は安全な許可リスト（`ja,en`、`all` は明示時のみ）、YouTube JS チャレンジ対応（`--remote-components ejs:github` + deno）、`curl_cffi` 同梱
 - 失敗ジョブ管理（ステータス・エラーメッセージ・再実行・キャンセル）+ `partial_success` / retryable
 - 運用補強（Phase 1.5）: `doctor` 診断、ジョブログ API/CLI（path traversal 対策）、profile dry-run
 - Web API（登録 / 展開 / コレクション / 再クロール / scheduler / ジョブ / プロファイル / 動画 / 診断）と CLI の両方
 - Docker Compose（web / worker / scheduler / postgres / redis / migrate）
-- Alembic マイグレーション（0001 初期 〜 0007 live chat / comment retry）+ pytest（190 tests）
+- Alembic マイグレーション（0001 初期 〜 0007 live chat / comment retry）+ pytest（201 tests）+ フロント Vitest（8 tests）
 
 ---
 
@@ -515,6 +516,72 @@ archiver live-chat refresh-all --limit-videos 25 --now   # has_live_chat/is_live
 
 ---
 
+## Phase 5A: 管理用 Web UI
+
+バックエンドの状態を**ブラウザから確認・操作**できる管理コンソールです（React + Vite + TypeScript）。**本格的な YouTube 風プレイヤー・認証・OAuth は未実装**で、まずは運用・確認用途に絞っています。
+
+### 構成
+
+- フロントエンドは `frontend/`（Vite + React + TS）。本番ビルド（`frontend/dist`）を **FastAPI が同一オリジンで配信**します（`app/main.py`）。SPA の deep link（例 `/jobs/5`）は history-API フォールバックで `index.html` を返します。
+- API はすべて `/api/*`。UI は**相対パス**で叩くため、開発（Vite proxy）と Docker（同一オリジン）の両方でそのまま動きます。別オリジンの API を使う場合のみ `VITE_API_BASE` を設定。
+- CORS は `CORS_ALLOW_ORIGINS`（既定 `*`。API は認証/cookie を使わないローカル管理ツール）。
+
+### Docker での起動（UI 同梱）
+
+`Dockerfile` は**マルチステージ**で、Node ステージが UI をビルド → Python イメージへ `frontend/dist` をコピーします。通常どおり起動するだけで UI も配信されます。
+
+```bash
+docker compose build
+docker compose up -d
+# ブラウザで開く:
+open http://localhost:8000/            # 管理 UI（Dashboard）
+# API ドキュメントは引き続き http://localhost:8000/docs
+```
+
+### 開発時の起動（ホットリロード）
+
+バックエンド（`uvicorn` or `docker compose up web`）を 8000 で起動した状態で:
+
+```bash
+cd frontend
+npm install
+npm run dev          # http://localhost:5173 （/api は 8000 へ proxy）
+# 別オリジンの API を使う場合: VITE_PROXY_TARGET=http://host:8000 npm run dev
+npm run build        # 本番ビルド -> dist/（FastAPI が配信）
+npm run typecheck    # tsc --noEmit
+npm test             # vitest
+```
+
+### 画面一覧
+
+| パス | 画面 | 主な内容 / 操作 |
+|---|---|---|
+| `/` | Dashboard | health（DB/Redis/yt-dlp）・各種件数・job status 集計・最新ジョブ・scheduler 状態 / **doctor 実行**・**scheduler run-once** |
+| `/jobs` | Jobs | 一覧（status/type フィルタ）・**自動更新（6秒）**・**retry**・詳細リンク |
+| `/jobs/:id` | Job 詳細 | 基本情報・`job.meta` 整形・**command/stdout/stderr ログ tab（tail・secret マスク）**・retry・関連 video/collection |
+| `/videos` | Videos | 一覧（検索 / comments_state / live_chat_state / body 有無）・状態バッジ・body 数 |
+| `/videos/:id` | Video 詳細 | metadata・**簡易プレイヤー（body があれば再生、なければ「未保存」）**・media files・comments stats/list・live chat stats/list・snapshots・**comments/live chat refresh ボタン**・関連 jobs/collections |
+| `/collections` | Collections | 一覧・**enable/disable**・**set-policy**・**refresh**・詳細リンク |
+| `/collections/:id` | Collection 詳細 | 基本情報・items（`removed_at` 表示・video へ遷移）・**max_items 指定 refresh** |
+| `/archive` | Add / Archive | **単体 URL 登録**・**expand**（playlist/channel・max_items）・**add-channel**（videos/shorts/streams・profile・max_items） |
+| `/takeout` | Takeout | `TAKEOUT_IMPORT_ROOT` の ZIP 一覧・**preview**・**import-all（dry-run / limit）**。個人データは件数のみ表示 |
+| `/settings` | Settings / Doctor | doctor 結果・profiles 一覧・scheduler 状態・**非 secret 設定値**（cookie/token/DB 認証情報は非表示・マスク） |
+
+### セキュリティ
+
+- **secret/cookie/token を UI・ログに出さない。** ジョブログは API 取得時に `services.logs.mask_secrets` で `--cookies <path>` / `Authorization` / `password|token|api_key=…` / 設定済み cookie ファイルパスを `***REDACTED***` にマスク（コマンドは生成時にも redact 済みの二重防御）。
+- **設定画面**は cookie ファイルパスを表示せず `cookies_configured: yes/no` のみ。`DATABASE_URL` / `REDIS_URL` はパスワードをマスク。
+- **Takeout / comments / live chat の個人情報**を不用意に全面表示しない（件数・サマリ中心。`raw_json`/author は既定で非返却）。
+- 簡易プレイヤーの配信は **DB に登録された media file のみ**（`GET /api/videos/{id}/media/{media_file_id}`、`ARCHIVE_ROOT` 配下に強制・パス入力なし）。
+- ログ表示は React により HTML エスケープ。既存 API の path traversal 対策は維持。
+- **UI と API は分離**（API は `/api/*`、UI は静的配信）しており、将来の認証導入を阻害しません。現状は**認証なし**なので信頼できるネットワークで運用してください。
+
+### 未実装（今後）
+
+- 本格的な YouTube 風プレイヤー（Phase 5B 以降）、ユーザー認証 / RBAC、YouTube Data API OAuth。
+
+---
+
 ## ストレージ構成
 
 ```
@@ -616,6 +683,9 @@ archiver live-chat stats VIDEO_ID
 | メソッド | パス | 説明 |
 |---|---|---|
 | GET | `/api/health` | 稼働状況（DB / Redis / yt-dlp バージョン） |
+| GET | `/api/dashboard` | 管理 UI 集約（health / 件数 / job 集計 / scheduler / 最新ジョブ）【Phase 5A】 |
+| GET | `/api/job-stats` | ジョブ件数集計（status 別 / type 別）【Phase 5A】 |
+| GET | `/api/settings` | 非 secret 設定 + プロファイル（cookie/token 非表示・URL 認証情報マスク）【Phase 5A】 |
 | GET | `/api/profiles` | プロファイル一覧 |
 | POST | `/api/archive/url` | URL を 1 件登録（`{"url","profile","priority"}`） |
 | POST | `/api/archive/current-tab` | 同上（ブラウザ拡張/ブックマークレット用、要件 5.1.4） |
@@ -665,10 +735,14 @@ archiver live-chat stats VIDEO_ID
 | POST | `/api/jobs/{id}/retry` | 失敗/キャンセル/部分成功ジョブの再実行 |
 | POST | `/api/jobs/{id}/cancel` | ジョブのキャンセル |
 | POST | `/api/profiles/{name}/build-command` | dry-run（`{"url"}`）。cookie/secret はマスク |
-| GET | `/api/videos` | 保存済み動画一覧（`?q=&limit=&offset=`） |
-| GET | `/api/videos/{id}` | 動画詳細（メディアファイル/字幕数/コメント数） |
+| GET | `/api/videos` | 保存済み動画一覧（`?q=&comments_state=&live_chat_state=&has_media=&limit=&offset=`、body 数付き）【Phase 5A 拡張】 |
+| GET | `/api/videos/{id}` | 動画詳細（メディアファイル/字幕数/コメント数 + comments/live_chat 状態） |
+| GET | `/api/videos/{id}/jobs` | その動画の関連ジョブ【Phase 5A】 |
+| GET | `/api/videos/{id}/collections` | その動画が属する collection【Phase 5A】 |
+| GET | `/api/videos/{id}/media/{media_file_id}` | media body 配信（DB 登録ファイルのみ・`ARCHIVE_ROOT` 配下強制）【Phase 5A】 |
+| GET | `/api/takeout/files` | `TAKEOUT_IMPORT_ROOT` 配下の ZIP 一覧（root 外は不可）【Phase 5A】 |
 
-OpenAPI は `/docs`（Swagger UI）/ `/redoc`。
+UI は `/`（管理コンソール）、OpenAPI は `/docs`（Swagger UI）/ `/redoc`。
 
 ログ API は **`LOG_ROOT/jobs/<id>/` 配下の 3 ファイルのみ**を読み、解決後パスが `LOG_ROOT` 内にあることを検証します（path traversal 対策）。それ以外は 404。
 

@@ -81,6 +81,21 @@ class VideoOut(BaseModel):
     thumbnail_path: str | None = None
     first_seen_at: datetime
     last_metadata_refresh_at: datetime | None = None
+    # Phase 4A/4B state (read-only; surfaced for the admin UI).
+    comments_state: str | None = None
+    comments_refresh_policy: str | None = None
+    last_comments_refresh_at: datetime | None = None
+    next_comments_refresh_at: datetime | None = None
+    live_chat_state: str | None = None
+    has_live_chat: bool = False
+    last_live_chat_refresh_at: datetime | None = None
+    next_live_chat_refresh_at: datetime | None = None
+
+
+class VideoListItemOut(VideoOut):
+    """Video list row with a media-file count (Phase 5A UI)."""
+
+    media_files_count: int = 0
 
 
 class MediaFileOut(BaseModel):
@@ -616,3 +631,61 @@ class LiveChatRefreshAllOut(BaseModel):
     videos_selected: int
     jobs_created: int
     job_ids: list[int] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5A: admin UI support (dashboard / stats / takeout files / settings)
+# --------------------------------------------------------------------------- #
+class JobStatsOut(BaseModel):
+    total: int
+    by_status: dict[str, int] = Field(default_factory=dict)
+    by_type: dict[str, int] = Field(default_factory=dict)
+
+
+class DashboardCounts(BaseModel):
+    videos: int = 0
+    collections: int = 0
+    crawlable_collections: int = 0
+    watch_history: int = 0
+    search_history: int = 0
+    subscriptions: int = 0
+    comments: int = 0
+    comments_due: int = 0
+    comments_frozen: int = 0
+    live_chat_messages: int = 0
+    live_chat_due: int = 0
+    metadata_snapshots: int = 0
+
+
+class DashboardOut(BaseModel):
+    health: HealthOut
+    job_stats: JobStatsOut
+    counts: DashboardCounts
+    scheduler: SchedulerStatusOut
+    latest_jobs: list[JobOut] = Field(default_factory=list)
+
+
+class TakeoutFileEntryOut(BaseModel):
+    name: str  # relative to TAKEOUT_IMPORT_ROOT
+    size: int
+    modified_at: datetime | None = None
+    is_zip: bool = True
+
+
+class TakeoutFilesOut(BaseModel):
+    root: str  # display path of TAKEOUT_IMPORT_ROOT (not a secret)
+    files: list[TakeoutFileEntryOut] = Field(default_factory=list)
+
+
+class SettingsItem(BaseModel):
+    key: str
+    value: str
+    note: str | None = None
+
+
+class SettingsOut(BaseModel):
+    """Non-secret, display-only settings. Secrets (cookies/db/redis creds) are
+    never included; connection URLs are credential-masked."""
+
+    items: list[SettingsItem] = Field(default_factory=list)
+    profiles: list[ProfileOut] = Field(default_factory=list)

@@ -40,6 +40,10 @@ youtube_archiver.egg-info/
 .eggs/
 build/
 dist/
+# Frontend (Phase 5A)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
 .venv/
 venv/
 .pytest_cache/

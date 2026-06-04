@@ -1,4 +1,19 @@
-# YouTube Archiver image: Python + ffmpeg/ffprobe + Deno + yt-dlp.
+# YouTube Archiver image (multi-stage):
+#   1) build the React/Vite admin UI with Node
+#   2) Python runtime: ffmpeg/ffprobe + Deno + yt-dlp, serving API + built UI
+
+# ---- Stage 1: frontend build ----
+FROM node:20-slim AS frontend
+WORKDIR /ui
+# Dependency layer (cached unless package manifests change).
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm ci || npm install
+# Build the SPA -> /ui/dist
+COPY frontend/ ./
+RUN npm run build \
+    && test -f dist/index.html
+
+# ---- Stage 2: python runtime ----
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -36,10 +51,16 @@ PY
 # Application. requirements.txt is the single source of runtime dependencies,
 # so the editable install must NOT re-resolve/override them (--no-deps).
 COPY . .
+
+# Built admin UI from stage 1 (served by FastAPI at "/" — see app/main.py).
+COPY --from=frontend /ui/dist ./frontend/dist
+
 RUN pip install --no-deps -e .
 
-# Final guard: the app's own settings/bootstrap import chain must resolve.
-RUN python -c "from app.config import get_settings; from app.bootstrap import seed; print('app import verify OK')"
+# Final guard: the app import chain AND the built UI must both be present.
+RUN python -c "from app.config import get_settings; from app.bootstrap import seed; print('app import verify OK')" \
+    && test -f /app/frontend/dist/index.html \
+    && echo "frontend dist verify OK"
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

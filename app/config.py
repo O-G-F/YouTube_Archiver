@@ -102,6 +102,22 @@ class Settings(BaseSettings):
     # ---- App ----
     log_level: str = "INFO"
 
+    # ---- Web UI / CORS (Phase 5A) ----
+    # Built frontend directory. Empty -> <repo>/frontend/dist (Docker: /app/frontend/dist).
+    web_ui_dir: str = ""
+    # Serve the built SPA from FastAPI when present.
+    web_ui_enabled: bool = True
+    # CORS allow-origins (comma separated). "*" = allow all (this is a local admin
+    # tool with no auth/cookies on the API). Set explicit origins to restrict.
+    cors_allow_origins: str = "*"
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        raw = (self.cors_allow_origins or "").strip()
+        if not raw or raw == "*":
+            return ["*"]
+        return [o.strip() for o in raw.split(",") if o.strip()]
+
     # ----- Derived helpers -----
     @property
     def effective_remote_components(self) -> str | None:

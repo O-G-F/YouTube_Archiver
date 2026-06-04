@@ -27,3 +27,9 @@ data/
 *.sqlite3
 *.db
 .DS_Store
+
+# Frontend: keep package.json + lockfile (the build stage runs `npm ci`), but
+# never copy host-installed modules or a stale local build into the image.
+frontend/node_modules
+frontend/dist
+frontend/.vite

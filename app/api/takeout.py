@@ -7,6 +7,8 @@ members are read in-memory (no extraction; zip-slip guarded).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
@@ -15,6 +17,8 @@ from app.config import get_settings
 from app.schemas import (
     PlaylistSampleOut,
     PlaylistsImportOut,
+    TakeoutFileEntryOut,
+    TakeoutFilesOut,
     TakeoutImportAllOut,
     TakeoutImportAllRequest,
     TakeoutImportOut,
@@ -27,6 +31,35 @@ from app.schemas import (
 from app.services import takeout
 
 router = APIRouter(prefix="/api/takeout", tags=["takeout"])
+
+
+@router.get("/files", response_model=TakeoutFilesOut)
+def takeout_files() -> TakeoutFilesOut:
+    """List ZIP files available under TAKEOUT_IMPORT_ROOT (no traversal outside)."""
+    settings = get_settings()
+    root = settings.takeout_import_root.resolve()
+    entries: list[TakeoutFileEntryOut] = []
+    if root.is_dir():
+        for p in sorted(root.rglob("*.zip"))[:500]:
+            try:
+                rp = p.resolve()
+                rp.relative_to(root)  # guard: stay within the import root
+                if not rp.is_file():
+                    continue
+                st = rp.stat()
+                entries.append(
+                    TakeoutFileEntryOut(
+                        name=str(rp.relative_to(root)),
+                        size=st.st_size,
+                        modified_at=datetime.fromtimestamp(
+                            st.st_mtime, tz=timezone.utc
+                        ).replace(tzinfo=None),
+                        is_zip=True,
+                    )
+                )
+            except (OSError, ValueError):
+                continue
+    return TakeoutFilesOut(root=str(root), files=entries)
 
 
 @router.post("/preview", response_model=TakeoutPreviewOut)
