@@ -18,6 +18,7 @@ search / likes / subscriptions / playlists are detected & counted for preview.
 from __future__ import annotations
 
 import csv
+import html as _html
 import io
 import json
 import re
@@ -32,6 +33,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.logging_setup import get_logger
 from app.models import (
     Collection,
     CollectionItem,
@@ -44,6 +46,8 @@ from app.models import (
     utcnow,
 )
 from app.services.urls import canonical_video_url, extract_video_id, is_video_id
+
+logger = get_logger(__name__)
 
 
 class TakeoutError(Exception):
@@ -107,6 +111,8 @@ class LikedVideoEntry:
     channel_title: str | None
     url: str | None
     liked_at: datetime | None
+    channel_id: str | None = None
+    source: str = "takeout_youtube"  # takeout_youtube | takeout_my_activity
     raw: dict = field(default_factory=dict)
 
 
@@ -416,6 +422,101 @@ def parse_liked_videos_html(html: str) -> Iterator[LikedVideoEntry]:
         )
 
 
+# --------------------------------------------------------------------------- #
+# My Activity (liked videos) — markers are the single configuration point.
+# (Adapted from the reference YouTube-Liked_Videos project.)
+# --------------------------------------------------------------------------- #
+LIKE_ACTIVITY_MARKERS: tuple[str, ...] = ("liked ", "liked:", "高く評価")
+NON_LIKE_ACTIVITY_MARKERS: tuple[str, ...] = (
+    "watched",
+    "disliked",
+    "unliked",
+    "removed like",
+    "removed a like",
+    "低く評価",
+    "低評価",
+    "高評価を削除",
+    "を視聴",
+)
+_CHANNEL_ID_RE = re.compile(r"(?:youtube\.com/(?:channel/)?|^)(UC[A-Za-z0-9_-]{22})")
+# My Activity export path: "<Takeout>/<My Activity|マイ アクティビティ>/YouTube/...json"
+_MY_ACTIVITY_YT_RE = re.compile(
+    r"(?:My Activity|マイ ?アクティビティ)/YouTube/.*\.json$", re.IGNORECASE
+)
+
+
+def _is_like_activity(title: str) -> bool:
+    low = title.lower()
+    if any(m in low for m in NON_LIKE_ACTIVITY_MARKERS):
+        return False
+    return any(m in low for m in LIKE_ACTIVITY_MARKERS)
+
+
+def _extract_channel_id(text: str | None) -> str | None:
+    if not text:
+        return None
+    m = _CHANNEL_ID_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _clean_activity_title(title: str) -> str | None:
+    text = _html.unescape(title).strip()
+    quoted = re.search(r"[「\"](.+?)[」\"]を?高く評価", text)
+    if quoted:
+        return quoted.group(1).strip() or None
+    if text.lower().startswith("liked "):
+        return text[6:].strip() or None
+    for prefix in ("高く評価しました ", "高く評価 "):
+        if text.startswith(prefix):
+            return text[len(prefix):].strip() or None
+    for suffix in ("を高く評価しました", "を高評価しました", "を高く評価", "を高評価"):
+        if text.endswith(suffix):
+            return text[: -len(suffix)].strip(" 「」") or None
+    return text or None
+
+
+def _iter_activity_dicts(value) -> Iterator[dict]:
+    """Yield activity item dicts from arbitrarily-nested My Activity JSON."""
+    if isinstance(value, dict):
+        if "title" in value and ("titleUrl" in value or "titleURL" in value) and "time" in value:
+            yield value
+        for child in value.values():
+            yield from _iter_activity_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_activity_dicts(child)
+
+
+def parse_myactivity_liked_json(text: str) -> Iterator[LikedVideoEntry]:
+    """Extract liked-video events from a My Activity YouTube JSON export."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return
+    for item in _iter_activity_dicts(data):
+        title = str(item.get("title") or "")
+        title_url = str(item.get("titleUrl") or item.get("titleURL") or "")
+        vid = extract_video_id(title_url) if title_url else None
+        if not vid or not _is_like_activity(title):
+            continue
+        channel_title = None
+        channel_id = None
+        subs = item.get("subtitles") or []
+        if isinstance(subs, list) and subs and isinstance(subs[0], dict):
+            channel_title = subs[0].get("name") or None
+            channel_id = _extract_channel_id(subs[0].get("url"))
+        yield LikedVideoEntry(
+            youtube_video_id=vid,
+            title=_clean_activity_title(title),
+            channel_title=channel_title,
+            url=canonical_video_url(vid),
+            liked_at=_parse_iso_time(item.get("time")),
+            channel_id=channel_id,
+            source="takeout_my_activity",
+            raw={"title": title, "titleUrl": title_url, "time": item.get("time"), "subtitles": subs},
+        )
+
+
 def parse_watch_history_html(html: str) -> Iterator[WatchEvent]:
     """Best-effort HTML watch-history parser (Takeout 'outer-cell' blocks)."""
     chunks = html.split('<div class="outer-cell')
@@ -593,7 +694,52 @@ class TakeoutArchive:
                 title=title, playlist_id=index.get(title), file_name=f.name, items=items
             )
 
+    def my_activity_youtube_path(self) -> str | None:
+        """The 'My Activity / YouTube' JSON member, if this is a My Activity export."""
+        for name in self._members:
+            if _MY_ACTIVITY_YT_RE.search(name):
+                return name
+        return None
+
+    def has_youtube_takeout(self) -> bool:
+        return any(
+            ("YouTube と YouTube Music/" in n) or ("YouTube and YouTube Music/" in n)
+            for n in self._members
+        )
+
+    def has_index_only(self) -> bool:
+        names = list(self._members)
+        return any(n.endswith("archive_browser.html") for n in names) and not (
+            self.has_youtube_takeout() or self.my_activity_youtube_path()
+        )
+
+    def archive_kind(self) -> str:
+        """Classify the archive: my_activity_takeout | youtube_takeout | takeout_index | unknown_takeout."""
+        if self.my_activity_youtube_path():
+            return "my_activity_takeout"
+        if self.has_youtube_takeout():
+            return "youtube_takeout"
+        if any(n.endswith("archive_browser.html") for n in self._members):
+            return "takeout_index"
+        return "unknown_takeout"
+
+    def liked_source_path(self) -> tuple[str, str | None]:
+        """Return (source_kind, detected_path) for the liked-videos source in this archive."""
+        ma = self.my_activity_youtube_path()
+        if ma:
+            return "takeout_my_activity", ma
+        for f in self.list_files():
+            if f.kind == "likes":
+                return "takeout_youtube", f.name
+        return self.archive_kind(), None
+
     def iter_liked_videos(self) -> Iterator[LikedVideoEntry]:
+        # My Activity export: parse the YouTube activity JSON for liked events.
+        ma = self.my_activity_youtube_path()
+        if ma:
+            yield from parse_myactivity_liked_json(self._read_text(ma))
+            return
+        # YouTube Takeout: the "Liked videos" playlist CSV (or json/html).
         for f in self.list_files():
             if f.kind != "likes":
                 continue
@@ -624,14 +770,6 @@ class TakeoutArchive:
                     counts["search_history_count"] += self._count_history(f)
                 elif f.kind == "subscriptions":
                     counts["subscriptions_count"] += self._count_csv_rows(f)
-                elif f.kind == "likes":
-                    if f.format == "csv":
-                        counts["likes_count"] += self._count_csv_rows(f)
-                    elif f.format == "json":
-                        d = json.loads(self._read_text(f.name))
-                        counts["likes_count"] += len(d) if isinstance(d, list) else 0
-                    elif f.format == "html":
-                        counts["likes_count"] += self._read_text(f.name).count('<div class="outer-cell')
                 elif f.kind == "playlist":
                     counts["playlists_count"] += 1
             except Exception as exc:  # noqa: BLE001
@@ -671,16 +809,20 @@ class TakeoutArchive:
                 )
                 if len(playlist_samples) >= sample:
                     break
+            # Single pass: count ALL liked videos (My Activity JSON or YouTube
+            # CSV) and keep the first `sample` as previews.
+            liked_total = 0
             for lv in self.iter_liked_videos():
-                liked_samples.append(
-                    {
-                        "youtube_video_id": lv.youtube_video_id,
-                        "title": lv.title,
-                        "liked_at": lv.liked_at.isoformat() if lv.liked_at else None,
-                    }
-                )
-                if len(liked_samples) >= sample:
-                    break
+                liked_total += 1
+                if len(liked_samples) < sample:
+                    liked_samples.append(
+                        {
+                            "youtube_video_id": lv.youtube_video_id,
+                            "title": lv.title,
+                            "liked_at": lv.liked_at.isoformat() if lv.liked_at else None,
+                        }
+                    )
+            counts["likes_count"] = liked_total
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"sample parse: {exc}")
 
@@ -691,7 +833,11 @@ class TakeoutArchive:
             "playlists": counts["playlists_count"] > 0,
             "liked_videos": counts["likes_count"] > 0,
         }
+        liked_source_kind, liked_detected_path = self.liked_source_path()
         return {
+            "archive_kind": self.archive_kind(),
+            "liked_source_kind": liked_source_kind,
+            "liked_detected_path": liked_detected_path,
             "files": [
                 {"name": f.name, "kind": f.kind, "format": f.format, "size": f.size}
                 for f in files
@@ -706,9 +852,49 @@ class TakeoutArchive:
             "warnings": warnings,
         }
 
+    def inspect(self) -> dict:
+        """Lightweight structural classification (no full content parse)."""
+        names = list(self._members)
+        return {
+            "archive_kind": self.archive_kind(),
+            "has_youtube_takeout": self.has_youtube_takeout(),
+            "my_activity_youtube_path": self.my_activity_youtube_path(),
+            "has_index": any(n.endswith("archive_browser.html") for n in names),
+            "member_count": len(names),
+            "liked_source_kind": self.liked_source_path()[0],
+            "liked_detected_path": self.liked_source_path()[1],
+        }
+
 
 def open_archive(path: Path) -> TakeoutArchive:
     return TakeoutArchive(path)
+
+
+def discover(settings: Settings, *, deep: bool = False) -> list[dict]:
+    """List ZIPs under TAKEOUT_IMPORT_ROOT with a structural classification.
+
+    ``deep`` parses content for a liked-count hint (slower); otherwise only the
+    member list is inspected (fast, no large-JSON parse).
+    """
+    root = settings.takeout_import_root.resolve()
+    out: list[dict] = []
+    if not root.is_dir():
+        return out
+    for p in sorted(root.rglob("*.zip"))[:500]:
+        try:
+            rp = p.resolve()
+            rp.relative_to(root)
+            if not rp.is_file():
+                continue
+            entry = {"name": str(rp.relative_to(root)), "size": rp.stat().st_size}
+            with open_archive(rp) as a:
+                entry.update(a.inspect())
+                if deep and entry["liked_detected_path"]:
+                    entry["liked_count"] = sum(1 for _ in a.iter_liked_videos())
+            out.append(entry)
+        except (OSError, ValueError, TakeoutError):
+            out.append({"name": p.name, "archive_kind": "unknown_takeout", "error": True})
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1001,16 +1187,19 @@ def import_liked_videos(
 ) -> dict:
     """Import liked videos into ``liked_videos`` (+ Video stubs) with dedup.
 
-    Dedup key: (source, youtube_video_id) when an id is present; otherwise
-    (source, title, url) for HTML-only fallbacks. A Video stub is created/linked
-    when an id is present so a later metadata_only refresh can enrich it.
+    Auto-detects the source (YouTube Takeout "Liked videos" CSV or Google
+    "My Activity" YouTube JSON). Dedup is **cross-source by youtube_video_id**
+    (a video liked in multiple exports/sources is stored once); id-less HTML
+    rows dedup by (title, url). Returns ``source_kind`` / ``detected_path`` and
+    creates/links a Video stub so a later ``metadata_only`` refresh can enrich.
     """
+    source_kind, detected_path = archive.liked_source_path()
+
+    # Existing liked videos across ALL sources (canonical: one row per video id).
     existing_ids: set[str] = set()
     existing_titlekey: set[tuple] = set()
     for vid, title, url in session.execute(
-        select(LikedVideo.youtube_video_id, LikedVideo.title, LikedVideo.url).where(
-            LikedVideo.source == "takeout"
-        )
+        select(LikedVideo.youtube_video_id, LikedVideo.title, LikedVideo.url)
     ):
         if vid:
             existing_ids.add(vid)
@@ -1026,6 +1215,8 @@ def import_liked_videos(
         if limit is not None and scanned >= limit:
             break
         scanned += 1
+        if scanned % 2000 == 0:
+            logger.info("liked import: scanned=%d imported=%d (%s)", scanned, imported, source_kind)
         vid = lv.youtube_video_id
         if vid:
             if vid in existing_ids or vid in seen_ids:
@@ -1056,10 +1247,12 @@ def import_liked_videos(
                 video.title = lv.title
             if lv.channel_title and not video.channel_title:
                 video.channel_title = lv.channel_title
+            if lv.channel_id and not video.channel_id:
+                video.channel_id = lv.channel_id
             video_pk = video.id
         session.add(
             LikedVideo(
-                source="takeout",
+                source=lv.source,
                 youtube_video_id=vid,
                 title=lv.title,
                 channel_title=lv.channel_title,
@@ -1072,12 +1265,18 @@ def import_liked_videos(
 
     if not dry_run:
         session.flush()
+    logger.info(
+        "liked import done: source=%s scanned=%d imported=%d skipped=%d videos_created=%d",
+        source_kind, scanned, imported, skipped, videos_created,
+    )
     return {
         "imported_count": imported,
         "skipped_duplicate_count": skipped,
         "failed_count": failed,
         "scanned": scanned,
         "videos_created": videos_created,
+        "source_kind": source_kind,
+        "detected_path": detected_path,
         "warnings": warnings,
     }
 
@@ -1120,7 +1319,8 @@ def _run_with_job(
         job.progress = 100.0
         job.meta = {
             **(job.meta or {}),
-            **{k: v for k, v in result.items() if isinstance(v, int)},
+            # persist scalar result fields (counts + source_kind/detected_path)
+            **{k: v for k, v in result.items() if isinstance(v, (int, str)) or v is None},
         }
         session.flush()
         result["job_id"] = job.id

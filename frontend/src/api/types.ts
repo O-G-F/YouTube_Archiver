@@ -291,11 +291,15 @@ export interface TakeoutFiles {
 
 export interface TakeoutPreview {
   path: string;
+  archive_kind: string | null;
+  liked_source_kind: string | null;
+  liked_detected_path: string | null;
   watch_history_count: number;
   search_history_count: number;
   likes_count: number;
   subscriptions_count: number;
   playlists_count: number;
+  liked_samples: { youtube_video_id: string | null; title: string | null; liked_at: string | null }[];
   warnings: string[];
 }
 
@@ -387,6 +391,45 @@ export interface LibraryCategory {
 }
 export interface LibrarySummary {
   categories: LibraryCategory[];
+  liked_sources: Record<string, number>;
+}
+
+export interface TakeoutDiscoverEntry {
+  name: string;
+  size: number;
+  archive_kind: string;
+  has_youtube_takeout: boolean;
+  my_activity_youtube_path: string | null;
+  has_index: boolean;
+  member_count: number;
+  liked_source_kind: string | null;
+  liked_detected_path: string | null;
+  liked_count: number | null;
+  error: boolean;
+}
+export interface TakeoutDiscover {
+  root: string;
+  archives: TakeoutDiscoverEntry[];
+}
+
+export interface YouTubeApiStatus {
+  enabled: boolean;
+  client_secret_present: boolean;
+  token_present: boolean;
+  configured: boolean;
+  method: string;
+}
+
+export interface YouTubeApiSyncResult {
+  ok: boolean;
+  classification: string | null;
+  message: string | null;
+  imported_count: number;
+  skipped_duplicate_count: number;
+  videos_created: number;
+  scanned: number;
+  stopped_on_existing: boolean;
+  dry_run: boolean;
 }
 
 export interface SchedulerRunOnceResult {

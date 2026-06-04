@@ -6,6 +6,13 @@ import { fmtDate } from "../lib/format";
 import { ErrorBox, Loading } from "../components/ui";
 import { Thumb } from "../components/Thumb";
 
+const SOURCE_LABEL: Record<string, string> = {
+  takeout_my_activity: "My Activity",
+  takeout_youtube: "YT Takeout",
+  takeout: "Takeout",
+  youtube_data_api: "API",
+};
+
 export default function LikedVideos() {
   const [q, setQ] = useState("");
   const [query, setQuery] = useState("");
@@ -99,6 +106,7 @@ export default function LikedVideos() {
               <tr>
                 <th>Video</th>
                 <th>Channel</th>
+                <th>Source</th>
                 <th>Liked at</th>
                 <th>Metadata</th>
                 <th></th>
@@ -127,6 +135,7 @@ export default function LikedVideos() {
                     </div>
                   </td>
                   <td className="muted small">{lv.channel_title ?? "—"}</td>
+                  <td><span className="badge muted">{SOURCE_LABEL[lv.source ?? ""] ?? lv.source ?? "—"}</span></td>
                   <td className="muted small">{fmtDate(lv.liked_at)}</td>
                   <td>
                     {lv.metadata_fetched ? (

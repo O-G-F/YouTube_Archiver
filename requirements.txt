@@ -18,3 +18,9 @@ yt-dlp>=2025.0.0
 # Enables yt-dlp browser impersonation -> fewer "no impersonate target" warnings
 # and 403/429s on YouTube. Optional but recommended in the container.
 curl_cffi>=0.7
+# YouTube Data API OAuth (Phase 6B). Only used when OAuth is explicitly enabled
+# and configured; the app starts and runs fully without credentials. Imported
+# lazily, so a missing/older version degrades to a classified "auth_required".
+google-api-python-client>=2.100
+google-auth-oauthlib>=1.2
+google-auth-httplib2>=0.2

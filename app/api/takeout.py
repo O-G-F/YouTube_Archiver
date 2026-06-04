@@ -18,12 +18,15 @@ from app.schemas import (
     LikedVideosImportOut,
     PlaylistSampleOut,
     PlaylistsImportOut,
+    TakeoutDiscoverEntry,
+    TakeoutDiscoverOut,
     TakeoutFileEntryOut,
     TakeoutFilesOut,
     TakeoutImportAllOut,
     TakeoutImportAllRequest,
     TakeoutImportOut,
     TakeoutImportPlaylistsRequest,
+    TakeoutInspectOut,
     TakeoutImportRequest,
     TakeoutPlaylistsPreviewOut,
     TakeoutPreviewOut,
@@ -36,7 +39,7 @@ router = APIRouter(prefix="/api/takeout", tags=["takeout"])
 
 @router.get("/files", response_model=TakeoutFilesOut)
 def takeout_files() -> TakeoutFilesOut:
-    """List ZIP files available under TAKEOUT_IMPORT_ROOT (no traversal outside)."""
+    """List ZIP files under TAKEOUT_IMPORT_ROOT with a kind hint (no traversal outside)."""
     settings = get_settings()
     root = settings.takeout_import_root.resolve()
     entries: list[TakeoutFileEntryOut] = []
@@ -48,6 +51,12 @@ def takeout_files() -> TakeoutFilesOut:
                 if not rp.is_file():
                     continue
                 st = rp.stat()
+                kind: str | None = None
+                try:
+                    with takeout.open_archive(rp) as a:
+                        kind = a.archive_kind()
+                except takeout.TakeoutError:
+                    kind = "unknown_takeout"
                 entries.append(
                     TakeoutFileEntryOut(
                         name=str(rp.relative_to(root)),
@@ -56,11 +65,36 @@ def takeout_files() -> TakeoutFilesOut:
                             st.st_mtime, tz=timezone.utc
                         ).replace(tzinfo=None),
                         is_zip=True,
+                        archive_kind=kind,
                     )
                 )
             except (OSError, ValueError):
                 continue
     return TakeoutFilesOut(root=str(root), files=entries)
+
+
+@router.get("/discover", response_model=TakeoutDiscoverOut)
+def takeout_discover(deep: bool = Query(default=False)) -> TakeoutDiscoverOut:
+    """Classify every ZIP under TAKEOUT_IMPORT_ROOT (youtube / my_activity / index / unknown).
+
+    ``deep=true`` also parses a liked-count hint (slower for large My Activity exports).
+    """
+    settings = get_settings()
+    archives = [TakeoutDiscoverEntry(**e) for e in takeout.discover(settings, deep=deep)]
+    return TakeoutDiscoverOut(root=str(settings.takeout_import_root.resolve()), archives=archives)
+
+
+@router.get("/inspect", response_model=TakeoutInspectOut)
+def takeout_inspect(path: str = Query(...)) -> TakeoutInspectOut:
+    """Structural classification of a single ZIP (kind + detected liked source)."""
+    settings = get_settings()
+    try:
+        zip_path = takeout.resolve_takeout_path(settings, path)
+        with takeout.open_archive(zip_path) as a:
+            info = a.inspect()
+    except takeout.TakeoutError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return TakeoutInspectOut(path=path, **info)
 
 
 @router.post("/preview", response_model=TakeoutPreviewOut)

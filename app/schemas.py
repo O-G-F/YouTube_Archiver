@@ -354,6 +354,9 @@ class LikedVideoSampleOut(BaseModel):
 
 class TakeoutPreviewOut(BaseModel):
     path: str
+    archive_kind: str | None = None  # youtube_takeout | my_activity_takeout | takeout_index | …
+    liked_source_kind: str | None = None
+    liked_detected_path: str | None = None
     files: list[TakeoutFileOut] = Field(default_factory=list)
     watch_history_count: int = 0
     search_history_count: int = 0
@@ -476,6 +479,8 @@ class LikedVideosImportOut(BaseModel):
     failed_count: int
     scanned: int
     videos_created: int = 0
+    source_kind: str | None = None  # takeout_my_activity | takeout_youtube | …
+    detected_path: str | None = None  # the member parsed (no traversal vector)
     dry_run: bool
     job_id: int | None = None
     warnings: list[str] = Field(default_factory=list)
@@ -769,11 +774,42 @@ class TakeoutFileEntryOut(BaseModel):
     size: int
     modified_at: datetime | None = None
     is_zip: bool = True
+    archive_kind: str | None = None  # youtube_takeout | my_activity_takeout | takeout_index | …
 
 
 class TakeoutFilesOut(BaseModel):
     root: str  # display path of TAKEOUT_IMPORT_ROOT (not a secret)
     files: list[TakeoutFileEntryOut] = Field(default_factory=list)
+
+
+class TakeoutDiscoverEntry(BaseModel):
+    name: str
+    size: int = 0
+    archive_kind: str = "unknown_takeout"
+    has_youtube_takeout: bool = False
+    my_activity_youtube_path: str | None = None
+    has_index: bool = False
+    member_count: int = 0
+    liked_source_kind: str | None = None
+    liked_detected_path: str | None = None
+    liked_count: int | None = None  # only when deep=true
+    error: bool = False
+
+
+class TakeoutDiscoverOut(BaseModel):
+    root: str
+    archives: list[TakeoutDiscoverEntry] = Field(default_factory=list)
+
+
+class TakeoutInspectOut(BaseModel):
+    path: str
+    archive_kind: str
+    has_youtube_takeout: bool = False
+    my_activity_youtube_path: str | None = None
+    has_index: bool = False
+    member_count: int = 0
+    liked_source_kind: str | None = None
+    liked_detected_path: str | None = None
 
 
 class SettingsItem(BaseModel):
@@ -827,3 +863,60 @@ class LibraryCategoryOut(BaseModel):
 
 class LibrarySummaryOut(BaseModel):
     categories: list[LibraryCategoryOut] = Field(default_factory=list)
+    liked_sources: dict[str, int] = Field(default_factory=dict)  # source -> count (6B)
+
+
+class LibraryBootstrapRequest(BaseModel):
+    youtube_takeout: str | None = None  # path under TAKEOUT_IMPORT_ROOT
+    myactivity_takeout: str | None = None
+    limit_watch: int | None = None
+    limit_search: int | None = None
+    limit_subscriptions: int | None = None
+    limit_playlists: int | None = None
+    limit_items: int | None = None
+    limit_liked: int | None = None
+    use_api: bool = False
+    dry_run: bool = False
+
+
+class LibraryBootstrapOut(BaseModel):
+    dry_run: bool
+    youtube_takeout: dict | None = None
+    myactivity_takeout: dict | None = None
+    api: dict | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6B: YouTube Data API (OAuth) differential liked sync
+# --------------------------------------------------------------------------- #
+class YouTubeApiStatusOut(BaseModel):
+    """Non-secret OAuth status (never exposes file paths or tokens)."""
+
+    enabled: bool
+    client_secret_present: bool
+    token_present: bool
+    configured: bool
+    method: str
+
+
+class YouTubeApiSyncRequest(BaseModel):
+    method: str | None = None  # videos | playlist | auto
+    stop_on_existing: bool = True
+    limit: int | None = None
+    dry_run: bool = False
+
+
+class YouTubeApiSyncOut(BaseModel):
+    imported_count: int = 0
+    skipped_duplicate_count: int = 0
+    failed_count: int = 0
+    scanned: int = 0
+    videos_created: int = 0
+    stopped_on_existing: bool = False
+    source: str = "youtube_data_api"
+    dry_run: bool = False
+    # When OAuth is not configured the endpoint returns 200 with ok=false + a
+    # classification (auth_required / quota_exceeded / …) instead of crashing.
+    ok: bool = True
+    classification: str | None = None
+    message: str | None = None

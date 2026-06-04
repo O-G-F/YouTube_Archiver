@@ -90,6 +90,14 @@ def get_settings_view(db: Session = Depends(get_db)) -> SettingsOut:
             key="max_concurrent_download_jobs", value=str(s.max_concurrent_download_jobs)
         ),
         SettingsItem(key="log_level", value=s.log_level),
+        # YouTube Data API OAuth (Phase 6B) — never expose paths/tokens.
+        SettingsItem(key="youtube_api_enabled", value=str(s.youtube_api_enabled)),
+        SettingsItem(
+            key="youtube_api_configured",
+            value="yes" if s.youtube_api_configured else "no",
+            note="OAuth client secret + token present (paths hidden)",
+        ),
+        SettingsItem(key="youtube_api_liked_method", value=s.youtube_api_liked_method),
     ]
     profiles = [
         ProfileOut.model_validate(p)

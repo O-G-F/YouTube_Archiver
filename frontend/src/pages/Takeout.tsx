@@ -1,15 +1,29 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
-import { fmtBytes, fmtDate } from "../lib/format";
+import { fmtBytes } from "../lib/format";
 import { ErrorBox, Loading } from "../components/ui";
 import type { TakeoutImportAll, TakeoutPreview } from "../api/types";
 
+const KIND_LABEL: Record<string, string> = {
+  youtube_takeout: "YouTube Takeout",
+  my_activity_takeout: "My Activity Takeout",
+  takeout_index: "Index only",
+  unknown_takeout: "Unknown",
+};
+function KindBadge({ kind }: { kind: string }) {
+  const cls =
+    kind === "my_activity_takeout" ? "ok" : kind === "youtube_takeout" ? "run" : kind === "takeout_index" ? "warn" : "muted";
+  return <span className={`badge ${cls}`}>{KIND_LABEL[kind] ?? kind}</span>;
+}
+
 export default function Takeout() {
-  const files = useFetch(() => api.takeoutFiles(), []);
+  const discover = useFetch(() => api.takeoutDiscover(false), []);
   const [path, setPath] = useState("");
   const [preview, setPreview] = useState<TakeoutPreview | null>(null);
   const [importResult, setImportResult] = useState<TakeoutImportAll | null>(null);
+  const [likedResult, setLikedResult] = useState<string | null>(null);
   const [dryRun, setDryRun] = useState(true);
   const [limit, setLimit] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -22,6 +36,7 @@ export default function Takeout() {
     setErr(null);
     setPreview(null);
     setImportResult(null);
+    setLikedResult(null);
     setPath(target);
     try {
       setPreview(await api.takeoutPreview(target));
@@ -32,7 +47,28 @@ export default function Takeout() {
     }
   }
 
-  async function doImport() {
+  async function doImportLiked(p?: string) {
+    const target = p ?? path;
+    if (!target) return;
+    setBusy("liked");
+    setErr(null);
+    setLikedResult(null);
+    setPath(target);
+    const n = limit ? Number(limit) : undefined;
+    try {
+      const r = await api.takeoutImportLiked({ path: target, limit: n });
+      setLikedResult(
+        `Imported ${r.imported_count} liked (skipped ${r.skipped_duplicate_count}, video stubs ${r.videos_created}) from ${r.source_kind}.`
+      );
+      discover.reload();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function doImportAll() {
     if (!path) return;
     setBusy("import");
     setErr(null);
@@ -62,57 +98,74 @@ export default function Takeout() {
     <div>
       <h1 className="page-title">Takeout import</h1>
       <p className="page-sub">
-        Import Google Takeout data placed under TAKEOUT_IMPORT_ROOT. Personal data (watch/search/raw) is summarized as
-        counts only — never dumped here.
+        Import Google Takeout placed under TAKEOUT_IMPORT_ROOT. <strong>Liked videos の全履歴は「My Activity」Takeout</strong>
+        に入っています（YouTube Takeout には通常 liked=0）。個人データは件数のみ表示します。
       </p>
       <ErrorBox error={err} />
-      <ErrorBox error={files.error} />
+      <ErrorBox error={discover.error} />
 
       <div className="panel">
         <div className="spread">
-          <h2>Available ZIP files</h2>
-          <button onClick={files.reload}>↻</button>
+          <h2>Detected Takeout ZIPs</h2>
+          <button onClick={discover.reload}>↻ {discover.loading && <span className="spin" />}</button>
         </div>
-        {files.loading && !files.data ? (
+        <p className="muted small mono">{discover.data?.root}</p>
+        {discover.loading && !discover.data ? (
           <Loading />
-        ) : (
-          <>
-            <p className="muted small mono">{files.data?.root}</p>
-            {files.data && files.data.files.length > 0 ? (
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th className="wrap">File</th>
-                      <th>Size</th>
-                      <th>Modified</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {files.data.files.map((f) => (
-                      <tr key={f.name}>
-                        <td className="wrap mono small">{f.name}</td>
-                        <td className="small">{fmtBytes(f.size)}</td>
-                        <td className="muted small">{fmtDate(f.modified_at)}</td>
-                        <td>
-                          <button className="sm" onClick={() => doPreview(f.name)}>
-                            Preview
+        ) : discover.data && discover.data.archives.length > 0 ? (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th className="wrap">File</th>
+                  <th>Kind</th>
+                  <th>Size</th>
+                  <th>Liked source</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {discover.data.archives.map((a) => (
+                  <tr key={a.name}>
+                    <td className="wrap mono small">{a.name}</td>
+                    <td><KindBadge kind={a.archive_kind} /></td>
+                    <td className="small">{fmtBytes(a.size)}</td>
+                    <td className="small muted">
+                      {a.archive_kind === "takeout_index"
+                        ? "目次のみ (実データではない)"
+                        : a.liked_source_kind === "takeout_my_activity"
+                        ? "My Activity ✓"
+                        : a.liked_source_kind === "takeout_youtube"
+                        ? "YouTube CSV"
+                        : "—"}
+                    </td>
+                    <td>
+                      <div className="row">
+                        <button className="sm" disabled={a.archive_kind === "takeout_index"} onClick={() => doPreview(a.name)}>
+                          Preview
+                        </button>
+                        {a.liked_source_kind?.startsWith("takeout") && (
+                          <button className="sm" disabled={busy === "liked"} onClick={() => doImportLiked(a.name)}>
+                            Import liked
                           </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : (
-              <p className="muted small">
-                No .zip files found. Copy a Takeout ZIP into the import directory shown above.
-              </p>
-            )}
-          </>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="muted small">No .zip files found. Copy Takeout ZIPs into the import directory shown above.</p>
         )}
+        <p className="muted small" style={{ marginTop: 8 }}>
+          ※ サーバ上のパスを選択します（ブラウザからのアップロードは将来対応）。`archive_browser.html` のみの ZIP は
+          <strong> 目次のみ</strong>で、実データではありません。
+        </p>
       </div>
+
+      {likedResult && <div className="flash">{likedResult} <Link to="/liked-videos">View liked videos →</Link></div>}
 
       <div className="panel">
         <h2>Preview / Import</h2>
@@ -121,35 +174,55 @@ export default function Takeout() {
             <label>ZIP path (relative to import root)</label>
             <input value={path} onChange={(e) => setPath(e.target.value)} placeholder="takeout-XXXX.zip" style={{ width: "100%" }} />
           </div>
+          <div className="field inline">
+            <label>limit (optional)</label>
+            <input type="number" min={0} value={limit} onChange={(e) => setLimit(e.target.value)} style={{ width: 110 }} />
+          </div>
           <button disabled={!path || busy === "preview"} onClick={() => doPreview()}>
             {busy === "preview" ? <span className="spin" /> : "🔍"} Preview
+          </button>
+          <button disabled={!path || busy === "liked"} onClick={() => doImportLiked()}>
+            {busy === "liked" ? <span className="spin" /> : "⤓"} Import liked
           </button>
         </div>
 
         {preview && (
           <>
+            <div className="row" style={{ marginTop: 10 }}>
+              <KindBadge kind={preview.archive_kind ?? "unknown_takeout"} />
+              <span className="muted small">liked source: {preview.liked_source_kind ?? "—"}</span>
+            </div>
             <h3>Counts</h3>
             <div className="cards">
+              <div className="card"><div className="label">Liked videos</div><div className="value sm">{preview.likes_count}</div></div>
               <div className="card"><div className="label">Watch history</div><div className="value sm">{preview.watch_history_count}</div></div>
               <div className="card"><div className="label">Search history</div><div className="value sm">{preview.search_history_count}</div></div>
-              <div className="card"><div className="label">Likes</div><div className="value sm">{preview.likes_count}</div></div>
               <div className="card"><div className="label">Subscriptions</div><div className="value sm">{preview.subscriptions_count}</div></div>
               <div className="card"><div className="label">Playlists</div><div className="value sm">{preview.playlists_count}</div></div>
             </div>
-            {preview.warnings.length > 0 && (
-              <div className="error-box">{preview.warnings.join("\n")}</div>
+            {preview.archive_kind === "youtube_takeout" && preview.likes_count === 0 && (
+              <div className="flash" style={{ borderColor: "var(--warn)" }}>
+                YouTube Takeout に liked videos はありません（通常です）。高評価の全履歴は <strong>My Activity Takeout</strong> を指定してください。
+              </div>
             )}
+            {preview.liked_samples.length > 0 && (
+              <>
+                <h3>Liked samples</h3>
+                <div className="tag-list">
+                  {preview.liked_samples.map((s, i) => (
+                    <span key={i} className="badge muted">{(s.title ?? s.youtube_video_id ?? "?").slice(0, 40)}</span>
+                  ))}
+                </div>
+              </>
+            )}
+            {preview.warnings.length > 0 && <div className="error-box">{preview.warnings.join("\n")}</div>}
 
-            <h3>Import all</h3>
+            <h3>Import all (watch / search / subs / playlists / liked)</h3>
             <div className="row">
               <label className="checkbox">
                 <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} /> dry-run (no DB writes)
               </label>
-              <div className="field inline">
-                <label>per-section limit (optional)</label>
-                <input type="number" min={0} value={limit} onChange={(e) => setLimit(e.target.value)} style={{ width: 120 }} />
-              </div>
-              <button className="primary" disabled={busy === "import"} onClick={doImport}>
+              <button className="primary" disabled={busy === "import"} onClick={doImportAll}>
                 {busy === "import" ? <span className="spin" /> : "▶"} {dryRun ? "Dry-run import-all" : "Import all"}
               </button>
             </div>

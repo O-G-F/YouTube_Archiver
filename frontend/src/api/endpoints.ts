@@ -24,11 +24,14 @@ import type {
   SchedulerStatus,
   SearchResponse,
   SettingsView,
+  TakeoutDiscover,
   TakeoutFiles,
   TakeoutImportAll,
   TakeoutPreview,
   VideoDetail,
   VideoListItem,
+  YouTubeApiStatus,
+  YouTubeApiSyncResult,
 } from "./types";
 
 export function mediaUrl(videoId: number, mediaFileId: number): string {
@@ -124,9 +127,25 @@ export const api = {
 
   // Takeout
   takeoutFiles: () => apiGet<TakeoutFiles>("/api/takeout/files"),
+  takeoutDiscover: (deep = false) => apiGet<TakeoutDiscover>(`/api/takeout/discover${deep ? "?deep=true" : ""}`),
   takeoutPreview: (path: string) => apiPost<TakeoutPreview>("/api/takeout/preview", { path }),
   takeoutImportAll: (body: Record<string, unknown>) =>
     apiPost<TakeoutImportAll>("/api/takeout/import-all", body),
+  takeoutImportLiked: (body: { path: string; limit?: number; dry_run?: boolean }) =>
+    apiPost<{ imported_count: number; videos_created: number; skipped_duplicate_count: number; scanned: number; source_kind: string | null; detected_path: string | null }>(
+      "/api/takeout/import-liked-videos",
+      body
+    ),
+
+  // Library bootstrap + YouTube Data API (Phase 6B)
+  libraryBootstrap: (body: Record<string, unknown>) =>
+    apiPost<{ dry_run: boolean; youtube_takeout: unknown; myactivity_takeout: unknown; api: unknown }>(
+      "/api/library/bootstrap",
+      body
+    ),
+  youtubeApiStatus: () => apiGet<YouTubeApiStatus>("/api/youtube-api/status"),
+  youtubeApiSyncLiked: (body: { limit?: number; method?: string; stop_on_existing?: boolean; dry_run?: boolean }) =>
+    apiPost<YouTubeApiSyncResult>("/api/youtube-api/sync-liked", body),
 
   // Search / Library (Phase 5B)
   search: (p: { q: string; types?: string; limit?: number }) =>

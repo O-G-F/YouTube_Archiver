@@ -29,13 +29,14 @@ YouTube の動画・メタデータ・字幕・コメントを `yt-dlp` でロ�
 - **scheduler 連携コメント定期更新・live chat 取得（Phase 4B）** — scheduler が `next_comments_refresh_at` の期限切れ動画へ自動でコメント更新ジョブを投入（`SCHEDULER_COMMENTS_ENABLED`、1パス上限 `SCHEDULER_COMMENTS_LIMIT_PER_RUN`、frozen/recent 除外）、429 で `comment_refresh_failures` 加算＋backoff 再スケジュール、`live_chat_refresh` ジョブ（本体・コメント再DLなし、`--write-subs --sub-langs live_chat`）で `live_chat_messages` を正規化保存（super chat/メンバー/差分対応）、非ライブ動画は `not_available` 扱いでエラーにしない
 - **管理用 Web UI（Phase 5A）** — React + Vite + TypeScript の管理コンソールを FastAPI が同一オリジンで配信（`/`）。Dashboard / Jobs / Job 詳細（ログ tab・secret マスク）/ Videos / Video 詳細（簡易プレイヤー・comments/live chat・snapshots・refresh ボタン）/ Collections / Collection 詳細 / Add(URL・expand・channel) / Takeout / Settings・Doctor。CLI/curl なしで登録・refresh・ログ確認が可能。secret/cookie/token は UI・ログに出さない
 - **視聴 UI / プレイヤー・検索（Phase 5B）** — 保存済み動画を**ブラウザでシーク再生**（HTTP Range 対応の `media` 配信）。YouTube 風 Video 詳細（プレイヤー＋タイトル＋チャンネル＋説明折りたたみ＋コメント親子表示＋ライブチャット super chat/メンバー区別＋同 channel/同 collection の関連動画）。横断検索（`/api/search`：動画/コメント/ライブチャット/コレクション）、Videos のチャンネル/状態フィルタ・並び替え・サムネ・ページング、Job の 429/partial_success 分類表示、Library（liked/history/subscriptions/playlists の将来分類）。body 未保存（metadata_only）は「未保存」と明示
-- **高評価リスト（liked videos）/ ライブラリ・DL 安定化（Phase 6A）** — Google Takeout の「高く評価した動画」を `liked_videos` に正規化保存（CSV/JSON/HTML・言語差異対応、video stub 連携、dedup、`raw_json` 既定非返却）。Library で実 count 表示＋専用画面（メタデータ未取得を明示、`metadata_only` enqueue で本体を保存せず後追い取得）。検索に `liked_video` 追加。download ジョブの stderr 分類を強化（429 / Incomplete data received / fragments / subtitles / impersonation）して `job.meta.classification` に保存し UI で原因・retryable を表示。liked videos の本格的な API 同期は Phase 6B 以降
+- **高評価リスト（liked videos）/ ライブラリ・DL 安定化（Phase 6A）** — Google Takeout の「高く評価した動画」を `liked_videos` に正規化保存（CSV/JSON/HTML・言語差異対応、video stub 連携、dedup、`raw_json` 既定非返却）。Library で実 count 表示＋専用画面（メタデータ未取得を明示、`metadata_only` enqueue で本体を保存せず後追い取得）。検索に `liked_video` 追加。download ジョブの stderr 分類を強化（429 / Incomplete data received / fragments / subtitles / impersonation）して `job.meta.classification` に保存し UI で原因・retryable を表示
+- **Hybrid Liked Videos Sync（Phase 6B）** — 高評価の**全履歴は Google Takeout「マイ アクティビティ」**から取得（YouTube Data API は実用上 ~5000 件で頭打ちのため）。Takeout ZIP の種別自動判定（`youtube_takeout` / `my_activity_takeout` / `takeout_index` / `unknown`）+ discover/inspect、My Activity の `高く評価しました` / `Liked` 抽出（`低く評価`/`高評価を削除`/`を視聴` は除外）、**source 区別**（`takeout_my_activity` / `takeout_youtube` / `youtube_data_api`）で同一 DB へ統合（youtube_video_id でクロス source dedup）。**逐次更新は YouTube Data API（OAuth・差分・既存到達で停止）**で、API quota/auth エラーも分類表示。Hybrid `library bootstrap`。**OAuth 既定無効でも全機能が安全に起動**（secret/token は非表示）
 - 字幕は安全な許可リスト（`ja,en`、`all` は明示時のみ）、YouTube JS チャレンジ対応（`--remote-components ejs:github` + deno）、`curl_cffi` 同梱
 - 失敗ジョブ管理（ステータス・エラーメッセージ・再実行・キャンセル）+ `partial_success` / retryable
 - 運用補強（Phase 1.5）: `doctor` 診断、ジョブログ API/CLI（path traversal 対策）、profile dry-run
 - Web API（登録 / 展開 / コレクション / 再クロール / scheduler / ジョブ / プロファイル / 動画 / 診断）と CLI の両方
 - Docker Compose（web / worker / scheduler / postgres / redis / migrate）
-- Alembic マイグレーション（0001 初期 〜 0008 liked_videos）+ pytest（217 tests）+ フロント Vitest（15 tests）
+- Alembic マイグレーション（0001 初期 〜 0008 liked_videos）+ pytest（228 tests）+ フロント Vitest（15 tests）
 
 ---
 
@@ -680,6 +681,83 @@ archiver liked-videos enqueue-metadata --limit 20 --profile metadata_only [--now
 
 ---
 
+## Phase 6B: Hybrid Liked Videos Sync
+
+### 高評価動画を取得する現実的な構成
+
+| 用途 | 手段 | 件数 |
+|---|---|---|
+| **初回（全履歴）** | **Google Takeout「マイ アクティビティ」**（`Takeout/マイ アクティビティ/YouTube/マイアクティビティ.json`） | 過去すべて（実例: **11,066 件**） |
+| 補完 | YouTube / YouTube Music Takeout（"Liked videos" プレイリスト CSV） | 通常 0〜直近のみ |
+| **逐次更新** | **YouTube Data API（OAuth）** | **実用上 ~5000 件で頭打ち**（過去全件は保証しない） |
+
+> **重要**: YouTube Data API 単体では過去全件を取得できません（実用上 ~5000 件）。それより古い高評価は **My Activity Takeout** から取り込みます。`API だけ / Takeout だけ / API+Takeout` のどれでも動作します。
+
+### Takeout の取得方法と種別
+
+- **My Activity Takeout**: [takeout.google.com](https://takeout.google.com) で「マイ アクティビティ」→ YouTube を選択（JSON 推奨）。これに `高く評価しました …` イベントが入ります。
+- **YouTube Takeout**: 「YouTube と YouTube Music」を選択（watch/search/subscriptions/playlists）。liked は通常 0。
+- **`archive_browser.html` だけの ZIP は「目次」**であり実データではありません（種別 `takeout_index`）。UI/CLI で明示されます。
+
+種別自動判定（`youtube_takeout` / `my_activity_takeout` / `takeout_index` / `unknown_takeout`）:
+
+```bash
+archiver takeout discover            # /takeout_imports 配下を一覧分類
+archiver takeout inspect PATH        # 1 ZIP の種別・検出パス
+# API: GET /api/takeout/discover, GET /api/takeout/inspect?path=, GET /api/takeout/files（kind 付き）
+```
+
+### liked import（My Activity 対応）
+
+`import-liked-videos` は ZIP 種別を自動判定し、My Activity JSON の `高く評価しました`/`Liked` を抽出（`低く評価`/`低評価`/`高評価を削除`/`unliked`/`removed like`/`を視聴` は除外。markers は `services/takeout.py` の `LIKE_ACTIVITY_MARKERS` / `NON_LIKE_ACTIVITY_MARKERS`）。`subtitles[0].name`→channel_title、`subtitles[0].url`→channel_id、`title` の `高く評価しました ` prefix を除去。
+
+```bash
+archiver takeout import-liked-videos MyActivityZIP --limit 10000 [--dry-run]
+archiver liked-videos stats / list [--only-missing-metadata]
+# 結果: scanned / imported / skipped_duplicate / failed / videos_created / source_kind / detected_path（job.meta にも保存）
+```
+
+- **source 区別**: `takeout_my_activity` / `takeout_youtube` / `youtube_data_api`。Library 画面で source 別 count を表示。
+- **dedup は youtube_video_id でクロス source**（複数 export/source で重複する動画は 1 行）。
+- 各 liked に **Video stub** を作成/統合し、`metadata_only` で後追い詳細取得（**本体は保存しない**）。
+
+### Hybrid 初回 DB 構築
+
+```bash
+archiver library bootstrap \
+  --youtube-takeout YouTubeTakeout.zip \
+  --myactivity-takeout MyActivity.zip \
+  --limit-liked 20000 [--use-api] [--dry-run]
+# API: POST /api/library/bootstrap
+```
+
+### YouTube Data API（差分更新・OAuth）
+
+**既定無効**。設定すると差分同期（newest-first で**既存 DB に到達したら停止**）が使えます。取得経路は A: `videos.list(myRating=like)` / B: `channels.list → relatedPlaylists.likes → playlistItems.list`（`YOUTUBE_API_LIKED_METHOD=videos|playlist|auto`）。1 ページ最大 50 件。
+
+```bash
+# 1) Google Cloud で OAuth クライアント（インストール済みアプリ）を作成し client_secret.json を /secrets か /config に置く
+#    .env: YOUTUBE_API_ENABLED=true / YOUTUBE_OAUTH_CLIENT_SECRET_FILE=/secrets/client_secret.json
+archiver youtube-api status            # enabled / configured 等（パス・token は非表示）
+archiver youtube-api authorize         # ブラウザで認可 → token を保存（/config 既定）
+archiver youtube-api sync-liked --limit 1000 --stop-on-existing [--dry-run]
+# API: GET /api/youtube-api/status, POST /api/youtube-api/sync-liked（未設定でも 200 + ok=false + classification）
+```
+
+- source=`youtube_data_api`。Takeout 由来と **youtube_video_id で dedup**。API で取れた title/channel/publishedAt は Video stub に反映。API で取れない古い liked は **My Activity 由来を残す**。
+- API quota/auth エラーも分類（`auth_required` / `quota_exceeded` / `forbidden` / `token_expired` / `rate_limited`）して UI/CLI に表示。
+- **OAuth 未設定でも全機能が安全に起動**します（依存ライブラリ未導入でも分類エラーで graceful degrade）。
+
+### 参考プロジェクト
+
+`YouTube-Liked_Videos.zip`（旧・高評価収集 WebUI）は **参考資料**です（My Activity parser・markers・API 差分更新・viewer の検索/絞り込み/サムネ設計）。**移植はせず**、本プロジェクトに不要ファイル（`.git/` 等）を混ぜていません。
+
+### セキュリティ（6B）
+
+- 高評価履歴・`raw_json` は個人情報として既定非返却・UI 非表示。**OAuth secret/token は UI/API/log に出さない**（Settings は `youtube_api_configured: yes/no` のみ、パス非表示）。secret/token/Takeout ZIP は Git 管理しない。`metadata_only` の本体非保存を維持。
+
+---
+
 ## ストレージ構成
 
 ```
@@ -805,7 +883,12 @@ archiver live-chat stats VIDEO_ID
 | POST | `/api/takeout/import-subscriptions` | 登録チャンネル import |
 | POST | `/api/takeout/import-playlists` | 再生リスト import（`{"path","limit_playlists","limit_items","dry_run"}`） |
 | POST | `/api/takeout/import-all` | 5種（watch/search/subs/playlists/liked）を順に import（各 limit 指定可）【6A 拡張】 |
-| POST | `/api/takeout/import-liked-videos` | 高評価リスト import（`{"path","limit","dry_run"}`）【Phase 6A】 |
+| POST | `/api/takeout/import-liked-videos` | 高評価リスト import（My Activity / YouTube 自動判定、`source_kind`/`detected_path` 返却）【6A/6B】 |
+| GET | `/api/takeout/discover` | ZIP 種別自動判定一覧（`?deep=`）【Phase 6B】 |
+| GET | `/api/takeout/inspect` | 1 ZIP の構造判定（`?path=`）【Phase 6B】 |
+| POST | `/api/library/bootstrap` | Hybrid 初回構築（YouTube + My Activity + 任意 API）【Phase 6B】 |
+| GET | `/api/youtube-api/status` | OAuth 状態（secret/token・パス非表示）【Phase 6B】 |
+| POST | `/api/youtube-api/sync-liked` | API 差分同期（未設定でも 200 + `ok=false` + classification）【Phase 6B】 |
 | GET | `/api/takeout/playlists/preview` | 再生リスト一覧 preview（`?path=&limit=`） |
 | GET | `/api/watch-history` | 視聴履歴一覧（`?q=&limit=&offset=&include_raw=`） |
 | GET | `/api/watch-history/stats` | 視聴履歴の統計（件数 / 期間 / top channels） |
@@ -940,6 +1023,7 @@ live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_e
   - `0006` `videos` に `last_comments_refresh_at` / `next_comments_refresh_at` / `comments_state`（adaptive コメント更新）
   - `0007` `videos` に `comment_refresh_failures` / `last_live_chat_refresh_at` / `next_live_chat_refresh_at`(index) / `live_chat_state` / `has_live_chat`、`live_chat_messages` に `time_text` / `amount_text` / `message_type` / `published_at` / `fetched_at` / `is_deleted_or_missing`（Phase 4B。NOT NULL 列は `server_default` 付きで既存行も安全に移行）
   - `0008` `liked_videos` テーブル追加（`source`/`youtube_video_id`/`title`/`channel_title`/`url`/`liked_at`/`video_id`(FK)/`raw_json`/`created_at`、`(source, youtube_video_id)` ユニーク、各種 index）（Phase 6A・SQLite/PostgreSQL 両対応）
+  - Phase 6B は**マイグレーション追加なし**（既存 `liked_videos.source` を `takeout_my_activity`/`takeout_youtube`/`youtube_data_api` で運用、channel_id は `raw_json` + Video stub へ反映）
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
 - 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 

@@ -48,6 +48,8 @@ watch_history_app = typer.Typer(help="Inspect imported watch history.")
 search_history_app = typer.Typer(help="Inspect imported search history.")
 subscriptions_app = typer.Typer(help="Takeout subscriptions (channels).")
 liked_videos_app = typer.Typer(help="Takeout liked videos library.")
+library_app = typer.Typer(help="Hybrid library bootstrap (Takeout + API).")
+youtube_api_app = typer.Typer(help="YouTube Data API OAuth (differential liked sync).")
 app.add_typer(source_app, name="source")
 app.add_typer(download_app, name="download")
 app.add_typer(jobs_app, name="jobs")
@@ -61,6 +63,8 @@ app.add_typer(watch_history_app, name="watch-history")
 app.add_typer(search_history_app, name="search-history")
 app.add_typer(subscriptions_app, name="subscriptions")
 app.add_typer(liked_videos_app, name="liked-videos")
+app.add_typer(library_app, name="library")
+app.add_typer(youtube_api_app, name="youtube-api")
 
 
 # --------------------------------------------------------------------------- #
@@ -980,6 +984,43 @@ def takeout_list_files(path: str = typer.Argument(..., help="ZIP under TAKEOUT_I
         raise typer.BadParameter(str(exc))
 
 
+@takeout_app.command("discover")
+def takeout_discover(
+    deep: bool = typer.Option(False, "--deep", help="Also parse a liked-count hint (slower)."),
+) -> None:
+    """Classify every ZIP under TAKEOUT_IMPORT_ROOT (youtube / my_activity / index / unknown)."""
+    from app.services import takeout as tk
+
+    rows = tk.discover(get_settings(), deep=deep)
+    if not rows:
+        typer.echo("No ZIPs under TAKEOUT_IMPORT_ROOT.")
+        return
+    for d in rows:
+        liked = f" liked={d['liked_count']}" if d.get("liked_count") is not None else ""
+        ma = " [my-activity-yt]" if d.get("my_activity_youtube_path") else ""
+        typer.echo(f"  {d.get('archive_kind','?'):<20}{liked}{ma}  {d['name']}")
+
+
+@takeout_app.command("inspect")
+def takeout_inspect(path: str = typer.Argument(..., help="ZIP under TAKEOUT_IMPORT_ROOT.")) -> None:
+    """Show the structural classification of one Takeout ZIP."""
+    from app.services import takeout as tk
+
+    try:
+        zip_path = tk.resolve_takeout_path(get_settings(), path)
+        with tk.open_archive(zip_path) as a:
+            info = a.inspect()
+    except tk.TakeoutError as exc:
+        raise typer.BadParameter(str(exc))
+    typer.echo(f"archive_kind        : {info['archive_kind']}")
+    typer.echo(f"has_youtube_takeout : {info['has_youtube_takeout']}")
+    typer.echo(f"my_activity_yt_path : {info['my_activity_youtube_path']}")
+    typer.echo(f"has_index           : {info['has_index']}")
+    typer.echo(f"member_count        : {info['member_count']}")
+    typer.echo(f"liked_source_kind   : {info['liked_source_kind']}")
+    typer.echo(f"liked_detected_path : {info['liked_detected_path']}")
+
+
 @takeout_app.command("preview")
 def takeout_preview(path: str = typer.Argument(...)) -> None:
     """Preview a Takeout ZIP (counts + samples) WITHOUT importing."""
@@ -991,11 +1032,16 @@ def takeout_preview(path: str = typer.Argument(...)) -> None:
             pv = a.preview(sample=5)
     except tk.TakeoutError as exc:
         raise typer.BadParameter(str(exc))
+    typer.echo(f"archive_kind={pv.get('archive_kind')} liked_source={pv.get('liked_source_kind')}")
     typer.echo(
         f"watch_history={pv['watch_history_count']} search_history={pv['search_history_count']} "
         f"likes={pv['likes_count']} subscriptions={pv['subscriptions_count']} "
         f"playlists={pv['playlists_count']}"
     )
+    if pv.get("liked_samples"):
+        typer.echo("liked samples:")
+        for s in pv["liked_samples"]:
+            typer.echo(f"  {s['youtube_video_id'] or '-'}  {(s['title'] or '')[:50]}  | {s['liked_at']}")
     typer.echo("samples:")
     for s in pv["samples"]:
         typer.echo(f"  {s['youtube_video_id'] or '-'}  {(s['title'] or '')[:50]}  | {s['channel_title']}  | {s['watched_at']}")
@@ -1257,6 +1303,119 @@ def liked_videos_enqueue_metadata(
     typer.echo(f"Created {len(job_ids)} {profile} job(s) for liked videos.")
     for jid in job_ids:
         _dispatch(jid, now)
+
+
+# --------------------------------------------------------------------------- #
+# library (hybrid bootstrap)
+# --------------------------------------------------------------------------- #
+@library_app.command("bootstrap")
+def library_bootstrap(
+    youtube_takeout: str = typer.Option("", "--youtube-takeout", help="YouTube Takeout ZIP (under TAKEOUT_IMPORT_ROOT)."),
+    myactivity_takeout: str = typer.Option("", "--myactivity-takeout", help="My Activity Takeout ZIP."),
+    limit_liked: int = typer.Option(0, "--limit-liked"),
+    limit_watch: int = typer.Option(0, "--limit-watch"),
+    limit_search: int = typer.Option(0, "--limit-search"),
+    limit_subscriptions: int = typer.Option(0, "--limit-subscriptions"),
+    limit_playlists: int = typer.Option(0, "--limit-playlists"),
+    limit_items: int = typer.Option(0, "--limit-items"),
+    use_api: bool = typer.Option(False, "--use-api", help="Also top-up via the YouTube Data API (if configured)."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """First-time hybrid build: YouTube Takeout + My Activity Takeout (+ optional API)."""
+    from app.services import library as lib
+
+    if not youtube_takeout and not myactivity_takeout and not use_api:
+        raise typer.BadParameter("provide --youtube-takeout and/or --myactivity-takeout (or --use-api)")
+    with session_scope() as s:
+        r = lib.bootstrap(
+            s, get_settings(),
+            youtube_takeout_path=(youtube_takeout or None),
+            myactivity_takeout_path=(myactivity_takeout or None),
+            limit_watch=(limit_watch or None), limit_search=(limit_search or None),
+            limit_subscriptions=(limit_subscriptions or None), limit_playlists=(limit_playlists or None),
+            limit_items=(limit_items or None), limit_liked=(limit_liked or None),
+            use_api=use_api, dry_run=dry_run,
+        )
+    typer.echo(f"dry_run={r['dry_run']}")
+    if r.get("youtube_takeout"):
+        yt = r["youtube_takeout"]
+        if "error" in yt:
+            typer.echo(f"  youtube_takeout : ERROR {yt['error']}")
+        else:
+            typer.echo(
+                f"  youtube_takeout : watch={yt['watch_history']['imported_count']} "
+                f"search={yt['search_history']['imported_count']} subs={yt['subscriptions']['imported_count']} "
+                f"playlists={yt['playlists']['playlists_imported']} liked={yt['liked_videos']['imported_count']}"
+            )
+    if r.get("myactivity_takeout"):
+        ma = r["myactivity_takeout"]
+        if "error" in ma:
+            typer.echo(f"  myactivity      : ERROR {ma['error']}")
+        else:
+            lv = ma["liked_videos"]
+            typer.echo(
+                f"  myactivity liked: imported={lv['imported_count']} skipped={lv['skipped_duplicate_count']} "
+                f"videos={lv['videos_created']} scanned={lv['scanned']} source={lv.get('source_kind')}"
+            )
+    if r.get("api"):
+        ap = r["api"]
+        if "error" in ap:
+            typer.echo(f"  api liked       : unavailable ({ap['error']})")
+        else:
+            lv = ap["liked_videos"]
+            typer.echo(f"  api liked       : imported={lv['imported_count']} stopped_on_existing={lv['stopped_on_existing']}")
+
+
+# --------------------------------------------------------------------------- #
+# youtube-api (OAuth differential sync)
+# --------------------------------------------------------------------------- #
+@youtube_api_app.command("status")
+def youtube_api_status() -> None:
+    """Show YouTube Data API OAuth status (no secrets/paths shown)."""
+    from app.services import youtube_api as yt
+
+    st = yt.status_dict(get_settings())
+    for k in ("enabled", "client_secret_present", "token_present", "configured", "method"):
+        typer.echo(f"  {k:22}: {st[k]}")
+
+
+@youtube_api_app.command("authorize")
+def youtube_api_authorize() -> None:
+    """Run the OAuth installed-app flow (needs a browser) and store the token."""
+    from app.services import youtube_api as yt
+
+    try:
+        path = yt.authorize(get_settings())
+    except yt.YouTubeApiError as exc:
+        raise typer.BadParameter(f"[{exc.classification}] {exc.message}")
+    typer.echo(f"OAuth token stored ({path.name}). You can now run `youtube-api sync-liked`.")
+
+
+@youtube_api_app.command("sync-liked")
+def youtube_api_sync_liked(
+    limit: int = typer.Option(0, "--limit", help="Max liked videos to scan (0 = all available)."),
+    method: str = typer.Option("", "--method", help="videos | playlist | auto"),
+    stop_on_existing: bool = typer.Option(True, "--stop-on-existing/--no-stop-on-existing"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Differentially sync liked videos from the YouTube Data API (source=youtube_data_api)."""
+    from app.services import youtube_api as yt
+
+    with session_scope() as s:
+        try:
+            r = yt.sync_liked(
+                s, get_settings(), method=(method or None),
+                stop_on_existing=stop_on_existing, limit=(limit or None), dry_run=dry_run,
+            )
+        except yt.YouTubeApiError as exc:
+            typer.echo(f"YouTube Data API unavailable: [{exc.classification}] {exc.message}")
+            typer.echo("Hint: set YOUTUBE_API_ENABLED=true, provide a client secret, and run `youtube-api authorize`.")
+            return
+    typer.echo(
+        f"sync-liked: imported={r['imported_count']} skipped={r['skipped_duplicate_count']} "
+        f"videos_created={r['videos_created']} scanned={r['scanned']} "
+        f"stopped_on_existing={r['stopped_on_existing']} dry_run={r['dry_run']}"
+    )
 
 
 # --------------------------------------------------------------------------- #

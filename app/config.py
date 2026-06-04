@@ -118,6 +118,37 @@ class Settings(BaseSettings):
             return ["*"]
         return [o.strip() for o in raw.split(",") if o.strip()]
 
+    # ---- YouTube Data API OAuth (Phase 6B) — DEFAULT DISABLED ----
+    # When disabled (default) the app starts and runs fully without any OAuth
+    # config. Secrets (client_secret / token) live as files under /config or
+    # /secrets and are NEVER returned by the API or logged.
+    youtube_api_enabled: bool = False
+    # OAuth installed-app client secret JSON (downloaded from Google Cloud).
+    youtube_oauth_client_secret_file: str = ""
+    # Stored OAuth token (created by the authorize flow). Default under CONFIG_ROOT.
+    youtube_oauth_token_file: str = ""
+    # Preferred liked-fetch method: "videos" (videos.list myRating=like),
+    # "playlist" (relatedPlaylists.likes), or "auto" (videos -> playlist fallback).
+    youtube_api_liked_method: str = "auto"
+
+    @property
+    def youtube_token_path(self) -> Path:
+        if self.youtube_oauth_token_file:
+            return Path(self.youtube_oauth_token_file)
+        return self.config_root / "youtube_oauth_token.json"
+
+    @property
+    def youtube_client_secret_path(self) -> Path | None:
+        return Path(self.youtube_oauth_client_secret_file) if self.youtube_oauth_client_secret_file else None
+
+    @property
+    def youtube_api_configured(self) -> bool:
+        """True if OAuth is enabled AND a client secret + token file are present."""
+        if not self.youtube_api_enabled:
+            return False
+        cs = self.youtube_client_secret_path
+        return bool(cs and cs.is_file() and self.youtube_token_path.is_file())
+
     # ----- Derived helpers -----
     @property
     def effective_remote_components(self) -> str | None:

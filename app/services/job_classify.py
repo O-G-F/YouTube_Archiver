@@ -33,6 +33,11 @@ _MARKERS: dict[str, tuple[str, ...]] = {
         "failed to download subtitle",
     ),
     "impersonation": ("impersonate", "curl_cffi", "could not find a suitable"),
+    # YouTube Data API (OAuth) error categories (Phase 6B).
+    "auth_required": ("auth_required", "oauth token not found", "not configured", "unauthorized"),
+    "quota_exceeded": ("quota_exceeded", "quotaexceeded", "quota exceeded", "dailylimitexceeded"),
+    "forbidden": ("forbidden", "accessnotconfigured", "insufficientpermissions"),
+    "token_expired": ("token_expired", "invalid_grant", "token expired", "token has been expired"),
 }
 
 # human-readable note per category (low-severity ones flagged as such)
@@ -43,6 +48,10 @@ _NOTES: dict[str, str] = {
     "fragments_failed": "Some media fragments failed to download — retry later",
     "subtitles_failed": "Subtitle download failed (usually non-fatal; body/metadata may be fine)",
     "impersonation": "optional impersonation/runtime dependency missing (low severity)",
+    "auth_required": "YouTube Data API not configured / not authorized — set up OAuth (see README)",
+    "quota_exceeded": "YouTube Data API quota exceeded — try again later",
+    "forbidden": "YouTube Data API request forbidden (permissions / API not enabled)",
+    "token_expired": "OAuth token expired — re-run the authorize flow",
 }
 
 _LOW_SEVERITY = ("impersonation", "subtitles_failed")
