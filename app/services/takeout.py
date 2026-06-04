@@ -36,6 +36,7 @@ from app.models import (
     Collection,
     CollectionItem,
     Job,
+    LikedVideo,
     SearchHistoryEvent,
     Source,
     Video,
@@ -97,6 +98,16 @@ class TakeoutPlaylist:
     playlist_id: str | None
     file_name: str
     items: list[PlaylistItem] = field(default_factory=list)
+
+
+@dataclass
+class LikedVideoEntry:
+    youtube_video_id: str | None
+    title: str | None
+    channel_title: str | None
+    url: str | None
+    liked_at: datetime | None
+    raw: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -313,6 +324,98 @@ def parse_playlist_index_csv(text: str) -> dict[str, str | None]:
     return index
 
 
+def _csv_header_col(header: list[str], *needles: str) -> int | None:
+    for i, h in enumerate(header):
+        hl = h.lower()
+        if any(n in hl or n in h for n in needles):
+            return i
+    return None
+
+
+def parse_liked_videos_csv(text: str) -> Iterator[LikedVideoEntry]:
+    """Parse the Takeout "Liked videos" playlist CSV (Video ID + timestamp).
+
+    Some exports add a title column; we use it when present. Otherwise only the
+    video id + liked timestamp are available (title/channel come later from a
+    metadata refresh).
+    """
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return
+    header = rows[0]
+    # The id column is usually col 0; fall back to scanning.
+    id_col = 0
+    if not is_video_id((rows[1][0].strip() if len(rows) > 1 and rows[1] else "")):
+        hc = _csv_header_col(header, "video id", "動画 id", "動画id")
+        id_col = hc if hc is not None else 0
+    ts_col = _csv_header_col(header, "timestamp", "time", "日時", "作成")
+    title_col = _csv_header_col(header, "title", "タイトル")
+    for row in rows[1:]:
+        if not row or not any(c.strip() for c in row):
+            continue
+        vid = row[id_col].strip() if len(row) > id_col else ""
+        if not is_video_id(vid):
+            # tolerate a leading column shuffle: scan the row for an id
+            vid = next((c.strip() for c in row if is_video_id(c.strip())), "")
+            if not is_video_id(vid):
+                continue
+        liked_at = None
+        if ts_col is not None and len(row) > ts_col:
+            liked_at = _parse_iso_time(row[ts_col])
+        if liked_at is None:  # try any cell that parses as a timestamp
+            for c in row:
+                liked_at = _parse_iso_time(c)
+                if liked_at:
+                    break
+        title = row[title_col].strip() if title_col is not None and len(row) > title_col else None
+        yield LikedVideoEntry(
+            youtube_video_id=vid,
+            title=title or None,
+            channel_title=None,
+            url=canonical_video_url(vid),
+            liked_at=liked_at,
+            raw={"video_id": vid, "liked_at": liked_at.isoformat() if liked_at else None},
+        )
+
+
+def parse_liked_videos_json(entries: list[dict]) -> Iterator[LikedVideoEntry]:
+    """Best-effort JSON likes parser (watch-history-shaped entries)."""
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        url = e.get("titleUrl") or e.get("url") or ""
+        vid = extract_video_id(url) if url else None
+        subtitles = e.get("subtitles") or []
+        channel = subtitles[0].get("name") if subtitles and isinstance(subtitles[0], dict) else None
+        yield LikedVideoEntry(
+            youtube_video_id=vid,
+            title=_clean_watch_title(e.get("title")) or e.get("title"),
+            channel_title=channel,
+            url=canonical_video_url(vid) if vid else (url or None),
+            liked_at=_parse_iso_time(e.get("time")),
+            raw=e,
+        )
+
+
+def parse_liked_videos_html(html: str) -> Iterator[LikedVideoEntry]:
+    """Best-effort HTML likes parser (Takeout 'outer-cell' blocks)."""
+    for chunk in html.split('<div class="outer-cell')[1:]:
+        mv = _HTML_VIDEO_RE.search(chunk)
+        if not mv:
+            continue
+        url, title = mv.group(1), _strip_tags(mv.group(2))
+        mc = _HTML_CHANNEL_RE.search(chunk)
+        vid = extract_video_id(url)
+        yield LikedVideoEntry(
+            youtube_video_id=vid,
+            title=title or None,
+            channel_title=_strip_tags(mc.group(1)) if mc else None,
+            url=canonical_video_url(vid) if vid else url,
+            liked_at=_parse_html_time(chunk),
+            raw={"url": url, "title": title},
+        )
+
+
 def parse_watch_history_html(html: str) -> Iterator[WatchEvent]:
     """Best-effort HTML watch-history parser (Takeout 'outer-cell' blocks)."""
     chunks = html.split('<div class="outer-cell')
@@ -341,6 +444,12 @@ def _classify_json_peek(head: str) -> str:
     if watch > 0:
         return "watch_history"
     return "unknown"
+
+
+def _is_likes_name(name: str) -> bool:
+    base = name.rsplit("/", 1)[-1]
+    low = base.lower()
+    return "高く評価" in base or "liked video" in low or "liked-video" in low or low.startswith("likes")
 
 
 def _classify_csv(name: str, header: str) -> str:
@@ -401,11 +510,15 @@ class TakeoutArchive:
                 continue
             ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
             if ext == "json":
-                head = self._read(name)[:8192].decode("utf-8", errors="replace")
-                kind, fmt = _classify_json_peek(head), "json"
+                fmt = "json"
+                kind = "likes" if _is_likes_name(name) else _classify_json_peek(
+                    self._read(name)[:8192].decode("utf-8", errors="replace")
+                )
             elif ext in ("html", "htm"):
                 low = name.lower()
-                if "watch" in low or "視聴" in name:
+                if _is_likes_name(name):
+                    kind = "likes"
+                elif "watch" in low or "視聴" in name:
                     kind = "watch_history"
                 elif "search" in low or "検索" in name:
                     kind = "search_history"
@@ -431,7 +544,7 @@ class TakeoutArchive:
 
     def _count_csv_rows(self, f: TakeoutFile) -> int:
         text = self._read_text(f.name)
-        rows = [r for r in csv.reader(io.StringIO(text))]
+        rows = [r for r in csv.reader(io.StringIO(text)) if r and any(c.strip() for c in r)]
         return max(0, len(rows) - 1)  # minus header
 
     # ----- watch events -----
@@ -480,6 +593,19 @@ class TakeoutArchive:
                 title=title, playlist_id=index.get(title), file_name=f.name, items=items
             )
 
+    def iter_liked_videos(self) -> Iterator[LikedVideoEntry]:
+        for f in self.list_files():
+            if f.kind != "likes":
+                continue
+            if f.format == "csv":
+                yield from parse_liked_videos_csv(self._read_text(f.name))
+            elif f.format == "json":
+                data = json.loads(self._read_text(f.name))
+                if isinstance(data, list):
+                    yield from parse_liked_videos_json(data)
+            elif f.format == "html":
+                yield from parse_liked_videos_html(self._read_text(f.name))
+
     def preview(self, sample: int = 5) -> dict:
         files = self.list_files()
         counts = {
@@ -499,7 +625,13 @@ class TakeoutArchive:
                 elif f.kind == "subscriptions":
                     counts["subscriptions_count"] += self._count_csv_rows(f)
                 elif f.kind == "likes":
-                    counts["likes_count"] += self._count_csv_rows(f)
+                    if f.format == "csv":
+                        counts["likes_count"] += self._count_csv_rows(f)
+                    elif f.format == "json":
+                        d = json.loads(self._read_text(f.name))
+                        counts["likes_count"] += len(d) if isinstance(d, list) else 0
+                    elif f.format == "html":
+                        counts["likes_count"] += self._read_text(f.name).count('<div class="outer-cell')
                 elif f.kind == "playlist":
                     counts["playlists_count"] += 1
             except Exception as exc:  # noqa: BLE001
@@ -509,6 +641,7 @@ class TakeoutArchive:
         search_samples: list[str] = []
         subscription_samples: list[dict] = []
         playlist_samples: list[dict] = []
+        liked_samples: list[dict] = []
         try:
             for ev in self.iter_watch_events():
                 samples.append(
@@ -538,6 +671,16 @@ class TakeoutArchive:
                 )
                 if len(playlist_samples) >= sample:
                     break
+            for lv in self.iter_liked_videos():
+                liked_samples.append(
+                    {
+                        "youtube_video_id": lv.youtube_video_id,
+                        "title": lv.title,
+                        "liked_at": lv.liked_at.isoformat() if lv.liked_at else None,
+                    }
+                )
+                if len(liked_samples) >= sample:
+                    break
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"sample parse: {exc}")
 
@@ -546,6 +689,7 @@ class TakeoutArchive:
             "search_history": counts["search_history_count"] > 0,
             "subscriptions": counts["subscriptions_count"] > 0,
             "playlists": counts["playlists_count"] > 0,
+            "liked_videos": counts["likes_count"] > 0,
         }
         return {
             "files": [
@@ -557,6 +701,7 @@ class TakeoutArchive:
             "search_samples": search_samples,
             "subscription_samples": subscription_samples,
             "playlist_samples": playlist_samples,
+            "liked_samples": liked_samples,
             "importable": importable,
             "warnings": warnings,
         }
@@ -847,6 +992,96 @@ def import_playlists(
     }
 
 
+def import_liked_videos(
+    session: Session,
+    archive: TakeoutArchive,
+    *,
+    limit: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Import liked videos into ``liked_videos`` (+ Video stubs) with dedup.
+
+    Dedup key: (source, youtube_video_id) when an id is present; otherwise
+    (source, title, url) for HTML-only fallbacks. A Video stub is created/linked
+    when an id is present so a later metadata_only refresh can enrich it.
+    """
+    existing_ids: set[str] = set()
+    existing_titlekey: set[tuple] = set()
+    for vid, title, url in session.execute(
+        select(LikedVideo.youtube_video_id, LikedVideo.title, LikedVideo.url).where(
+            LikedVideo.source == "takeout"
+        )
+    ):
+        if vid:
+            existing_ids.add(vid)
+        else:
+            existing_titlekey.add(((title or "")[:200], (url or "")))
+
+    imported = skipped = failed = scanned = videos_created = 0
+    seen_ids: set[str] = set()
+    seen_titlekey: set[tuple] = set()
+    warnings: list[str] = []
+
+    for lv in archive.iter_liked_videos():
+        if limit is not None and scanned >= limit:
+            break
+        scanned += 1
+        vid = lv.youtube_video_id
+        if vid:
+            if vid in existing_ids or vid in seen_ids:
+                skipped += 1
+                continue
+            seen_ids.add(vid)
+        else:
+            tkey = ((lv.title or "")[:200], (lv.url or ""))
+            if not any(tkey):
+                failed += 1
+                continue
+            if tkey in existing_titlekey or tkey in seen_titlekey:
+                skipped += 1
+                continue
+            seen_titlekey.add(tkey)
+
+        imported += 1
+        if dry_run:
+            continue
+
+        video_pk = None
+        if vid:
+            video, created = _find_or_create_video(session, vid)
+            if created:
+                videos_created += 1
+            # Enrich the stub from the liked entry only when fields are empty.
+            if lv.title and not video.title:
+                video.title = lv.title
+            if lv.channel_title and not video.channel_title:
+                video.channel_title = lv.channel_title
+            video_pk = video.id
+        session.add(
+            LikedVideo(
+                source="takeout",
+                youtube_video_id=vid,
+                title=lv.title,
+                channel_title=lv.channel_title,
+                url=lv.url,
+                liked_at=lv.liked_at,
+                video_id=video_pk,
+                raw_json=lv.raw,
+            )
+        )
+
+    if not dry_run:
+        session.flush()
+    return {
+        "imported_count": imported,
+        "skipped_duplicate_count": skipped,
+        "failed_count": failed,
+        "scanned": scanned,
+        "videos_created": videos_created,
+        "warnings": warnings,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Job-wrapped runners
 # --------------------------------------------------------------------------- #
@@ -940,6 +1175,15 @@ def run_import_playlists(
     )
 
 
+def run_import_liked_videos(
+    session: Session, settings: Settings, path: str, *, limit: int | None = None, dry_run: bool = False
+) -> dict:
+    return _run_with_job(
+        session, settings, path, "liked_videos",
+        lambda a: import_liked_videos(session, a, limit=limit, dry_run=dry_run), dry_run,
+    )
+
+
 def run_import_all(
     session: Session,
     settings: Settings,
@@ -950,6 +1194,7 @@ def run_import_all(
     limit_subscriptions: int | None = None,
     limit_playlists: int | None = None,
     limit_items: int | None = None,
+    limit_liked: int | None = None,
     dry_run: bool = False,
 ) -> dict:
     """Run all Takeout imports in order, returning per-kind results."""
@@ -960,5 +1205,6 @@ def run_import_all(
         "playlists": run_import_playlists(
             session, settings, path, limit_playlists=limit_playlists, limit_items=limit_items, dry_run=dry_run
         ),
+        "liked_videos": run_import_liked_videos(session, settings, path, limit=limit_liked, dry_run=dry_run),
         "dry_run": dry_run,
     }

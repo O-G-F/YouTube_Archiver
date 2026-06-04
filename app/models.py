@@ -414,6 +414,38 @@ class SearchHistoryEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class LikedVideo(Base):
+    """A "liked video" library entry (Phase 6A).
+
+    Currently sourced from Google Takeout (the "Liked videos" playlist CSV).
+    ``raw_json`` is personal data and is NOT returned by the API by default.
+    """
+
+    __tablename__ = "liked_videos"
+    __table_args__ = (
+        # A video can only be liked once per source. NULL youtube_video_id rows
+        # (HTML-only fallbacks) are deduped in code by (source, title, url).
+        UniqueConstraint("source", "youtube_video_id", name="uq_liked_video"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # source: takeout | youtube_data_api (future)
+    source: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    youtube_video_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    title: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    channel_title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    liked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Optional link to the canonical Video row (stub created on import).
+    video_id: Mapped[int | None] = mapped_column(
+        ForeignKey("videos.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    raw_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class DiaryEntry(Base):
     __tablename__ = "diary_entries"
 

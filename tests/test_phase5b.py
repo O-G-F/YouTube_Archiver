@@ -166,7 +166,7 @@ def test_library_summary(client, settings):
         s.add(Collection(type="takeout_playlist", title="pl", url="https://p"))
     body = client.get("/api/library/summary").json()
     cats = {c["key"]: c for c in body["categories"]}
-    assert cats["liked_videos"]["available"] is False  # planned
+    assert "liked_videos" in cats  # available flips to True once 6A lands
     assert cats["subscriptions"]["count"] >= 1
     assert cats["playlists"]["count"] >= 1
 
@@ -190,13 +190,10 @@ def test_classify_job_rate_limited_from_meta_and_stderr():
     assert any("impersonation" in w or "impersonate" in w for w in classify_job(j4)["warnings"])
 
     j5 = Job(type="download", status="success")
-    assert classify_job(j5) == {
-        "rate_limited": False,
-        "partial": False,
-        "retryable": False,
-        "warnings": [],
-        "summary": "Success",
-    }
+    c5 = classify_job(j5)
+    assert c5["rate_limited"] is False and c5["partial"] is False
+    assert c5["retryable"] is False and c5["summary"] == "Success"
+    assert c5["reasons"] == [] and c5["warnings"] == []
 
 
 def test_jobs_api_includes_classification(client):

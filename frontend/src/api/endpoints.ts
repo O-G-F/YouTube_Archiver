@@ -12,6 +12,9 @@ import type {
   JobLogs,
   JobStats,
   LibrarySummary,
+  LikedVideo,
+  LikedVideosEnqueueResult,
+  LikedVideoStats,
   LiveChatMessage,
   LiveChatStats,
   MetadataSnapshot,
@@ -129,4 +132,16 @@ export const api = {
   search: (p: { q: string; types?: string; limit?: number }) =>
     apiGet<SearchResponse>(`/api/search${qs(p)}`),
   librarySummary: () => apiGet<LibrarySummary>("/api/library/summary"),
+
+  // Liked videos (Phase 6A)
+  likedVideos: (p: { q?: string; only_missing_metadata?: boolean; limit?: number; offset?: number } = {}) =>
+    apiGet<LikedVideo[]>(`/api/liked-videos${qs(p)}`),
+  likedVideosStats: () => apiGet<LikedVideoStats>("/api/liked-videos/stats"),
+  importLikedVideos: (body: { path: string; limit?: number; dry_run?: boolean }) =>
+    apiPost<{ imported_count: number; skipped_duplicate_count: number; videos_created: number; dry_run: boolean }>(
+      "/api/takeout/import-liked-videos",
+      body
+    ),
+  enqueueLikedMetadata: (body: { profile?: string; limit?: number; only_missing_metadata?: boolean }) =>
+    apiPost<LikedVideosEnqueueResult>("/api/liked-videos/enqueue-metadata", body),
 };

@@ -159,12 +159,13 @@ class JobLogsOut(BaseModel):
 
 
 class JobClassification(BaseModel):
-    """Derived, human-friendly hints about a job's outcome (Phase 5B)."""
+    """Derived, human-friendly hints about a job's outcome (Phase 5B/6A)."""
 
     rate_limited: bool = False  # HTTP 429 seen
     partial: bool = False  # finished with usable output despite non-zero exit
     retryable: bool = False
-    warnings: list[str] = Field(default_factory=list)  # low-severity notes
+    reasons: list[str] = Field(default_factory=list)  # machine keys (rate_limited, incomplete_data, …)
+    warnings: list[str] = Field(default_factory=list)  # human-readable notes
     summary: str | None = None  # short headline for the UI
 
 
@@ -345,6 +346,12 @@ class PlaylistSampleOut(BaseModel):
     item_count: int = 0
 
 
+class LikedVideoSampleOut(BaseModel):
+    youtube_video_id: str | None = None
+    title: str | None = None
+    liked_at: str | None = None
+
+
 class TakeoutPreviewOut(BaseModel):
     path: str
     files: list[TakeoutFileOut] = Field(default_factory=list)
@@ -357,6 +364,7 @@ class TakeoutPreviewOut(BaseModel):
     search_samples: list[str] = Field(default_factory=list)
     subscription_samples: list[SubscriptionSampleOut] = Field(default_factory=list)
     playlist_samples: list[PlaylistSampleOut] = Field(default_factory=list)
+    liked_samples: list[LikedVideoSampleOut] = Field(default_factory=list)
     importable: dict = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
 
@@ -456,6 +464,23 @@ class TakeoutImportPlaylistsRequest(BaseModel):
     dry_run: bool = False
 
 
+class LikedVideosImportRequest(BaseModel):
+    path: str
+    limit: int | None = None
+    dry_run: bool = False
+
+
+class LikedVideosImportOut(BaseModel):
+    imported_count: int
+    skipped_duplicate_count: int
+    failed_count: int
+    scanned: int
+    videos_created: int = 0
+    dry_run: bool
+    job_id: int | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class TakeoutImportAllRequest(BaseModel):
     path: str
     limit_watch: int | None = None
@@ -463,6 +488,7 @@ class TakeoutImportAllRequest(BaseModel):
     limit_subscriptions: int | None = None
     limit_playlists: int | None = None
     limit_items: int | None = None
+    limit_liked: int | None = None
     dry_run: bool = False
 
 
@@ -471,7 +497,46 @@ class TakeoutImportAllOut(BaseModel):
     search_history: TakeoutImportOut
     subscriptions: TakeoutImportOut
     playlists: PlaylistsImportOut
+    liked_videos: LikedVideosImportOut
     dry_run: bool
+
+
+class LikedVideoOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    source: str | None = None
+    youtube_video_id: str | None = None
+    title: str | None = None
+    channel_title: str | None = None
+    url: str | None = None
+    liked_at: datetime | None = None
+    video_id: int | None = None
+    created_at: datetime
+    # metadata-fetched = a linked Video has a title (filled later by metadata_only)
+    metadata_fetched: bool = False
+    raw_json: dict | None = None  # only when include_raw=true
+
+
+class LikedVideoStatsOut(BaseModel):
+    total: int
+    with_video_id: int
+    linked_videos: int
+    metadata_fetched: int
+    earliest: datetime | None = None
+    latest: datetime | None = None
+
+
+class LikedVideosEnqueueRequest(BaseModel):
+    profile: str | None = None  # default metadata_only
+    limit: int | None = None
+    only_missing_metadata: bool = True
+
+
+class LikedVideosEnqueueOut(BaseModel):
+    videos_selected: int
+    jobs_created: int
+    job_ids: list[int] = Field(default_factory=list)
 
 
 class SubscriptionEnqueueRequest(BaseModel):

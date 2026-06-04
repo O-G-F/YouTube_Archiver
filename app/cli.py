@@ -47,6 +47,7 @@ takeout_app = typer.Typer(help="Google Takeout preview / import.")
 watch_history_app = typer.Typer(help="Inspect imported watch history.")
 search_history_app = typer.Typer(help="Inspect imported search history.")
 subscriptions_app = typer.Typer(help="Takeout subscriptions (channels).")
+liked_videos_app = typer.Typer(help="Takeout liked videos library.")
 app.add_typer(source_app, name="source")
 app.add_typer(download_app, name="download")
 app.add_typer(jobs_app, name="jobs")
@@ -59,6 +60,7 @@ app.add_typer(takeout_app, name="takeout")
 app.add_typer(watch_history_app, name="watch-history")
 app.add_typer(search_history_app, name="search-history")
 app.add_typer(subscriptions_app, name="subscriptions")
+app.add_typer(liked_videos_app, name="liked-videos")
 
 
 # --------------------------------------------------------------------------- #
@@ -1094,6 +1096,29 @@ def takeout_playlists(
         raise typer.BadParameter(str(exc))
 
 
+@takeout_app.command("import-liked-videos")
+def takeout_import_liked_videos(
+    path: str = typer.Argument(...),
+    limit: int = typer.Option(0, "--limit", help="Max liked videos to scan (0 = all)."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Import liked videos (Takeout 'Liked videos' playlist) into liked_videos."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        try:
+            r = tk.run_import_liked_videos(
+                s, get_settings(), path, limit=(limit or None), dry_run=dry_run
+            )
+        except tk.TakeoutError as exc:
+            raise typer.BadParameter(str(exc))
+    typer.echo(
+        f"liked_videos: imported={r['imported_count']} skipped={r['skipped_duplicate_count']} "
+        f"failed={r['failed_count']} scanned={r['scanned']} videos_created={r['videos_created']} "
+        f"dry_run={r['dry_run']}"
+    )
+
+
 @takeout_app.command("import-all")
 def takeout_import_all(
     path: str = typer.Argument(...),
@@ -1102,9 +1127,10 @@ def takeout_import_all(
     limit_subscriptions: int = typer.Option(0, "--limit-subscriptions"),
     limit_playlists: int = typer.Option(0, "--limit-playlists"),
     limit_items: int = typer.Option(0, "--limit-items"),
+    limit_liked: int = typer.Option(0, "--limit-liked"),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
-    """Import watch history, search history, subscriptions and playlists in order."""
+    """Import watch/search history, subscriptions, playlists and liked videos in order."""
     from app.services import takeout as tk
 
     with session_scope() as s:
@@ -1116,16 +1142,121 @@ def takeout_import_all(
                 limit_subscriptions=(limit_subscriptions or None),
                 limit_playlists=(limit_playlists or None),
                 limit_items=(limit_items or None),
+                limit_liked=(limit_liked or None),
                 dry_run=dry_run,
             )
         except tk.TakeoutError as exc:
             raise typer.BadParameter(str(exc))
-    w, se, su, pl = r["watch_history"], r["search_history"], r["subscriptions"], r["playlists"]
+    w, se, su, pl, lv = (
+        r["watch_history"], r["search_history"], r["subscriptions"], r["playlists"], r["liked_videos"]
+    )
     typer.echo(f"dry_run={r['dry_run']}")
     typer.echo(f"  watch_history : imported={w['imported_count']} skipped={w['skipped_duplicate_count']} scanned={w['scanned']}")
     typer.echo(f"  search_history: imported={se['imported_count']} skipped={se['skipped_duplicate_count']} scanned={se['scanned']}")
     typer.echo(f"  subscriptions : imported={su['imported_count']} skipped={su['skipped_duplicate_count']} scanned={su['scanned']}")
     typer.echo(f"  playlists     : playlists={pl['playlists_imported']} items={pl['items_imported']} videos={pl['videos_created']} scanned={pl['scanned_playlists']}")
+    typer.echo(f"  liked_videos  : imported={lv['imported_count']} skipped={lv['skipped_duplicate_count']} videos={lv['videos_created']} scanned={lv['scanned']}")
+
+
+# --------------------------------------------------------------------------- #
+# liked-videos
+# --------------------------------------------------------------------------- #
+@liked_videos_app.command("list")
+def liked_videos_list(
+    limit: int = typer.Option(50, "--limit"),
+    offset: int = typer.Option(0, "--offset"),
+    only_missing_metadata: bool = typer.Option(False, "--only-missing-metadata"),
+) -> None:
+    """List liked videos (most recently liked first)."""
+    from app.models import LikedVideo, Video
+
+    with session_scope() as s:
+        rows = s.execute(
+            select(LikedVideo, Video)
+            .join(Video, Video.id == LikedVideo.video_id, isouter=True)
+            .order_by(LikedVideo.liked_at.desc().nulls_last(), LikedVideo.id.desc())
+            .limit(limit)
+            .offset(offset)
+        ).all()
+        shown = 0
+        for lv, video in rows:
+            fetched = bool(video is not None and video.title)
+            if only_missing_metadata and fetched:
+                continue
+            title = (video.title if video and video.title else lv.title) or "(metadata not fetched)"
+            flag = "" if fetched else "  [meta?]"
+            typer.echo(f"  {lv.youtube_video_id or '-':12} {str(lv.liked_at)[:10]:10}{flag}  {title[:60]}")
+            shown += 1
+        if shown == 0:
+            typer.echo("No liked videos. Import with `takeout import-liked-videos`.")
+
+
+@liked_videos_app.command("stats")
+def liked_videos_stats() -> None:
+    """Show liked-videos statistics."""
+    from sqlalchemy import func
+
+    from app.models import LikedVideo, Video
+
+    with session_scope() as s:
+        total = s.scalar(select(func.count(LikedVideo.id))) or 0
+        with_vid = s.scalar(
+            select(func.count(LikedVideo.id)).where(LikedVideo.youtube_video_id.is_not(None))
+        ) or 0
+        linked = s.scalar(
+            select(func.count(LikedVideo.id)).where(LikedVideo.video_id.is_not(None))
+        ) or 0
+        fetched = s.scalar(
+            select(func.count(LikedVideo.id))
+            .join(Video, Video.id == LikedVideo.video_id)
+            .where(Video.title.is_not(None))
+        ) or 0
+    typer.echo(f"total liked       : {total}")
+    typer.echo(f"with video id     : {with_vid}")
+    typer.echo(f"linked to videos  : {linked}")
+    typer.echo(f"metadata fetched  : {fetched}")
+
+
+@liked_videos_app.command("enqueue-metadata")
+def liked_videos_enqueue_metadata(
+    limit: int = typer.Option(20, "--limit", help="Max videos to enqueue (0 = all)."),
+    profile: str = typer.Option("metadata_only", "--profile"),
+    all_: bool = typer.Option(False, "--all", help="Include liked videos that already have metadata."),
+    now: bool = typer.Option(False, "--now"),
+) -> None:
+    """Enqueue metadata_only jobs for liked videos (default: those missing metadata)."""
+    from app.models import LikedVideo, Video
+
+    _ensure_profile(profile)
+    job_ids: list[int] = []
+    with session_scope() as s:
+        rows = s.execute(
+            select(LikedVideo, Video)
+            .join(Video, Video.id == LikedVideo.video_id, isouter=True)
+            .where(LikedVideo.youtube_video_id.is_not(None))
+            .order_by(LikedVideo.liked_at.desc().nulls_last(), LikedVideo.id.desc())
+        ).all()
+        seen: set[str] = set()
+        for lv, video in rows:
+            if limit and len(job_ids) >= limit:
+                break
+            if not all_ and video is not None and video.title:
+                continue
+            vid = lv.youtube_video_id
+            if not vid or vid in seen:
+                continue
+            seen.add(vid)
+            v = jobs_svc.resolve_or_create_video(s, vid)
+            if v is None:
+                continue
+            job_ids.append(
+                jobs_svc.create_job_for_url(
+                    s, v.url, profile, extra_meta={"enqueued_by": "liked_videos"}
+                ).id
+            )
+    typer.echo(f"Created {len(job_ids)} {profile} job(s) for liked videos.")
+    for jid in job_ids:
+        _dispatch(jid, now)
 
 
 # --------------------------------------------------------------------------- #

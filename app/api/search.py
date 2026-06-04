@@ -12,12 +12,12 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.models import Collection, Comment, LiveChatMessage, Video
+from app.models import Collection, Comment, LikedVideo, LiveChatMessage, Video
 from app.schemas import SearchOut, SearchResultOut
 
 router = APIRouter(tags=["search"])
 
-_ALL_TYPES = ("video", "comment", "live_chat", "collection")
+_ALL_TYPES = ("video", "comment", "live_chat", "collection", "liked_video")
 
 
 def _snippet(text: str | None, n: int = 160) -> str | None:
@@ -120,6 +120,31 @@ def search(
                     snippet=None,
                     collection_id=c.id,
                     extra=c.type,
+                )
+            )
+
+    if "liked_video" in wanted:
+        for lv in db.scalars(
+            select(LikedVideo)
+            .where(
+                or_(
+                    LikedVideo.title.ilike(like),
+                    LikedVideo.channel_title.ilike(like),
+                    LikedVideo.youtube_video_id.ilike(like),
+                    LikedVideo.url.ilike(like),
+                )
+            )
+            .order_by(LikedVideo.liked_at.desc().nullslast())
+            .limit(limit)
+        ):
+            results.append(
+                SearchResultOut(
+                    type="liked_video",
+                    title=lv.title or lv.youtube_video_id,
+                    snippet=None,
+                    video_id=lv.video_id,
+                    youtube_video_id=lv.youtube_video_id,
+                    extra="liked",
                 )
             )
 

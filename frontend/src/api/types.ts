@@ -13,6 +13,7 @@ export interface JobClassification {
   rate_limited: boolean;
   partial: boolean;
   retryable: boolean;
+  reasons: string[];
   warnings: string[];
   summary: string | null;
 }
@@ -315,16 +316,54 @@ export interface PlaylistsImportResult {
   dry_run: boolean;
   warnings: string[];
 }
+export interface LikedImportResult {
+  imported_count: number;
+  skipped_duplicate_count: number;
+  failed_count: number;
+  scanned: number;
+  videos_created: number;
+  dry_run: boolean;
+}
 export interface TakeoutImportAll {
   watch_history: TakeoutImportResult;
   search_history: TakeoutImportResult;
   subscriptions: TakeoutImportResult;
   playlists: PlaylistsImportResult;
+  liked_videos: LikedImportResult;
   dry_run: boolean;
 }
 
+export interface LikedVideo {
+  id: number;
+  source: string | null;
+  youtube_video_id: string | null;
+  title: string | null;
+  channel_title: string | null;
+  url: string | null;
+  liked_at: string | null;
+  video_id: number | null;
+  created_at: string;
+  metadata_fetched: boolean;
+  raw_json: Record<string, unknown> | null;
+}
+
+export interface LikedVideoStats {
+  total: number;
+  with_video_id: number;
+  linked_videos: number;
+  metadata_fetched: number;
+  earliest: string | null;
+  latest: string | null;
+}
+
+export interface LikedVideosEnqueueResult {
+  videos_selected: number;
+  jobs_created: number;
+  job_ids: number[];
+}
+
 export interface SearchResult {
-  type: "video" | "comment" | "live_chat" | "collection";
+  type: "video" | "comment" | "live_chat" | "collection" | "liked_video";
   title: string | null;
   snippet: string | null;
   video_id: number | null;

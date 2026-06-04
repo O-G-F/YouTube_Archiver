@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.config import get_settings
 from app.schemas import (
+    LikedVideosImportOut,
     PlaylistSampleOut,
     PlaylistsImportOut,
     TakeoutFileEntryOut,
@@ -122,6 +123,20 @@ def takeout_import_playlists(
     return PlaylistsImportOut(**result)
 
 
+@router.post("/import-liked-videos", response_model=LikedVideosImportOut)
+def takeout_import_liked_videos(
+    req: TakeoutImportRequest, db: Session = Depends(get_db)
+) -> LikedVideosImportOut:
+    try:
+        result = takeout.run_import_liked_videos(
+            db, get_settings(), req.path, limit=req.limit, dry_run=req.dry_run
+        )
+    except takeout.TakeoutError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    db.commit()
+    return LikedVideosImportOut(**result)
+
+
 @router.post("/import-all", response_model=TakeoutImportAllOut)
 def takeout_import_all(
     req: TakeoutImportAllRequest, db: Session = Depends(get_db)
@@ -136,6 +151,7 @@ def takeout_import_all(
             limit_subscriptions=req.limit_subscriptions,
             limit_playlists=req.limit_playlists,
             limit_items=req.limit_items,
+            limit_liked=req.limit_liked,
             dry_run=req.dry_run,
         )
     except takeout.TakeoutError as exc:

@@ -7,14 +7,21 @@ import type { SearchResponse, SearchResult } from "../api/types";
 
 const TYPES = [
   { key: "video", label: "Videos" },
+  { key: "liked_video", label: "Liked" },
   { key: "comment", label: "Comments" },
   { key: "live_chat", label: "Live chat" },
   { key: "collection", label: "Collections" },
 ];
 
 function typeBadge(t: SearchResult["type"]) {
-  const cls = t === "video" ? "run" : t === "collection" ? "muted" : t === "comment" ? "ok" : "warn";
-  return <span className={`badge ${cls}`}>{t}</span>;
+  const map: Record<string, string> = {
+    video: "run",
+    liked_video: "ok",
+    collection: "muted",
+    comment: "ok",
+    live_chat: "warn",
+  };
+  return <span className={`badge ${map[t] ?? "muted"}`}>{t}</span>;
 }
 
 function Hit({ r }: { r: SearchResult }) {
@@ -41,6 +48,7 @@ export default function Search() {
   const [q, setQ] = useState("");
   const [active, setActive] = useState<Record<string, boolean>>({
     video: true,
+    liked_video: true,
     comment: true,
     live_chat: true,
     collection: true,

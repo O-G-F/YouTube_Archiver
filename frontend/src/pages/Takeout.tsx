@@ -48,6 +48,7 @@ export default function Takeout() {
           limit_subscriptions: n,
           limit_playlists: n,
           limit_items: n,
+          limit_liked: n,
         })
       );
     } catch (e) {
@@ -185,6 +186,13 @@ export default function Takeout() {
                     <td className="num">{importResult.playlists.items_skipped}</td>
                     <td className="num">—</td>
                     <td className="num">{importResult.playlists.scanned_playlists}</td>
+                  </tr>
+                  <tr>
+                    <td>liked_videos</td>
+                    <td className="num">{importResult.liked_videos.imported_count}</td>
+                    <td className="num">{importResult.liked_videos.skipped_duplicate_count}</td>
+                    <td className="num">{importResult.liked_videos.failed_count}</td>
+                    <td className="num">{importResult.liked_videos.scanned}</td>
                   </tr>
                 </tbody>
               </table>

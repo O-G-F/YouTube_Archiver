@@ -32,6 +32,7 @@ from app.services import expand as expand_svc
 from app.services import jobs as jobs_svc
 from app.services import live_chat as live_chat_svc
 from app.services import storage
+from app.services.job_classify import classify_text
 from app.services.command_builder import download_build_context, external_ctx
 from app.services.ingest import (
     ingest_comments_from_info,
@@ -189,6 +190,14 @@ def _run_download(settings: Settings, job_id: int) -> None:
                 run.returncode,
                 rate_limited,
             )
+
+        # Persist a stderr-based classification into job.meta so the UI/CLI can
+        # explain *why* a download failed (429 / incomplete data / fragments /
+        # subtitles / impersonation) without re-reading logs.
+        job.meta = {
+            **(job.meta or {}),
+            "classification": classify_text(job.status, err_tail, job.meta),
+        }
 
 
 # --------------------------------------------------------------------------- #

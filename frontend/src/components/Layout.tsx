@@ -6,6 +6,7 @@ const LINKS: { to: string; label: string; section?: string }[] = [
   { to: "/videos", label: "Videos", section: "Browse" },
   { to: "/search", label: "Search" },
   { to: "/library", label: "Library" },
+  { to: "/liked-videos", label: "Liked videos" },
   { to: "/collections", label: "Collections" },
   { to: "/archive", label: "Add / Archive", section: "Actions" },
   { to: "/takeout", label: "Takeout" },

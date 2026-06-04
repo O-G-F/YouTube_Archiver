@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.models import Collection, SearchHistoryEvent, WatchHistoryEvent
+from app.models import Collection, LikedVideo, SearchHistoryEvent, WatchHistoryEvent
 from app.schemas import LibraryCategoryOut, LibrarySummaryOut
 
 router = APIRouter(tags=["library"])
@@ -27,6 +27,7 @@ def _count(db: Session, model, *where) -> int:
 
 @router.get("/api/library/summary", response_model=LibrarySummaryOut)
 def library_summary(db: Session = Depends(get_db)) -> LibrarySummaryOut:
+    liked = _count(db, LikedVideo)
     watch = _count(db, WatchHistoryEvent)
     search = _count(db, SearchHistoryEvent)
     subs = _count(db, Collection, Collection.type == "channel")
@@ -36,9 +37,9 @@ def library_summary(db: Session = Depends(get_db)) -> LibrarySummaryOut:
             LibraryCategoryOut(
                 key="liked_videos",
                 label="Liked videos",
-                count=0,
-                available=False,
-                note="Planned: Google Takeout import and/or YouTube Data API sync (Phase 6A+).",
+                count=liked,
+                available=True,
+                note="Imported from Google Takeout. YouTube Data API sync is planned (Phase 6B+).",
             ),
             LibraryCategoryOut(key="watch_history", label="Watch history", count=watch),
             LibraryCategoryOut(key="search_history", label="Search history", count=search),

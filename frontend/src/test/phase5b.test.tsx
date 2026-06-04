@@ -47,7 +47,7 @@ describe("JobBadges", () => {
       <JobBadges
         job={job({
           status: "failed",
-          classification: { rate_limited: true, partial: false, retryable: true, warnings: [], summary: "Rate limited" },
+          classification: { rate_limited: true, partial: false, retryable: true, reasons: ["rate_limited"], warnings: [], summary: "Rate limited" },
         })}
       />
     );

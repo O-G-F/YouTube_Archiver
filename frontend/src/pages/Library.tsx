@@ -6,7 +6,7 @@ import { ErrorBox, Loading } from "../components/ui";
 // Where each library category currently links (existing screens) until full
 // sync lands in a later phase.
 const LINKS: Record<string, string | null> = {
-  liked_videos: null,
+  liked_videos: "/liked-videos",
   watch_history: null, // backed by /api/watch-history (no dedicated screen yet)
   search_history: null,
   subscriptions: null,

@@ -27,6 +27,7 @@ from app.api import (
     health,
     jobs,
     library,
+    liked_videos,
     live_chat,
     profiles,
     scheduler,
@@ -90,6 +91,7 @@ app.include_router(profiles.router)
 app.include_router(videos.router)
 app.include_router(search.router)
 app.include_router(library.router)
+app.include_router(liked_videos.router)
 
 
 # --------------------------------------------------------------------------- #

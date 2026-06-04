@@ -12,6 +12,7 @@ import Takeout from "./pages/Takeout";
 import Settings from "./pages/Settings";
 import Search from "./pages/Search";
 import Library from "./pages/Library";
+import LikedVideos from "./pages/LikedVideos";
 import NotFound from "./pages/NotFound";
 
 export function App() {
@@ -26,6 +27,7 @@ export function App() {
           <Route path="/videos/:id" element={<VideoDetail />} />
           <Route path="/search" element={<Search />} />
           <Route path="/library" element={<Library />} />
+          <Route path="/liked-videos" element={<LikedVideos />} />
           <Route path="/collections" element={<Collections />} />
           <Route path="/collections/:id" element={<CollectionDetail />} />
           <Route path="/archive" element={<Archive />} />

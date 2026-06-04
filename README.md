@@ -29,12 +29,13 @@ YouTube の動画・メタデータ・字幕・コメントを `yt-dlp` でロ�
 - **scheduler 連携コメント定期更新・live chat 取得（Phase 4B）** — scheduler が `next_comments_refresh_at` の期限切れ動画へ自動でコメント更新ジョブを投入（`SCHEDULER_COMMENTS_ENABLED`、1パス上限 `SCHEDULER_COMMENTS_LIMIT_PER_RUN`、frozen/recent 除外）、429 で `comment_refresh_failures` 加算＋backoff 再スケジュール、`live_chat_refresh` ジョブ（本体・コメント再DLなし、`--write-subs --sub-langs live_chat`）で `live_chat_messages` を正規化保存（super chat/メンバー/差分対応）、非ライブ動画は `not_available` 扱いでエラーにしない
 - **管理用 Web UI（Phase 5A）** — React + Vite + TypeScript の管理コンソールを FastAPI が同一オリジンで配信（`/`）。Dashboard / Jobs / Job 詳細（ログ tab・secret マスク）/ Videos / Video 詳細（簡易プレイヤー・comments/live chat・snapshots・refresh ボタン）/ Collections / Collection 詳細 / Add(URL・expand・channel) / Takeout / Settings・Doctor。CLI/curl なしで登録・refresh・ログ確認が可能。secret/cookie/token は UI・ログに出さない
 - **視聴 UI / プレイヤー・検索（Phase 5B）** — 保存済み動画を**ブラウザでシーク再生**（HTTP Range 対応の `media` 配信）。YouTube 風 Video 詳細（プレイヤー＋タイトル＋チャンネル＋説明折りたたみ＋コメント親子表示＋ライブチャット super chat/メンバー区別＋同 channel/同 collection の関連動画）。横断検索（`/api/search`：動画/コメント/ライブチャット/コレクション）、Videos のチャンネル/状態フィルタ・並び替え・サムネ・ページング、Job の 429/partial_success 分類表示、Library（liked/history/subscriptions/playlists の将来分類）。body 未保存（metadata_only）は「未保存」と明示
+- **高評価リスト（liked videos）/ ライブラリ・DL 安定化（Phase 6A）** — Google Takeout の「高く評価した動画」を `liked_videos` に正規化保存（CSV/JSON/HTML・言語差異対応、video stub 連携、dedup、`raw_json` 既定非返却）。Library で実 count 表示＋専用画面（メタデータ未取得を明示、`metadata_only` enqueue で本体を保存せず後追い取得）。検索に `liked_video` 追加。download ジョブの stderr 分類を強化（429 / Incomplete data received / fragments / subtitles / impersonation）して `job.meta.classification` に保存し UI で原因・retryable を表示。liked videos の本格的な API 同期は Phase 6B 以降
 - 字幕は安全な許可リスト（`ja,en`、`all` は明示時のみ）、YouTube JS チャレンジ対応（`--remote-components ejs:github` + deno）、`curl_cffi` 同梱
 - 失敗ジョブ管理（ステータス・エラーメッセージ・再実行・キャンセル）+ `partial_success` / retryable
 - 運用補強（Phase 1.5）: `doctor` 診断、ジョブログ API/CLI（path traversal 対策）、profile dry-run
 - Web API（登録 / 展開 / コレクション / 再クロール / scheduler / ジョブ / プロファイル / 動画 / 診断）と CLI の両方
 - Docker Compose（web / worker / scheduler / postgres / redis / migrate）
-- Alembic マイグレーション（0001 初期 〜 0007 live chat / comment retry）+ pytest（211 tests）+ フロント Vitest（14 tests）
+- Alembic マイグレーション（0001 初期 〜 0008 liked_videos）+ pytest（217 tests）+ フロント Vitest（15 tests）
 
 ---
 
@@ -635,6 +636,50 @@ curl -s -D - -o /dev/null -H "Range: bytes=0-1023" \
 
 ---
 
+## Phase 6A: 高評価リスト / Takeout ライブラリ・DL 安定化
+
+### なぜ Takeout を使うのか
+
+高評価リスト（liked videos）・視聴履歴・検索履歴・登録チャンネル・再生リストは、**YouTube Data API だけでは取得が制限/不安定**な場合があり（quota・privacy スコープ・廃止項目）、**Google Takeout のエクスポートが最も確実**です。Phase 6A は **Takeout 中心**で実データ化し、API 同期（OAuth）は Phase 6B 以降に統合する設計です。
+
+### liked videos のインポート
+
+Takeout ZIP 内の「高く評価した動画」プレイリスト（`Liked videos.csv` / `高く評価した動画.csv` 等、CSV/JSON/HTML・言語差異に対応）を検出し、`liked_videos` に正規化保存します。
+
+```bash
+# preview（件数・サンプル）→ import
+archiver takeout preview takeout.zip                 # likes_count / liked_samples
+archiver takeout import-liked-videos takeout.zip --limit 100 [--dry-run]
+archiver takeout import-all takeout.zip --limit-liked 100   # 他セクションと一括
+# 一覧 / 統計 / メタデータ後追い取得（本体は保存しない）
+archiver liked-videos list [--only-missing-metadata]
+archiver liked-videos stats
+archiver liked-videos enqueue-metadata --limit 20 --profile metadata_only [--now]
+```
+
+- **video stub 連携**: `youtube_video_id` がある liked entry は `videos` に stub を作成/統合（既存があれば紐付け）。`title`/`channel` は取得できた範囲で補完し、後から `metadata_only` で詳細を埋められます。
+- **dedup**: `(source, youtube_video_id)`（id が無い HTML 由来は `(source, title, url)`）。再インポートは skip。
+- **プライバシー**: `liked_videos.raw_json` と高評価履歴は**個人情報**。API は既定で `raw_json` を返しません（`include_raw=true` のみ）。
+
+### Library 画面
+
+`/library` は liked videos / watch history / search history / subscriptions / playlists の**実 count** を表示（liked は `/liked-videos` 専用画面へ）。`/liked-videos` では**メタデータ未取得**の動画を明示し、行ごと/一括で `metadata_only` ジョブを投入できます（**本体は保存しません** = body 数は増えません）。検索（`/api/search`）に `liked_video` タイプを追加。
+
+### download 安定化（429 / Incomplete data received / partial_success）
+
+実際の動画 DL は環境により YouTube 側の**スロットリング**（`Incomplete data received`）や **HTTP 429** で不安定になります。これらは**アプリ不具合ではなく既知の外部制限**として扱い、運用しやすいよう **stderr を分類**して `job.meta.classification` に保存し、UI で原因と `retryable` を表示します。
+
+- 分類カテゴリ: `rate_limited`(429) / `incomplete_data` / `fragments_failed` / `subtitles_failed` / `impersonation`（impersonation・subtitles は**低重要度**）。
+- **`partial_success`** は failed と区別して表示（例: 本体・info は取得できたが字幕だけ 429）。「後で字幕だけ再取得」は後続検討（Job は `retryable`）。
+- リトライ/バックオフ設定: `YTDLP_RETRY_BACKOFF_SECONDS`（yt-dlp `--retry-sleep`）/ `DOWNLOAD_JOB_DELAY_SECONDS`（ジョブ間スリープ）/ `COMMENTS_REFRESH_RETRY_BACKOFF_SECONDS`（429 後の再スケジュール）。
+- **後続フェーズの検討対象**: `cookies` / PO-token / `--remote-components`(ejs:github) / `curl_cffi` impersonation の整備で 429・incomplete data の低減（Phase 6B 以降）。
+
+### セキュリティ（6A）
+
+- liked videos / watch / search 履歴は個人情報として扱い、`raw_json` は既定非返却・UI 非表示。`metadata_only` enqueue は**本体を保存しない**挙動を維持。Takeout ZIP / cookies は Git 管理しない（`.gitignore` / `.dockerignore`）。
+
+---
+
 ## ストレージ構成
 
 ```
@@ -759,7 +804,8 @@ archiver live-chat stats VIDEO_ID
 | POST | `/api/takeout/import` | 視聴履歴 import（`{"path","limit","dry_run"}`） |
 | POST | `/api/takeout/import-subscriptions` | 登録チャンネル import |
 | POST | `/api/takeout/import-playlists` | 再生リスト import（`{"path","limit_playlists","limit_items","dry_run"}`） |
-| POST | `/api/takeout/import-all` | 4種を順に import（各 limit 指定可） |
+| POST | `/api/takeout/import-all` | 5種（watch/search/subs/playlists/liked）を順に import（各 limit 指定可）【6A 拡張】 |
+| POST | `/api/takeout/import-liked-videos` | 高評価リスト import（`{"path","limit","dry_run"}`）【Phase 6A】 |
 | GET | `/api/takeout/playlists/preview` | 再生リスト一覧 preview（`?path=&limit=`） |
 | GET | `/api/watch-history` | 視聴履歴一覧（`?q=&limit=&offset=&include_raw=`） |
 | GET | `/api/watch-history/stats` | 視聴履歴の統計（件数 / 期間 / top channels） |
@@ -796,8 +842,11 @@ archiver live-chat stats VIDEO_ID
 | GET | `/api/videos/{id}/thumbnail` | サムネ配信（guarded）【Phase 5B】 |
 | GET | `/api/videos/{id}/related` | 関連動画（同 channel + 同 collection）【Phase 5B】 |
 | GET | `/api/videos/channels` | 動画を持つ channel 一覧（件数付き、フィルタ用）【Phase 5B】 |
-| GET | `/api/search` | 横断検索（`?q=&types=video,comment,live_chat,collection&limit=`、raw 非返却）【Phase 5B】 |
-| GET | `/api/library/summary` | ライブラリ分類サマリ（liked は planned）【Phase 5B】 |
+| GET | `/api/search` | 横断検索（`?q=&types=video,comment,live_chat,collection,liked_video&limit=`、raw 非返却）【5B/6A】 |
+| GET | `/api/library/summary` | ライブラリ分類サマリ（liked は実 count）【5B/6A】 |
+| GET | `/api/liked-videos` | 高評価リスト一覧（`?q=&only_missing_metadata=&include_raw=&limit=&offset=`）【Phase 6A】 |
+| GET | `/api/liked-videos/stats` | 高評価リスト統計【Phase 6A】 |
+| POST | `/api/liked-videos/enqueue-metadata` | 高評価動画に `metadata_only` ジョブを一括投入（本体保存なし）【Phase 6A】 |
 | GET | `/api/takeout/files` | `TAKEOUT_IMPORT_ROOT` 配下の ZIP 一覧（root 外は不可）【Phase 5A】 |
 
 `/api/jobs`・`/api/jobs/{id}` は **`classification`**（429/partial/retryable/warnings）を含みます【Phase 5B】。Videos 一覧は `?channel_id=&sort=` を追加。
@@ -890,6 +939,7 @@ live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_e
   - `0005` `search_history_events` テーブル追加（`(source, query, searched_at)` ユニーク）
   - `0006` `videos` に `last_comments_refresh_at` / `next_comments_refresh_at` / `comments_state`（adaptive コメント更新）
   - `0007` `videos` に `comment_refresh_failures` / `last_live_chat_refresh_at` / `next_live_chat_refresh_at`(index) / `live_chat_state` / `has_live_chat`、`live_chat_messages` に `time_text` / `amount_text` / `message_type` / `published_at` / `fetched_at` / `is_deleted_or_missing`（Phase 4B。NOT NULL 列は `server_default` 付きで既存行も安全に移行）
+  - `0008` `liked_videos` テーブル追加（`source`/`youtube_video_id`/`title`/`channel_title`/`url`/`liked_at`/`video_id`(FK)/`raw_json`/`created_at`、`(source, youtube_video_id)` ユニーク、各種 index）（Phase 6A・SQLite/PostgreSQL 両対応）
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
 - 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 
