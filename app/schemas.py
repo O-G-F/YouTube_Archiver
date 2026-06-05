@@ -37,6 +37,9 @@ class JobOut(BaseModel):
     log_path: str | None = None
     command_path: str | None = None
     meta: dict | None = None
+    retry_count: int = 0
+    retry_of_job_id: int | None = None
+    next_retry_at: datetime | None = None
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -185,6 +188,39 @@ class JobDetailOut(JobOut):
     classification: JobClassification = Field(default_factory=JobClassification)
 
 
+# --------------------------------------------------------------------------- #
+# Phase 7A: retry + subtitles refresh
+# --------------------------------------------------------------------------- #
+class JobRetryAllRequest(BaseModel):
+    reason: str | None = None  # only retry jobs whose classification has this reason
+    type: str | None = None    # only retry jobs of this type
+    limit: int = 50
+
+
+class JobRetryAllOut(BaseModel):
+    retried: int
+    job_ids: list[int] = Field(default_factory=list)
+
+
+class SubtitlesRefreshRequest(BaseModel):
+    target: str | None = None  # video id / URL (official)
+    video: str | None = None   # backward-compatible alias
+    profile: str | None = None
+    now: bool = False
+
+    def resolved_target(self) -> str | None:
+        return self.target if self.target is not None else self.video
+
+    def has_conflict(self) -> bool:
+        return self.target is not None and self.video is not None
+
+
+class SubtitlesRefreshAllOut(BaseModel):
+    videos_selected: int
+    jobs_created: int
+    job_ids: list[int] = Field(default_factory=list)
+
+
 class BuildCommandRequest(BaseModel):
     url: str
 
@@ -307,6 +343,7 @@ class SchedulerRunOnceOut(BaseModel):
     collection_jobs_created: int = 0
     due_comment_videos_checked: int = 0
     comments_jobs_created: int = 0
+    retries_requeued: int = 0
     skipped_frozen: int = 0
     skipped_recent: int = 0
     jobs_created: int = 0

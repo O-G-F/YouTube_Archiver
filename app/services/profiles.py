@@ -247,6 +247,27 @@ BUILTIN_PROFILES: dict[str, ProfileSpec] = {
         ),
         sub_langs="live_chat",
     ),
+    "subtitles_refresh_only": ProfileSpec(
+        name="subtitles_refresh_only",
+        media_mode="metadata",
+        quality_mode="none",
+        description="No media body: subtitles only (--write-subs --write-auto-subs); "
+        "re-fetch subtitles that failed on a metadata/download job.",
+        ytdlp_args=[],
+        flags=_flags(
+            skip_download=True,
+            write_subs=True,
+            write_auto_subs=True,
+            write_comments=False,
+            write_thumbnail=False,
+            write_info_json=False,
+            write_description=False,
+            write_links=False,
+            write_live_chat=False,
+            sponsorblock_mark=False,
+        ),
+        sub_langs="@default",
+    ),
 }
 
 
@@ -259,6 +280,9 @@ class BuildContext:
     download_archive: str | None = None
     no_playlist: bool = False
     cookies_file: str | None = None
+    # YouTube fetch stabilization (Phase 7A): browser cookies + PO token (secret).
+    cookies_from_browser: str | None = None
+    po_token: str | None = None
     ffmpeg_location: str | None = None
     deno_path: str | None = None
     # Remote-components default ON (YouTube JS challenge solver). See requirement 6.
@@ -391,6 +415,12 @@ def build_ytdlp_args(spec: ProfileSpec, ctx: BuildContext) -> list[str]:
         args += ["--remote-components", ctx.remote_components]
     if ctx.cookies_file:
         args += ["--cookies", ctx.cookies_file]
+    elif ctx.cookies_from_browser:
+        # Only when no cookies.txt (the two are mutually exclusive in yt-dlp).
+        args += ["--cookies-from-browser", ctx.cookies_from_browser]
+    if ctx.po_token:
+        # Secret value; masked in command.txt by redact_args (po_token=******).
+        args += ["--extractor-args", f"youtube:po_token={ctx.po_token}"]
 
     # ----- admin-only escape hatch -----
     if ctx.extra_args:

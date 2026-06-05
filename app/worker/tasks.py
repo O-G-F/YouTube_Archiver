@@ -32,7 +32,6 @@ from app.services import expand as expand_svc
 from app.services import jobs as jobs_svc
 from app.services import live_chat as live_chat_svc
 from app.services import storage
-from app.services.job_classify import classify_text
 from app.services.command_builder import download_build_context, external_ctx
 from app.services.ingest import (
     ingest_comments_from_info,
@@ -73,6 +72,8 @@ def run_job(job_id: int) -> None:
             _run_metadata_refresh(settings, job_id)
         elif jtype == "live_chat_refresh":
             _run_live_chat_refresh(settings, job_id)
+        elif jtype == "subtitles_refresh":
+            _run_subtitles_refresh(settings, job_id)
         else:
             raise ValueError(f"unknown job type: {jtype!r}")
     except Exception as exc:  # noqa: BLE001 - we want to record every failure
@@ -191,13 +192,9 @@ def _run_download(settings: Settings, job_id: int) -> None:
                 rate_limited,
             )
 
-        # Persist a stderr-based classification into job.meta so the UI/CLI can
-        # explain *why* a download failed (429 / incomplete data / fragments /
-        # subtitles / impersonation) without re-reading logs.
-        job.meta = {
-            **(job.meta or {}),
-            "classification": classify_text(job.status, err_tail, job.meta),
-        }
+        # Persist classification + schedule a backoff retry for retryable
+        # failures (429 / incomplete data / fragments) under the attempt cap.
+        jobs_svc.apply_classification(s, job, settings, err_tail)
 
 
 # --------------------------------------------------------------------------- #
@@ -303,9 +300,15 @@ def _run_metadata_refresh(settings: Settings, job_id: int) -> None:
         is_comments = job.type == "comments_refresh"
         jobs_svc.mark_running(s, job)
 
-    # Rate control: space out consecutive comment refresh jobs (avoid 429).
-    if is_comments and settings.comments_refresh_job_delay_seconds > 0:
-        time.sleep(settings.comments_refresh_job_delay_seconds)
+    # Rate control: space out consecutive refresh jobs (avoid 429). Per-type
+    # delay (comments vs metadata) so heavy/light fetches can be tuned apart.
+    _delay = (
+        settings.comments_refresh_job_delay_seconds
+        if is_comments
+        else settings.metadata_refresh_job_delay_seconds
+    )
+    if _delay and _delay > 0:
+        time.sleep(_delay)
 
     max_comments = (
         settings.comment_refresh_max_comments if is_comments else settings.ytdlp_max_comments
@@ -427,6 +430,8 @@ def _run_metadata_refresh(settings: Settings, job_id: int) -> None:
             )
             if rate_limited:
                 job.meta = {**(job.meta or {}), "retryable": True, "reason": "http_429"}
+
+        jobs_svc.apply_classification(s, job, settings, err_tail)
 
 
 # --------------------------------------------------------------------------- #
@@ -567,6 +572,133 @@ def _run_live_chat_refresh(settings: Settings, job_id: int) -> None:
                 "live_chat_refresh: job %s state=%s fetched=%d new=%d",
                 job_id, live_chat_state, summary["fetched"], summary["new"],
             )
+
+        jobs_svc.apply_classification(s, job, settings, err_tail)
+
+
+# --------------------------------------------------------------------------- #
+# subtitles_refresh (subtitles only; NEVER re-downloads the body)
+# --------------------------------------------------------------------------- #
+_SUB_EXTS = (".vtt", ".srt", ".ass", ".ssa")
+
+
+def _subtitle_files(out_dir: Path, yid: str) -> set[Path]:
+    if not out_dir.is_dir():
+        return set()
+    return {
+        p
+        for p in out_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in _SUB_EXTS and f"[{yid}]" in p.name
+    }
+
+
+def _register_subtitles(session, video, files: set[Path], settings: Settings) -> None:
+    from app.models import Subtitle
+
+    for p in files:
+        rel = storage.to_relative(settings, p)
+        suffixes = p.suffixes
+        lang = suffixes[-2].lstrip(".") if len(suffixes) >= 2 else None
+        fmt = p.suffix.lstrip(".")
+        sub = session.scalar(
+            select(Subtitle).where(Subtitle.video_id == video.id, Subtitle.path == rel)
+        )
+        if sub is None:
+            sub = Subtitle(video_id=video.id, path=rel)
+            session.add(sub)
+        sub.language = lang
+        sub.format = fmt
+        sub.is_auto = bool(lang and "auto" in lang.lower())
+
+
+def _run_subtitles_refresh(settings: Settings, job_id: int) -> None:
+    """Re-fetch ONLY subtitles for a video (``--skip-download``); the body is
+    never downloaded. Subtitles are written into the video's existing output dir
+    so they sit alongside the media. No MediaFile (video/audio) is created.
+    """
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        video = s.get(Video, job.video_id) if job.video_id else None
+        if video is None:
+            jobs_svc.mark_failed(s, job, "subtitles_refresh: job has no associated video")
+            return
+        yid = video.youtube_video_id
+        video_pk = video.id
+        channel_id = video.channel_id
+        profile_name = job.profile_name or "subtitles_refresh_only"
+        # Prefer the directory where the body lives; else the canonical video dir.
+        out_dir = None
+        for mf in video.media_files:
+            if mf.media_type in ("video", "audio"):
+                out_dir = (settings.archive_root / mf.path).parent
+                break
+        if out_dir is None:
+            out_dir = storage.video_output_dir(settings, "video", channel_id, yid)
+        jobs_svc.mark_running(s, job)
+
+    if settings.subtitles_refresh_job_delay_seconds > 0:
+        time.sleep(settings.subtitles_refresh_job_delay_seconds)
+
+    sub_langs = settings.effective_subtitles_sub_langs
+    url = canonical_video_url(yid)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    before = _subtitle_files(out_dir, yid)
+
+    with session_scope() as s:
+        spec = get_profile_spec(s, profile_name)
+
+    out_tpl = str(out_dir / "%(title).180B [%(id)s].%(ext)s")
+    ctx = BuildContext(
+        output_template=out_tpl,
+        download_archive=None,  # never skipped, never re-DL the body
+        no_playlist=True,
+        default_sub_langs=sub_langs,
+        archive_sub_langs=sub_langs,
+        retry_sleep=settings.ytdlp_retry_backoff_seconds,
+        **external_ctx(settings),
+    )
+    argv = build_ytdlp_args(spec, ctx)
+    log_dir = storage.job_log_dir(settings, job_id)
+    run = run_ytdlp(
+        argv, log_dir, url=url, settings=settings, timeout=settings.ytdlp_timeout or None
+    )
+
+    err_tail = _tail(run.stderr_path)
+    rate_limited = ("HTTP Error 429" in err_tail) or ("Too Many Requests" in err_tail)
+    after = _subtitle_files(out_dir, yid)
+    created = after - before
+
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        job.log_path = storage.log_relative(settings, log_dir)
+        job.command_path = storage.log_relative(settings, run.command_path)
+        video = s.get(Video, video_pk)
+        if after:
+            _register_subtitles(s, video, after, settings)
+
+        subtitles_failed = (not run.ok) and (rate_limited or "subtitle" in err_tail.lower() or not after)
+        job.meta = {
+            **(job.meta or {}),
+            "target_video_id": yid,
+            "requested_sub_langs": sub_langs,
+            "subtitle_files_created": len(created),
+            "subtitle_files_updated": len(after & before),
+            "subtitles_failed": bool(subtitles_failed),
+            "rate_limited": rate_limited,
+        }
+        if run.ok or (after and not subtitles_failed):
+            jobs_svc.mark_success(s, job)
+            logger.info(
+                "subtitles_refresh: job %s created=%d total=%d", job_id, len(created), len(after)
+            )
+        elif after:
+            jobs_svc.mark_partial_success(
+                s, job, f"some subtitles saved but yt-dlp exited {run.returncode}. {err_tail}"
+            )
+        else:
+            jobs_svc.mark_failed(s, job, f"yt-dlp exited {run.returncode}\n{err_tail}")
+
+        jobs_svc.apply_classification(s, job, settings, err_tail)
 
 
 # --------------------------------------------------------------------------- #

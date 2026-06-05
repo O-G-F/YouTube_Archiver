@@ -16,6 +16,8 @@ export function JobBadges({ job, showWarnings = false }: { job: Job; showWarning
         <span className="badge warn" title="Incomplete data received (YouTube throttling)">throttled</span>
       )}
       {reasons.includes("fragments_failed") && <span className="badge warn" title="Fragment download failed">frags</span>}
+      {reasons.includes("subtitles_failed") && <span className="badge warn" title="Subtitle download failed">subs</span>}
+      {reasons.includes("impersonation") && <span className="badge muted" title="optional impersonation dependency">imp</span>}
       {partial && job.status !== "partial_success" && <span className="badge warn">partial</span>}
       {showWarnings &&
         c?.warnings.map((w, i) => (

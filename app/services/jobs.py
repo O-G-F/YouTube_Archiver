@@ -189,6 +189,32 @@ def create_live_chat_refresh_job(
     return job
 
 
+def create_subtitles_refresh_job(
+    session: Session,
+    video: Video,
+    *,
+    profile_name: str = "subtitles_refresh_only",
+    priority: int = 0,
+    extra_meta: dict | None = None,
+) -> Job:
+    """Create a subtitles_refresh job (Phase 7A): subtitles only, never re-DL body."""
+    meta = {"target_video_id": video.youtube_video_id}
+    if extra_meta:
+        meta.update(extra_meta)
+    job = Job(
+        type="subtitles_refresh",
+        status="queued",
+        url=canonical_video_url(video.youtube_video_id),
+        video_id=video.id,
+        profile_name=profile_name,
+        priority=priority,
+        meta=meta,
+    )
+    session.add(job)
+    session.flush()
+    return job
+
+
 # --------------------------------------------------------------------------- #
 # Status transitions
 # --------------------------------------------------------------------------- #
@@ -232,15 +258,48 @@ def mark_canceled(session: Session, job: Job) -> None:
     session.flush()
 
 
-def retry_job(session: Session, job: Job) -> Job:
-    """Reset a failed/canceled job back to queued."""
+def retry_job(session: Session, job: Job, *, increment: bool = True) -> Job:
+    """Reset a failed/canceled/partial job back to queued.
+
+    Increments ``retry_count`` (capped by callers) and clears ``next_retry_at``
+    so the scheduler won't double-pick it. Logs/meta are preserved.
+    """
     job.status = "queued"
     job.error_message = None
     job.started_at = None
     job.finished_at = None
     job.progress = 0.0
+    job.next_retry_at = None
+    if increment:
+        job.retry_count = (job.retry_count or 0) + 1
     session.flush()
     return job
+
+
+def apply_classification(
+    session: Session, job: Job, settings, error_text: str | None, *, now=None
+) -> dict:
+    """Persist a stderr-based classification into ``job.meta`` and, for a
+    retryable failure under the attempt cap, schedule ``next_retry_at`` (backoff).
+
+    Centralizes Phase 7A logic so every job type (download / metadata /
+    comments / live_chat / subtitles) explains itself the same way.
+    """
+    from app.models import utcnow
+    from app.services.job_classify import classify_text, compute_next_retry_at
+
+    now = now or utcnow()
+    classification = classify_text(job.status, error_text, job.meta)
+    job.meta = {**(job.meta or {}), "classification": classification}
+
+    next_at = None
+    if classification["retryable"] and job.status in ("failed", "partial_success"):
+        next_at = compute_next_retry_at(
+            classification["reasons"], job.retry_count or 0, settings, now, seed=job.id or 0
+        )
+    job.next_retry_at = next_at
+    session.flush()
+    return classification
 
 
 # --------------------------------------------------------------------------- #

@@ -66,12 +66,26 @@ export const api = {
   // Jobs
   jobs: (p: { status?: string; type?: string; limit?: number; offset?: number }) =>
     apiGet<Job[]>(`/api/jobs${qs(p)}`),
+  retryableJobs: (p: { reason?: string; type?: string; limit?: number } = {}) =>
+    apiGet<Job[]>(`/api/jobs/retryable${qs(p)}`),
   job: (id: number) => apiGet<JobDetail>(`/api/jobs/${id}`),
   jobLogs: (id: number, tail?: number) => apiGet<JobLogs>(`/api/jobs/${id}/logs${qs({ tail })}`),
   jobLogStream: (id: number, stream: string, tail?: number) =>
     apiText(`/api/jobs/${id}/logs/${stream}${qs({ tail })}`),
-  retryJob: (id: number) => apiPost<Job>(`/api/jobs/${id}/retry`),
+  retryJob: (id: number, force = false) => apiPost<Job>(`/api/jobs/${id}/retry${force ? "?force=true" : ""}`),
+  retryAll: (body: { reason?: string; type?: string; limit?: number }) =>
+    apiPost<{ retried: number; job_ids: number[] }>("/api/jobs/retry-all", body),
   cancelJob: (id: number) => apiPost<Job>(`/api/jobs/${id}/cancel`),
+
+  // Subtitles (Phase 7A)
+  subtitlesFailed: (limit = 50) => apiGet<Job[]>(`/api/subtitles/failed${qs({ limit })}`),
+  refreshSubtitles: (target: string) => apiPost<Job>("/api/subtitles/refresh", { target }),
+  refreshVideoSubtitles: (videoId: number) => apiPost<Job>(`/api/subtitles/videos/${videoId}/refresh`),
+  refreshFailedSubtitles: (limit = 25) =>
+    apiPost<{ videos_selected: number; jobs_created: number; job_ids: number[] }>(
+      `/api/subtitles/refresh-failed${qs({ limit })}`,
+      undefined
+    ),
 
   // Videos
   videos: (p: {

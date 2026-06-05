@@ -54,8 +54,13 @@ def get_settings_view(db: Session = Depends(get_db)) -> SettingsOut:
         SettingsItem(key="rq_queue", value=s.rq_queue),
         SettingsItem(
             key="cookies_configured",
-            value="yes" if (s.cookies_file or "").strip() else "no",
-            note="cookie file path is intentionally hidden",
+            value="yes" if s.cookies_configured else "no",
+            note="cookies.txt / browser cookies (path hidden)",
+        ),
+        SettingsItem(
+            key="po_token_configured",
+            value="yes" if s.po_token_configured else "no",
+            note="YouTube PO token (value hidden)",
         ),
         SettingsItem(key="ytdlp_binary", value=s.ytdlp_binary),
         SettingsItem(key="ffmpeg_location", value=s.ffmpeg_location or "(PATH)"),

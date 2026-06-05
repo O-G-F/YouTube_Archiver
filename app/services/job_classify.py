@@ -14,6 +14,9 @@ Recognised failure categories (download-stabilization visibility):
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
+from app.config import Settings
 from app.models import Job
 
 # category -> (substring markers searched in the lowercased error text)
@@ -32,6 +35,8 @@ _MARKERS: dict[str, tuple[str, ...]] = {
         "error downloading subtitle",
         "failed to download subtitle",
     ),
+    "comments_failed": ("unable to download comments", "error downloading comments"),
+    "live_chat_failed": ("unable to download live chat", "live chat replay is not available"),
     "impersonation": ("impersonate", "curl_cffi", "could not find a suitable"),
     # YouTube Data API (OAuth) error categories (Phase 6B).
     "auth_required": ("auth_required", "oauth token not found", "not configured", "unauthorized"),
@@ -46,7 +51,9 @@ _NOTES: dict[str, str] = {
     "incomplete_data": "Incomplete data received — YouTube throttling; retry later "
     "(cookies / PO-token / impersonation may help — see README)",
     "fragments_failed": "Some media fragments failed to download — retry later",
-    "subtitles_failed": "Subtitle download failed (usually non-fatal; body/metadata may be fine)",
+    "subtitles_failed": "Subtitle download failed (non-fatal; body/metadata may be fine — retry subtitles only)",
+    "comments_failed": "Comment download failed — retry later",
+    "live_chat_failed": "Live chat download failed / not available",
     "impersonation": "optional impersonation/runtime dependency missing (low severity)",
     "auth_required": "YouTube Data API not configured / not authorized — set up OAuth (see README)",
     "quota_exceeded": "YouTube Data API quota exceeded — try again later",
@@ -55,6 +62,21 @@ _NOTES: dict[str, str] = {
 }
 
 _LOW_SEVERITY = ("impersonation", "subtitles_failed")
+
+# Categories that are worth automatically retrying (transient / fetchable later).
+# auth_required / forbidden / impersonation are NOT here (need setup, or harmless).
+RETRYABLE_REASONS = frozenset(
+    {
+        "rate_limited",
+        "incomplete_data",
+        "fragments_failed",
+        "subtitles_failed",
+        "comments_failed",
+        "live_chat_failed",
+        "quota_exceeded",
+        "token_expired",
+    }
+)
 
 
 def classify_text(status: str, error_text: str | None, meta: dict | None) -> dict:
@@ -72,10 +94,13 @@ def classify_text(status: str, error_text: str | None, meta: dict | None) -> dic
 
     rate_limited = "rate_limited" in reasons
     partial = status == "partial_success"
-    retryable = bool(meta.get("retryable")) or status in (
-        "failed",
-        "canceled",
-        "partial_success",
+    # Retryable = a recognised transient reason, OR a partial success (we can
+    # re-fetch the missing piece), OR an explicit worker flag. A plain `failed`
+    # with no recognised retryable reason is NOT retryable (e.g. video deleted).
+    retryable = (
+        bool(meta.get("retryable"))
+        or partial
+        or any(r in RETRYABLE_REASONS for r in reasons)
     )
 
     warnings = [_NOTES[c] for c in reasons if c in _NOTES]
@@ -112,3 +137,41 @@ def classify_job(job: Job) -> dict:
 
 def is_low_severity(reason: str) -> bool:
     return reason in _LOW_SEVERITY
+
+
+def is_retryable(classification: dict) -> bool:
+    return bool(classification.get("retryable"))
+
+
+def subtitles_only_failure(classification: dict) -> bool:
+    """True if subtitles failed but nothing else did (good candidate for a
+    subtitles-only refresh on a partial_success body/metadata job)."""
+    reasons = set(classification.get("reasons") or [])
+    hard = reasons - {"subtitles_failed", "impersonation"}
+    return "subtitles_failed" in reasons and not hard
+
+
+def compute_next_retry_at(
+    reasons: list[str],
+    retry_count: int,
+    settings: Settings,
+    now: datetime,
+    *,
+    seed: int = 0,
+) -> datetime | None:
+    """Backoff time for the next auto-retry, or None if not retryable / over cap.
+
+    delay = backoff * multiplier**retry_count (+ deterministic jitter from seed).
+    ``seed`` (e.g. the job id) spreads retries without using a RNG.
+    """
+    if retry_count >= max(0, settings.download_retry_max_attempts):
+        return None
+    if not any(r in RETRYABLE_REASONS for r in reasons):
+        return None
+    base = max(0, settings.download_retry_backoff_seconds)
+    mult = max(1.0, settings.download_retry_backoff_multiplier) ** max(0, retry_count)
+    delay = base * mult
+    jitter = max(0, settings.download_retry_jitter_seconds)
+    if jitter > 0:
+        delay += seed % (jitter + 1)
+    return now + timedelta(seconds=int(delay))

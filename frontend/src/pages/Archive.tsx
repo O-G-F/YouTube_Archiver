@@ -88,6 +88,8 @@ export default function Archive() {
           <div className="v small">既定。1080p 以下・Web 再生向け。<strong>本体を保存</strong>するのでブラウザ再生可。</div>
           <div className="k mono">video_best_archive</div>
           <div className="v small">最高画質 mkv で長期保存（重い）。コメント/ライブチャット/サムネも保存。</div>
+          <div className="k mono">subtitles_refresh_only</div>
+          <div className="v small">字幕だけ再取得（本体は保存しない）。字幕が 429 で失敗したとき Job 詳細から実行。</div>
         </div>
         <p className="muted small" style={{ marginTop: 10 }}>
           ジョブが <span className="badge warn">partial_success</span> や{" "}

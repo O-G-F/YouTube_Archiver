@@ -356,6 +356,16 @@ class Job(Base):
     parent_job_id: Mapped[int | None] = mapped_column(
         ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
     )
+    # Retry tracking (Phase 7A). retry_count caps re-attempts; retry_of_job_id
+    # records provenance when a retry is created as a fresh job; next_retry_at
+    # lets the scheduler pick up retryable jobs after a backoff window.
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    retry_of_job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
     rq_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     priority: Mapped[int] = mapped_column(Integer, default=0)
     progress: Mapped[float] = mapped_column(Float, default=0.0)

@@ -31,12 +31,13 @@ YouTube の動画・メタデータ・字幕・コメントを `yt-dlp` でロ�
 - **視聴 UI / プレイヤー・検索（Phase 5B）** — 保存済み動画を**ブラウザでシーク再生**（HTTP Range 対応の `media` 配信）。YouTube 風 Video 詳細（プレイヤー＋タイトル＋チャンネル＋説明折りたたみ＋コメント親子表示＋ライブチャット super chat/メンバー区別＋同 channel/同 collection の関連動画）。横断検索（`/api/search`：動画/コメント/ライブチャット/コレクション）、Videos のチャンネル/状態フィルタ・並び替え・サムネ・ページング、Job の 429/partial_success 分類表示、Library（liked/history/subscriptions/playlists の将来分類）。body 未保存（metadata_only）は「未保存」と明示
 - **高評価リスト（liked videos）/ ライブラリ・DL 安定化（Phase 6A）** — Google Takeout の「高く評価した動画」を `liked_videos` に正規化保存（CSV/JSON/HTML・言語差異対応、video stub 連携、dedup、`raw_json` 既定非返却）。Library で実 count 表示＋専用画面（メタデータ未取得を明示、`metadata_only` enqueue で本体を保存せず後追い取得）。検索に `liked_video` 追加。download ジョブの stderr 分類を強化（429 / Incomplete data received / fragments / subtitles / impersonation）して `job.meta.classification` に保存し UI で原因・retryable を表示
 - **Hybrid Liked Videos Sync（Phase 6B）** — 高評価の**全履歴は Google Takeout「マイ アクティビティ」**から取得（YouTube Data API は実用上 ~5000 件で頭打ちのため）。Takeout ZIP の種別自動判定（`youtube_takeout` / `my_activity_takeout` / `takeout_index` / `unknown`）+ discover/inspect、My Activity の `高く評価しました` / `Liked` 抽出（`低く評価`/`高評価を削除`/`を視聴` は除外）、**source 区別**（`takeout_my_activity` / `takeout_youtube` / `youtube_data_api`）で同一 DB へ統合（youtube_video_id でクロス source dedup）。**逐次更新は YouTube Data API（OAuth・差分・既存到達で停止）**で、API quota/auth エラーも分類表示。Hybrid `library bootstrap`。**OAuth 既定無効でも全機能が安全に起動**（secret/token は非表示）
+- **実 DL 安定化・retry/backoff・字幕再取得（Phase 7A）** — 全ジョブ種別が `job.meta.classification`（429/incomplete_data/fragments/subtitles/comments/live_chat/impersonation/quota/auth/token、`reasons[]`/`retryable`/`partial`/`summary`）を**永続保存**。**再試行可能な失敗だけ抽出**（`GET /api/jobs/retryable`、`retry-all --reason`）、download に**指数バックオフ retry**（`next_retry_at`・回数上限で無限ループ防止、scheduler 自動再投入は任意）。**字幕だけ再取得**する `subtitles_refresh` ジョブ（本体非DL）。`partial_success` を failed と明確に区別。cookies / browser cookies / PO-token は configured yes/no のみ表示（値は UI/API/log に出さない）
 - 字幕は安全な許可リスト（`ja,en`、`all` は明示時のみ）、YouTube JS チャレンジ対応（`--remote-components ejs:github` + deno）、`curl_cffi` 同梱
 - 失敗ジョブ管理（ステータス・エラーメッセージ・再実行・キャンセル）+ `partial_success` / retryable
 - 運用補強（Phase 1.5）: `doctor` 診断、ジョブログ API/CLI（path traversal 対策）、profile dry-run
 - Web API（登録 / 展開 / コレクション / 再クロール / scheduler / ジョブ / プロファイル / 動画 / 診断）と CLI の両方
 - Docker Compose（web / worker / scheduler / postgres / redis / migrate）
-- Alembic マイグレーション（0001 初期 〜 0008 liked_videos）+ pytest（228 tests）+ フロント Vitest（15 tests）
+- Alembic マイグレーション（0001 初期 〜 0009 job retry fields）+ pytest（247 tests）+ フロント Vitest（18 tests）
 
 ---
 
@@ -758,6 +759,88 @@ archiver youtube-api sync-liked --limit 1000 --stop-on-existing [--dry-run]
 
 ---
 
+## Phase 7A: 実 DL 安定化 / retry・backoff / 字幕再取得
+
+### 失敗の意味（429 / Incomplete data received / partial_success）
+
+YouTube 側の事情で本体 DL・字幕・コメント取得は不安定になります。**アプリ不具合ではなく外部制限**として運用しやすいよう、全ジョブが `job.meta.classification` を**永続保存**し、UI/CLI/API で表示します。
+
+| 区分 | 意味 | 扱い |
+|---|---|---|
+| `rate_limited` (HTTP 429) | レート制限 | retryable（バックオフ後に再試行）|
+| `incomplete_data` | YouTube スロットリング（`Incomplete data received`）| retryable |
+| `fragments_failed` | フラグメント DL 失敗 | retryable |
+| `subtitles_failed` | 字幕取得失敗（多くは非致命）| retryable・**字幕だけ再取得可**|
+| `comments_failed` / `live_chat_failed` | コメント/ライブチャット取得失敗 | retryable |
+| `impersonation` | 任意 impersonation 依存の警告 | **低重要度**（retryable ではない）|
+| `auth_required` / `quota_exceeded` / `forbidden` / `token_expired` | API/OAuth エラー | 設定要・quota は時間をおく |
+
+- **`partial_success` は failed と明確に区別**（本体・info は取得できたが字幕だけ 429 等）。UI では黄色系バッジ。
+- 「再試行可能な失敗だけ」を抽出できます（plain な `failed`＝動画削除等は retryable ではない）。
+
+### retryable jobs / 手動 retry / 一括 retry
+
+```bash
+archiver jobs retryable [--reason rate_limited] [--type download] --limit 50
+archiver jobs retry JOB_ID [--now] [--force]        # 回数上限超過は --force
+archiver jobs retry-all [--reason incomplete_data] [--type download] --limit N [--now]
+# API: GET /api/jobs/retryable, POST /api/jobs/{id}/retry[?force=true], POST /api/jobs/retry-all
+```
+
+- retry は **`retry_count` を加算**し、`DOWNLOAD_RETRY_MAX_ATTEMPTS` で上限（**無限 retry 防止**）。`next_retry_at` は retry/成功で解除。
+- UI: Jobs 画面に **retryable filter / reason filter / Retry all**、Job 詳細に classification・Retry・**Retry subtitles only** ボタン。
+
+### download retry / backoff
+
+retryable な失敗は**指数バックオフ**で再試行時刻 `next_retry_at = now + BACKOFF * MULTIPLIER**attempt (+jitter)` を `jobs` 列に保存します（即時連続 retry しない）。`SCHEDULER_RETRY_ENABLED=true` で scheduler が `next_retry_at` を過ぎた retryable ジョブを自動再投入します（既定は手動 retry）。
+
+```bash
+DOWNLOAD_RETRY_MAX_ATTEMPTS=5
+DOWNLOAD_RETRY_BACKOFF_SECONDS=600
+DOWNLOAD_RETRY_BACKOFF_MULTIPLIER=2.0
+DOWNLOAD_RETRY_JITTER_SECONDS=60
+SCHEDULER_RETRY_ENABLED=false
+SCHEDULER_RETRY_LIMIT_PER_RUN=10
+```
+
+### 字幕だけ再取得（subtitles_refresh）— 本体を再 DL しない
+
+`metadata_only`/download で**字幕だけ失敗**したとき、本体を再 DL せず字幕のみ取り直します。
+
+```bash
+archiver subtitles failed --limit 50                 # 字幕失敗ジョブ一覧
+archiver subtitles refresh VIDEO_OR_URL --now
+archiver subtitles refresh-failed --limit N --now    # 失敗動画へ一括
+# API: GET /api/subtitles/failed, POST /api/subtitles/refresh, POST /api/subtitles/refresh-failed
+```
+
+- profile `subtitles_refresh_only` = `--skip-download --write-subs --write-auto-subs --sub-langs <SUBTITLES_REFRESH_SUB_LANGS|DEFAULT_SUB_LANGS> --no-download-archive --no-playlist --remote-components ejs:github`（deno js runtime 維持、**本体フォーマット無し**）。字幕は**既存 video output dir** に保存し、**MediaFile(video/audio) は作りません**（body 数は増えない）。
+- `job.meta`: `target_video_id` / `requested_sub_langs` / `subtitle_files_created` / `subtitle_files_updated` / `subtitles_failed` / `rate_limited`。
+
+### metadata_only と video download の違い
+
+- `metadata_only` / `subtitles_refresh_only` / `comments_refresh_only` / `live_chat_refresh_only`：**本体を保存しない**（Videos の body=0、Video 詳細は「未保存」）。
+- `video_compressed_1080p` / `video_best_archive` 等：本体を保存（body≥1）。
+
+### YouTube 取得安定化（cookies / browser cookies / PO-token / impersonation）
+
+DL の 429・throttling を減らす運用オプション（**このフェーズでは設定の土台**。secret/token は UI/API/log に**出しません**。Settings は configured yes/no のみ）。
+
+| 設定 | 説明 |
+|---|---|
+| `COOKIES_FILE` | cookies.txt のパス（`/secrets` か `/config`、Git 非管理）。`--cookies` |
+| `COOKIES_FROM_BROWSER` | ブラウザから cookies（例 `chrome`）。`--cookies-from-browser`（cookies.txt 未設定時）|
+| `YOUTUBE_PO_TOKEN` | PO token（**secret**）。`--extractor-args youtube:po_token=…`（command/log でマスク）|
+| `curl_cffi`（同梱） | yt-dlp の **impersonation**。`impersonation` warning を減らせる**任意依存**。不安定なら無理に使わない |
+
+- queue rate limiting: `DOWNLOAD_JOB_DELAY_SECONDS`（本体）・`METADATA_REFRESH_JOB_DELAY_SECONDS`・`SUBTITLES_REFRESH_JOB_DELAY_SECONDS`・`COMMENTS_REFRESH_JOB_DELAY_SECONDS` で種別ごとに連続 DL を間引けます。
+
+### セキュリティ（7A）
+
+- cookies / PO-token / token を **UI/API/log に出さない**（`redact_args` で `po_token=******`、`logs.mask_secrets` で読み出し時もマスク、Settings は configured yes/no）。`metadata_only`/`subtitles_refresh` の**本体非保存**を維持。retry は回数上限で**無限ループしない**。
+
+---
+
 ## ストレージ構成
 
 ```
@@ -909,12 +992,17 @@ archiver live-chat stats VIDEO_ID
 | GET | `/api/videos/{id}/live-chat` | live chat 一覧（`?include_missing=&superchats_only=&include_raw=&limit=&offset=`） |
 | GET | `/api/videos/{id}/live-chat/stats` | live chat 統計（total/active/missing/superchats/members/状態） |
 | GET | `/api/doctor` | 環境診断（書込可否 / ツール版 / DB / Redis） |
-| GET | `/api/jobs` | ジョブ一覧（`?status=&type=&limit=&offset=`） |
-| GET | `/api/jobs/{id}` | ジョブ詳細（status/error/ログパス/出力先/動画/profile） |
+| GET | `/api/jobs` | ジョブ一覧（`?status=&type=&limit=&offset=`、`classification` 付き） |
+| GET | `/api/jobs/retryable` | 再試行可能な失敗ジョブ（`?reason=&type=&limit=`）【Phase 7A】 |
+| POST | `/api/jobs/retry-all` | 再試行可能ジョブを一括 re-queue（`{"reason","type","limit"}`）【Phase 7A】 |
+| GET | `/api/subtitles/failed` | 字幕取得に失敗したジョブ一覧【Phase 7A】 |
+| POST | `/api/subtitles/refresh` | 字幕のみ再取得（`{"target"}`、本体非DL）【Phase 7A】 |
+| POST | `/api/subtitles/refresh-failed` | 字幕失敗動画へ一括字幕再取得（`?limit=`）【Phase 7A】 |
+| GET | `/api/jobs/{id}` | ジョブ詳細（status/error/ログパス/出力先/動画/profile/classification/retry） |
 | GET | `/api/jobs/{id}/logs` | command/stdout/stderr をまとめて取得（`?tail=N`） |
 | GET | `/api/jobs/{id}/logs/{stdout\|stderr\|command}` | 単一ログを生テキストで取得（`?tail=N`） |
 | GET | `/api/jobs/{id}/log` | （後方互換）末尾のみの JSON |
-| POST | `/api/jobs/{id}/retry` | 失敗/キャンセル/部分成功ジョブの再実行 |
+| POST | `/api/jobs/{id}/retry` | 失敗/キャンセル/部分成功ジョブの再実行（`?force=true` で回数上限を無視）【7A 拡張】 |
 | POST | `/api/jobs/{id}/cancel` | ジョブのキャンセル |
 | POST | `/api/profiles/{name}/build-command` | dry-run（`{"url"}`）。cookie/secret はマスク |
 | GET | `/api/videos` | 保存済み動画一覧（`?q=&comments_state=&live_chat_state=&has_media=&limit=&offset=`、body 数付き）【Phase 5A 拡張】 |
@@ -1024,6 +1112,7 @@ live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_e
   - `0007` `videos` に `comment_refresh_failures` / `last_live_chat_refresh_at` / `next_live_chat_refresh_at`(index) / `live_chat_state` / `has_live_chat`、`live_chat_messages` に `time_text` / `amount_text` / `message_type` / `published_at` / `fetched_at` / `is_deleted_or_missing`（Phase 4B。NOT NULL 列は `server_default` 付きで既存行も安全に移行）
   - `0008` `liked_videos` テーブル追加（`source`/`youtube_video_id`/`title`/`channel_title`/`url`/`liked_at`/`video_id`(FK)/`raw_json`/`created_at`、`(source, youtube_video_id)` ユニーク、各種 index）（Phase 6A・SQLite/PostgreSQL 両対応）
   - Phase 6B は**マイグレーション追加なし**（既存 `liked_videos.source` を `takeout_my_activity`/`takeout_youtube`/`youtube_data_api` で運用、channel_id は `raw_json` + Video stub へ反映）
+  - `0009` `jobs` に `retry_count`(server_default 0) / `retry_of_job_id` / `next_retry_at`(index)（Phase 7A・retry/backoff。SQLite 互換のため自己参照 FK はプレーン列で追加）
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
 - 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 

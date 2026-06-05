@@ -93,11 +93,53 @@ class Settings(BaseSettings):
     # ---- Rate control / retry (Phase 2B) ----
     # Sleep before each download job starts (spaces out requests on one worker).
     download_job_delay_seconds: float = 0.0
+    # Per-job-type delays (Phase 7A). 0 -> fall back to the download delay where
+    # relevant. Lets you throttle metadata / subtitle / comment refreshes apart
+    # from heavy body downloads.
+    metadata_refresh_job_delay_seconds: float = 0.0
+    subtitles_refresh_job_delay_seconds: float = 0.0
     # Passed to yt-dlp --retry-sleep (seconds between retries, e.g. on HTTP 429).
     ytdlp_retry_backoff_seconds: int = 0
     # Intended download concurrency. With a single RQ worker this is effectively
     # 1; scale with `docker compose up --scale worker=N`. Surfaced for tooling.
     max_concurrent_download_jobs: int = 1
+
+    # ---- Download retry / backoff (Phase 7A) ----
+    # A retryable failure (429 / incomplete data / fragments) schedules a backoff
+    # retry up to MAX_ATTEMPTS. Backoff = BACKOFF * MULTIPLIER**attempt (+jitter).
+    download_retry_max_attempts: int = 5
+    download_retry_backoff_seconds: int = 600  # 10 min base
+    download_retry_backoff_multiplier: float = 2.0
+    download_retry_jitter_seconds: int = 60
+    # Default subtitle languages for subtitles_refresh (falls back to default_sub_langs).
+    subtitles_refresh_sub_langs: str = ""
+
+    # ---- Scheduler retry pickup (Phase 7A; optional) ----
+    scheduler_retry_enabled: bool = False
+    scheduler_retry_limit_per_run: int = 10
+
+    # ---- YouTube fetch stabilization secrets (Phase 7A) ----
+    # All are SECRETS: never returned by the API / shown in the UI (only a
+    # configured yes/no). cookies_file is defined above (Phase 0).
+    # Browser to read cookies from (yt-dlp --cookies-from-browser), e.g. "chrome".
+    cookies_from_browser: str = ""
+    # YouTube PO token (yt-dlp --extractor-args youtube:po_token=...). Secret.
+    youtube_po_token: str = ""
+
+    @property
+    def effective_subtitles_sub_langs(self) -> str:
+        return (self.subtitles_refresh_sub_langs or self.default_sub_langs or "ja,en").strip()
+
+    @property
+    def cookies_configured(self) -> bool:
+        from pathlib import Path as _P
+
+        cf = (self.cookies_file or "").strip()
+        return bool((cf and _P(cf).is_file()) or (self.cookies_from_browser or "").strip())
+
+    @property
+    def po_token_configured(self) -> bool:
+        return bool((self.youtube_po_token or "").strip())
 
     # ---- App ----
     log_level: str = "INFO"

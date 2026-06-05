@@ -37,6 +37,9 @@ export interface Job {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  retry_count?: number;
+  retry_of_job_id?: number | null;
+  next_retry_at?: string | null;
   classification?: JobClassification;
 }
 

@@ -8,18 +8,29 @@ import { JobBadges } from "../components/JobBadges";
 import type { Job } from "../api/types";
 
 const STATUSES = ["", "queued", "running", "success", "partial_success", "failed", "canceled"];
-const TYPES = ["", "download", "expand", "metadata_refresh", "comments_refresh", "live_chat_refresh"];
+const TYPES = [
+  "", "download", "expand", "metadata_refresh", "comments_refresh", "live_chat_refresh", "subtitles_refresh",
+];
+const REASONS = [
+  "", "rate_limited", "incomplete_data", "fragments_failed", "subtitles_failed", "comments_failed", "impersonation",
+];
 
 export default function Jobs() {
   const [status, setStatus] = useState("");
   const [type, setType] = useState("");
+  const [retryableOnly, setRetryableOnly] = useState(false);
+  const [reason, setReason] = useState("");
   const [auto, setAuto] = useState(true);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
+  const [flash, setFlash] = useState<string | null>(null);
 
   const { data, error, loading, reload } = useFetch<Job[]>(
-    () => api.jobs({ status: status || undefined, type: type || undefined, limit: 100 }),
-    [status, type],
+    () =>
+      retryableOnly
+        ? api.retryableJobs({ reason: reason || undefined, type: type || undefined, limit: 100 })
+        : api.jobs({ status: status || undefined, type: type || undefined, limit: 100 }),
+    [status, type, retryableOnly, reason],
     auto ? 6000 : undefined
   );
 
@@ -36,6 +47,21 @@ export default function Jobs() {
     }
   }
 
+  async function retryAll() {
+    setBusyId(-1);
+    setActionErr(null);
+    setFlash(null);
+    try {
+      const r = await api.retryAll({ reason: reason || undefined, type: type || undefined, limit: 100 });
+      setFlash(`Re-queued ${r.retried} retryable job(s).`);
+      reload();
+    } catch (e) {
+      setActionErr((e as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   return (
     <div>
       <h1 className="page-title">Jobs</h1>
@@ -44,7 +70,7 @@ export default function Jobs() {
       <div className="toolbar">
         <div className="field inline">
           <label>Status</label>
-          <select value={status} onChange={(e) => setStatus(e.target.value)}>
+          <select value={status} disabled={retryableOnly} onChange={(e) => setStatus(e.target.value)}>
             {STATUSES.map((s) => (
               <option key={s} value={s}>
                 {s || "all"}
@@ -63,14 +89,34 @@ export default function Jobs() {
           </select>
         </div>
         <label className="checkbox" style={{ alignSelf: "center" }}>
+          <input type="checkbox" checked={retryableOnly} onChange={(e) => setRetryableOnly(e.target.checked)} />
+          retryable only
+        </label>
+        <div className="field inline">
+          <label>Reason</label>
+          <select value={reason} onChange={(e) => setReason(e.target.value)}>
+            {REASONS.map((r) => (
+              <option key={r} value={r}>
+                {r || "any"}
+              </option>
+            ))}
+          </select>
+        </div>
+        {retryableOnly && (
+          <button disabled={busyId === -1} onClick={retryAll}>
+            {busyId === -1 ? <span className="spin" /> : "↻"} Retry all
+          </button>
+        )}
+        <label className="checkbox" style={{ alignSelf: "center" }}>
           <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
-          auto-refresh (6s)
+          auto (6s)
         </label>
         <button className="right" onClick={reload}>
           ↻ Refresh {loading && <span className="spin" />}
         </button>
       </div>
 
+      {flash && <div className="flash">{flash}</div>}
       <ErrorBox error={error} />
       <ErrorBox error={actionErr} />
 

@@ -18,6 +18,8 @@ from app.schemas import (
     JobLogsOut,
     JobOut,
     JobOutClassified,
+    JobRetryAllOut,
+    JobRetryAllRequest,
     ProfileOut,
     VideoOut,
 )
@@ -50,6 +52,64 @@ def list_jobs(
         item.classification = JobClassification(**classify_job(j))
         out.append(item)
     return out
+
+
+def _retryable_jobs(db: Session, *, reason: str | None, type_: str | None, scan: int = 500):
+    """Failed/partial jobs that are classified retryable and under the attempt cap."""
+    max_attempts = get_settings().download_retry_max_attempts
+    stmt = (
+        select(Job)
+        .where(Job.status.in_(("failed", "partial_success")))
+        .order_by(Job.id.desc())
+        .limit(scan)
+    )
+    if type_:
+        stmt = stmt.where(Job.type == type_)
+    result = []
+    for j in db.scalars(stmt):
+        if (j.retry_count or 0) >= max_attempts:
+            continue
+        c = classify_job(j)
+        if not c["retryable"]:
+            continue
+        if reason and reason not in c["reasons"]:
+            continue
+        result.append((j, c))
+    return result
+
+
+@router.get("/retryable", response_model=list[JobOutClassified])
+def list_retryable_jobs(
+    db: Session = Depends(get_db),
+    reason: str | None = Query(default=None, description="filter by classification reason"),
+    type: str | None = Query(default=None),
+    limit: int = Query(default=50, le=500),
+) -> list[JobOutClassified]:
+    out: list[JobOutClassified] = []
+    for j, c in _retryable_jobs(db, reason=reason, type_=type)[:limit]:
+        item = JobOutClassified.model_validate(j)
+        item.classification = JobClassification(**c)
+        out.append(item)
+    return out
+
+
+@router.post("/retry-all", response_model=JobRetryAllOut)
+def retry_all_jobs(
+    req: JobRetryAllRequest, db: Session = Depends(get_db)
+) -> JobRetryAllOut:
+    """Re-queue all retryable jobs (optionally filtered by reason / type)."""
+    candidates = _retryable_jobs(db, reason=req.reason, type_=req.type)[: req.limit]
+    job_ids: list[int] = []
+    for j, _c in candidates:
+        jobs_svc.retry_job(db, j)  # increments retry_count, clears next_retry_at
+        job_ids.append(j.id)
+    db.commit()
+    for jid in job_ids:
+        try:
+            jobs_svc.submit_job(jid)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("retry-all: job %s not resubmitted: %s", jid, exc)
+    return JobRetryAllOut(retried=len(job_ids), job_ids=job_ids)
 
 
 @router.get("/{job_id}", response_model=JobDetailOut)
@@ -106,10 +166,20 @@ def get_job_log(job_id: int, db: Session = Depends(get_db)) -> JobLogOut:
 
 
 @router.post("/{job_id}/retry", response_model=JobOut)
-def retry_job(job_id: int, db: Session = Depends(get_db)) -> Job:
+def retry_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    force: bool = Query(default=False, description="bypass the retry-count cap"),
+) -> Job:
     job = _require_job(db, job_id)
     if job.status not in ("failed", "canceled", "partial_success"):
         raise HTTPException(status_code=409, detail=f"cannot retry a {job.status} job")
+    max_attempts = get_settings().download_retry_max_attempts
+    if not force and (job.retry_count or 0) >= max_attempts:
+        raise HTTPException(
+            status_code=409,
+            detail=f"retry cap reached ({job.retry_count}/{max_attempts}); use ?force=true to override",
+        )
     jobs_svc.retry_job(db, job)
     db.commit()
     try:

@@ -92,6 +92,28 @@ def _crawlable_count(s) -> int:
     )
 
 
+def _requeue_due_retries(s, now: datetime, limit: int | None) -> list[int]:
+    """Re-queue retryable jobs whose backoff window (next_retry_at) has elapsed."""
+    from app.models import Job
+
+    stmt = (
+        select(Job)
+        .where(
+            Job.status.in_(("failed", "partial_success")),
+            Job.next_retry_at.is_not(None),
+            Job.next_retry_at <= now,
+        )
+        .order_by(Job.next_retry_at.asc())
+    )
+    if limit:
+        stmt = stmt.limit(limit)
+    job_ids: list[int] = []
+    for job in s.scalars(stmt):
+        jobs_svc.retry_job(s, job)  # increments retry_count, clears next_retry_at
+        job_ids.append(job.id)
+    return job_ids
+
+
 def _enqueue_due_comments(s, settings: Settings, now: datetime, limit: int | None) -> list[int]:
     """Create comments_refresh jobs for videos due for a comment refresh."""
     job_ids: list[int] = []
@@ -133,21 +155,23 @@ def run_once(
     is_scheduler = reason == "scheduler"
     run_collections = do_collections and (settings.scheduler_enabled if is_scheduler else True)
     run_comments = do_comments and (settings.scheduler_comments_enabled if is_scheduler else True)
+    run_retries = settings.scheduler_retry_enabled if is_scheduler else False
 
     empty = {
-        "enabled": run_collections or run_comments,
+        "enabled": run_collections or run_comments or run_retries,
         "reason": reason,
         "collections_checked": 0,
         "collection_jobs_created": 0,
         "due_comment_videos_checked": 0,
         "comments_jobs_created": 0,
+        "retries_requeued": 0,
         "skipped_frozen": 0,
         "skipped_recent": 0,
         "jobs_created": 0,
         "submitted": 0,
         "job_ids": [],
     }
-    if not run_collections and not run_comments:
+    if not run_collections and not run_comments and not run_retries:
         _scheduler_log(settings, f"skip: nothing to do (reason={reason})")
         return empty
 
@@ -155,6 +179,7 @@ def run_once(
     cap = max_items if max_items is not None else settings.expand_max_items
     collection_job_ids: list[int] = []
     comment_job_ids: list[int] = []
+    retry_job_ids: list[int] = []
     collections_checked = 0
     due_checked = 0
     skipped_frozen = 0
@@ -171,9 +196,13 @@ def run_once(
                 s, settings, now, settings.scheduler_comments_limit_per_run
             )
             due_checked = len(comment_job_ids)
+        if run_retries:
+            retry_job_ids = _requeue_due_retries(
+                s, now, settings.scheduler_retry_limit_per_run
+            )
         s.commit()
 
-    job_ids = collection_job_ids + comment_job_ids
+    job_ids = collection_job_ids + comment_job_ids + retry_job_ids
     submitted = 0
     for jid in job_ids:
         try:
@@ -189,6 +218,7 @@ def run_once(
         "collection_jobs_created": len(collection_job_ids),
         "due_comment_videos_checked": due_checked,
         "comments_jobs_created": len(comment_job_ids),
+        "retries_requeued": len(retry_job_ids),
         "skipped_frozen": skipped_frozen,
         "skipped_recent": skipped_recent,
         "jobs_created": len(job_ids),

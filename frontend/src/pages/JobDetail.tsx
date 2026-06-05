@@ -14,11 +14,12 @@ export default function JobDetail() {
   const { data: job, error, loading, reload } = useFetch(() => api.job(jobId), [jobId]);
   const logs = useFetch(() => api.jobLogs(jobId, 2000), [jobId]);
   const [tab, setTab] = useState<Tab>("command");
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
+  const [flash, setFlash] = useState<string | null>(null);
 
   async function retry() {
-    setBusy(true);
+    setBusy("retry");
     setActionErr(null);
     try {
       await api.retryJob(jobId);
@@ -27,7 +28,22 @@ export default function JobDetail() {
     } catch (e) {
       setActionErr((e as Error).message);
     } finally {
-      setBusy(false);
+      setBusy(null);
+    }
+  }
+
+  async function retrySubtitles() {
+    if (!job?.video) return;
+    setBusy("subs");
+    setActionErr(null);
+    setFlash(null);
+    try {
+      const j = await api.refreshVideoSubtitles(job.video.id);
+      setFlash(`Created subtitles_refresh job #${j.id} (body is not re-downloaded).`);
+    } catch (e) {
+      setActionErr((e as Error).message);
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -36,6 +52,8 @@ export default function JobDetail() {
   if (!job) return null;
 
   const logText = logs.data ? logs.data[tab] : null;
+  const reasons = job.classification?.reasons ?? [];
+  const canRetry = ["failed", "canceled", "partial_success"].includes(job.status);
 
   return (
     <div>
@@ -44,9 +62,14 @@ export default function JobDetail() {
           Job #{job.id} <StatusBadge status={job.status} />
         </h1>
         <div className="row">
-          {["failed", "canceled", "partial_success"].includes(job.status) && (
-            <button className="primary" disabled={busy} onClick={retry}>
-              {busy ? <span className="spin" /> : "↻"} Retry
+          {canRetry && (
+            <button className="primary" disabled={busy === "retry"} onClick={retry}>
+              {busy === "retry" ? <span className="spin" /> : "↻"} Retry
+            </button>
+          )}
+          {reasons.includes("subtitles_failed") && job.video && (
+            <button disabled={busy === "subs"} onClick={retrySubtitles}>
+              {busy === "subs" ? <span className="spin" /> : "📝"} Retry subtitles only
             </button>
           )}
           <button onClick={() => { reload(); logs.reload(); }}>↻ Refresh</button>
@@ -56,6 +79,7 @@ export default function JobDetail() {
         <Link to="/jobs">← back to jobs</Link>
       </p>
       <ErrorBox error={actionErr} />
+      {flash && <div className="flash">{flash}</div>}
       <JobClassificationNote job={job} />
 
       <div className="grid2">
@@ -69,6 +93,8 @@ export default function JobDetail() {
               ["URL", <span className="mono small">{job.url ?? "—"}</span>],
               ["Priority", String(job.priority)],
               ["Progress", `${job.progress}%`],
+              ["Retry count", String(job.retry_count ?? 0)],
+              ["Next retry", fmtDate(job.next_retry_at)],
               ["RQ job id", <span className="mono small">{job.rq_job_id ?? "—"}</span>],
               ["Created", fmtDate(job.created_at)],
               ["Started", fmtDate(job.started_at)],

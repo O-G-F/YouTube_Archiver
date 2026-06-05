@@ -44,6 +44,7 @@ def test_builtin_profiles_exist():
         "metadata_only",
         "comments_refresh_only",
         "live_chat_refresh_only",
+        "subtitles_refresh_only",
     }
     assert expected == set(BUILTIN_PROFILES)
 
@@ -210,7 +211,7 @@ def test_redact_masks_password_not_cookies():
 
 def test_seed_and_lookup(session):
     written = seed_builtin_profiles(session)
-    assert written == 9
+    assert written == 10
     spec = get_profile_spec(session, "video_best_archive")
     assert spec.media_mode == "video"
     # idempotent: second seed writes 0 new rows

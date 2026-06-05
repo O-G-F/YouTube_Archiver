@@ -40,6 +40,7 @@ download_app = typer.Typer(help="Enqueue and run download jobs.")
 jobs_app = typer.Typer(help="Inspect and control jobs.")
 comments_app = typer.Typer(help="Comment / metadata refresh (no body re-download).")
 live_chat_app = typer.Typer(help="Live chat refresh (no body re-download).")
+subtitles_app = typer.Typer(help="Subtitles-only refresh (no body re-download).")
 profiles_app = typer.Typer(help="Download profiles.")
 collections_app = typer.Typer(help="Inspect and re-crawl playlist/channel collections.")
 scheduler_app = typer.Typer(help="Run the collection re-crawl scheduler.")
@@ -55,6 +56,7 @@ app.add_typer(download_app, name="download")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(comments_app, name="comments")
 app.add_typer(live_chat_app, name="live-chat")
+app.add_typer(subtitles_app, name="subtitles")
 app.add_typer(profiles_app, name="profiles")
 app.add_typer(collections_app, name="collections")
 app.add_typer(scheduler_app, name="scheduler")
@@ -614,6 +616,90 @@ def live_chat_stats(video_id: str = typer.Argument(..., help="YouTube video id."
 
 
 # --------------------------------------------------------------------------- #
+# subtitles (subtitle-only refresh; never re-downloads the body)
+# --------------------------------------------------------------------------- #
+@subtitles_app.command("refresh")
+def subtitles_refresh(
+    video_or_url: str = typer.Argument(..., help="YouTube video id or URL."),
+    profile: str = typer.Option("subtitles_refresh_only", "--profile", "-p"),
+    now: bool = typer.Option(False, "--now"),
+) -> None:
+    """Re-fetch subtitles for a video WITHOUT re-downloading the body."""
+    _ensure_profile(profile)
+    with session_scope() as s:
+        video = jobs_svc.resolve_or_create_video(s, video_or_url)
+        if video is None:
+            raise typer.BadParameter(f"could not resolve video: {video_or_url!r}")
+        job = jobs_svc.create_subtitles_refresh_job(s, video, profile_name=profile)
+        job_id = job.id
+    typer.echo(f"Created subtitles_refresh job #{job_id} for {video_or_url}")
+    _dispatch(job_id, now)
+
+
+@subtitles_app.command("failed")
+def subtitles_failed(limit: int = typer.Option(50, "--limit")) -> None:
+    """List jobs whose subtitle download failed (candidates for a subtitles refresh)."""
+    from app.services.job_classify import classify_job
+
+    with session_scope() as s:
+        rows = s.scalars(
+            select(Job)
+            .where(Job.status.in_(("failed", "partial_success")), Job.video_id.is_not(None))
+            .order_by(Job.id.desc())
+            .limit(500)
+        )
+        shown = 0
+        for j in rows:
+            c = classify_job(j)
+            if "subtitles_failed" not in c["reasons"] and not (j.meta or {}).get("subtitles_failed"):
+                continue
+            typer.echo(
+                f"  #{j.id:<5} {j.status:<15} {j.type:<18} video={j.video_id} "
+                f"{(j.url or '')[:40]}"
+            )
+            shown += 1
+            if shown >= limit:
+                break
+        if shown == 0:
+            typer.echo("No jobs with failed subtitles.")
+
+
+@subtitles_app.command("refresh-failed")
+def subtitles_refresh_failed(
+    limit: int = typer.Option(25, "--limit"),
+    now: bool = typer.Option(False, "--now"),
+) -> None:
+    """Create a subtitles_refresh job for each video that had a subtitles failure."""
+    from app.services.job_classify import classify_job
+
+    job_ids: list[int] = []
+    with session_scope() as s:
+        rows = s.scalars(
+            select(Job)
+            .where(Job.status.in_(("failed", "partial_success")), Job.video_id.is_not(None))
+            .order_by(Job.id.desc())
+            .limit(500)
+        )
+        seen: set[int] = set()
+        for j in rows:
+            if len(job_ids) >= limit:
+                break
+            c = classify_job(j)
+            if "subtitles_failed" not in c["reasons"] and not (j.meta or {}).get("subtitles_failed"):
+                continue
+            if j.video_id in seen:
+                continue
+            seen.add(j.video_id)
+            video = s.get(Video, j.video_id)
+            if video is None:
+                continue
+            job_ids.append(jobs_svc.create_subtitles_refresh_job(s, video).id)
+    typer.echo(f"Created {len(job_ids)} subtitles_refresh job(s).")
+    for jid in job_ids:
+        _dispatch(jid, now)
+
+
+# --------------------------------------------------------------------------- #
 # jobs
 # --------------------------------------------------------------------------- #
 @jobs_app.command("list")
@@ -645,17 +731,88 @@ def jobs_list(
 def jobs_retry(
     job_id: int = typer.Argument(...),
     now: bool = typer.Option(False, "--now"),
+    force: bool = typer.Option(False, "--force", help="Bypass the retry-count cap."),
 ) -> None:
-    """Reset a failed/canceled job to queued and re-run/re-submit it."""
+    """Reset a failed/canceled/partial job to queued and re-run/re-submit it."""
     with session_scope() as s:
         job = s.get(Job, job_id)
         if job is None:
             raise typer.BadParameter("job not found")
         if job.status not in ("failed", "canceled", "partial_success"):
             raise typer.BadParameter(f"cannot retry a {job.status} job")
+        cap = get_settings().download_retry_max_attempts
+        if not force and (job.retry_count or 0) >= cap:
+            raise typer.BadParameter(
+                f"retry cap reached ({job.retry_count}/{cap}); use --force to override"
+            )
         jobs_svc.retry_job(s, job)
-    typer.echo(f"Job #{job_id} reset to queued.")
+    typer.echo(f"Job #{job_id} reset to queued (retry #{job.retry_count}).")
     _dispatch(job_id, now)
+
+
+@jobs_app.command("retryable")
+def jobs_retryable(
+    reason: str = typer.Option("", "--reason", help="filter by classification reason"),
+    type: str = typer.Option("", "--type"),
+    limit: int = typer.Option(50, "--limit"),
+) -> None:
+    """List failed/partial jobs that are classified retryable (under the attempt cap)."""
+    from app.services.job_classify import classify_job
+
+    cap = get_settings().download_retry_max_attempts
+    with session_scope() as s:
+        stmt = select(Job).where(Job.status.in_(("failed", "partial_success"))).order_by(Job.id.desc()).limit(500)
+        if type:
+            stmt = stmt.where(Job.type == type)
+        shown = 0
+        for j in s.scalars(stmt):
+            if (j.retry_count or 0) >= cap:
+                continue
+            c = classify_job(j)
+            if not c["retryable"]:
+                continue
+            if reason and reason not in c["reasons"]:
+                continue
+            typer.echo(
+                f"  #{j.id:<5} {j.status:<15} {j.type:<18} retry={j.retry_count} "
+                f"reasons={','.join(c['reasons']) or '-'}  {(j.url or '')[:40]}"
+            )
+            shown += 1
+            if shown >= limit:
+                break
+        if shown == 0:
+            typer.echo("No retryable jobs.")
+
+
+@jobs_app.command("retry-all")
+def jobs_retry_all(
+    reason: str = typer.Option("", "--reason", help="only retry jobs with this reason"),
+    type: str = typer.Option("", "--type"),
+    limit: int = typer.Option(50, "--limit"),
+    now: bool = typer.Option(False, "--now"),
+) -> None:
+    """Re-queue all retryable jobs (optionally filtered by reason / type)."""
+    from app.services.job_classify import classify_job
+
+    cap = get_settings().download_retry_max_attempts
+    job_ids: list[int] = []
+    with session_scope() as s:
+        stmt = select(Job).where(Job.status.in_(("failed", "partial_success"))).order_by(Job.id.desc()).limit(500)
+        if type:
+            stmt = stmt.where(Job.type == type)
+        for j in s.scalars(stmt):
+            if len(job_ids) >= limit:
+                break
+            if (j.retry_count or 0) >= cap:
+                continue
+            c = classify_job(j)
+            if not c["retryable"] or (reason and reason not in c["reasons"]):
+                continue
+            jobs_svc.retry_job(s, j)
+            job_ids.append(j.id)
+    typer.echo(f"Re-queued {len(job_ids)} job(s).")
+    for jid in job_ids:
+        _dispatch(jid, now)
 
 
 @jobs_app.command("cancel")

@@ -36,6 +36,7 @@ from app.api import (
     settings as settings_api,
     sources,
     subscriptions,
+    subtitles,
     takeout,
     videos,
     watch_history,
@@ -87,6 +88,7 @@ app.include_router(search_history.router)
 app.include_router(subscriptions.router)
 app.include_router(comments.router)
 app.include_router(live_chat.router)
+app.include_router(subtitles.router)
 app.include_router(jobs.router)
 app.include_router(profiles.router)
 app.include_router(videos.router)

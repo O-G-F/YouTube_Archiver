@@ -14,6 +14,7 @@ file *path* is kept so the command stays re-runnable.
 
 from __future__ import annotations
 
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -49,6 +50,11 @@ def redact_args(args: list[str], *, mask_cookies: bool = False) -> list[str]:
         if mask_next:
             out.append("******")
             mask_next = False
+            continue
+        # Inline secrets carried inside a combined arg (e.g. an extractor-arg
+        # "youtube:po_token=XXXX"): mask the value, keep the key.
+        if "po_token=" in arg:
+            out.append(re.sub(r"(po_token=)[^,;\s]+", r"\1******", arg))
             continue
         out.append(arg)
         if arg in sensitive:
