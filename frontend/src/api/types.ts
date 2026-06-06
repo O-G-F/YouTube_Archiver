@@ -505,9 +505,47 @@ export interface SchedulerRunOnceResult {
   collection_jobs_created: number;
   due_comment_videos_checked: number;
   comments_jobs_created: number;
+  retries_requeued?: number;
+  liked_metadata_selected?: number;
+  liked_metadata_jobs_created?: number;
+  liked_archive_selected?: number;
+  liked_archive_jobs_created?: number;
+  liked_retry_selected?: number;
+  liked_retry_jobs_requeued?: number;
+  skipped_active_jobs?: number;
+  skipped_duplicates?: number;
   skipped_frozen: number;
   skipped_recent: number;
   jobs_created: number;
   submitted: number;
   job_ids: number[];
+}
+
+export interface LikedProgress {
+  total_liked: number;
+  metadata_fetched: number;
+  metadata_missing: number;
+  body_saved: number;
+  body_missing: number;
+  active_archive_jobs: number;
+  retryable_liked_jobs: number;
+  failed_liked_jobs: number;
+  partial_liked_jobs: number;
+  by_source: Record<string, number>;
+  by_channel: { channel: string; count: number }[];
+  earliest_liked_at: string | null;
+  latest_liked_at: string | null;
+  last_archive_job_at: string | null;
+  last_successful_archive_at: string | null;
+}
+
+export interface QueueStatus {
+  queued: number;
+  running: number;
+  total_active: number;
+  by_type: Record<string, number>;
+  by_source_action: Record<string, number>;
+  oldest_queued_at: string | null;
+  oldest_queued_job_id: number | null;
+  worker_count: number | null;
 }

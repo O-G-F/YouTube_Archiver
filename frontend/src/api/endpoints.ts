@@ -35,6 +35,8 @@ import type {
   YouTubeDoctor,
   LikedArchivePlan,
   LikedArchiveEnqueueResult,
+  LikedProgress,
+  QueueStatus,
 } from "./types";
 
 export interface LikedArchiveBody {
@@ -76,11 +78,17 @@ export const api = {
   profiles: () => apiGet<Profile[]>("/api/profiles"),
 
   schedulerStatus: () => apiGet<SchedulerStatus>("/api/scheduler/status"),
-  schedulerRunOnce: (body: { collections?: boolean; comments?: boolean; max_items?: number }) =>
-    apiPost<SchedulerRunOnceResult>("/api/scheduler/run-once", body),
+  schedulerRunOnce: (body: {
+    collections?: boolean;
+    comments?: boolean;
+    max_items?: number;
+    liked_metadata?: boolean;
+    liked_archive?: boolean;
+    liked_retry?: boolean;
+  }) => apiPost<SchedulerRunOnceResult>("/api/scheduler/run-once", body),
 
   // Jobs
-  jobs: (p: { status?: string; type?: string; limit?: number; offset?: number }) =>
+  jobs: (p: { status?: string; type?: string; source_action?: string; limit?: number; offset?: number }) =>
     apiGet<Job[]>(`/api/jobs${qs(p)}`),
   retryableJobs: (p: { reason?: string; type?: string; limit?: number } = {}) =>
     apiGet<Job[]>(`/api/jobs/retryable${qs(p)}`),
@@ -213,6 +221,8 @@ export const api = {
     apiGet<Job[]>(`/api/liked-videos/retryable${qs(p)}`),
   likedRetryFailed: (body: { reason?: string; limit?: number }) =>
     apiPost<{ retried: number; job_ids: number[] }>("/api/liked-videos/retry-failed", body),
+  likedProgress: () => apiGet<LikedProgress>("/api/liked-videos/progress"),
+  queueStatus: () => apiGet<QueueStatus>("/api/queue/status"),
 
   // YouTube fetch-stability doctor / diagnostics (Phase 7B)
   doctorYoutube: () => apiGet<YouTubeDoctor>("/api/doctor/youtube"),

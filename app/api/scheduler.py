@@ -30,11 +30,17 @@ def scheduler_run_once(
     (both default true). The summary reports collection + comment job counts.
     """
     req = req or SchedulerRunOnceRequest()
+    # If any liked pass is explicitly requested, run only the liked passes (avoid
+    # surprise collection/comment work from the default-true flags).
+    liked_requested = req.liked_metadata or req.liked_archive or req.liked_retry
     summary = scheduler_svc.run_once(
         get_settings(),
         reason="manual",
         max_items=req.max_items,
-        do_collections=req.collections,
-        do_comments=req.comments,
+        do_collections=req.collections and not liked_requested,
+        do_comments=req.comments and not liked_requested,
+        do_liked_metadata=req.liked_metadata,
+        do_liked_archive=req.liked_archive,
+        do_liked_retry=req.liked_retry,
     )
     return SchedulerRunOnceOut(**summary)

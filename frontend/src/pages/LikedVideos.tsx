@@ -5,6 +5,7 @@ import { useFetch } from "../lib/useFetch";
 import { fmtDate } from "../lib/format";
 import { ErrorBox, Loading } from "../components/ui";
 import { Thumb } from "../components/Thumb";
+import { LikedProgressDashboard } from "../components/LikedProgress";
 import type { LikedArchivePlan, LikedArchiveEnqueueResult } from "../api/types";
 
 const SOURCE_LABEL: Record<string, string> = {
@@ -148,6 +149,8 @@ export default function LikedVideos() {
           </button>
         </div>
       </div>
+
+      <LikedProgressDashboard onChanged={reload} />
 
       {stats.data && (
         <div className="cards">

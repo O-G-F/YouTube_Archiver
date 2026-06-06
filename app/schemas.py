@@ -330,10 +330,14 @@ class SchedulerStatusOut(BaseModel):
 
 
 class SchedulerRunOnceRequest(BaseModel):
-    # Which parts to run for this manual cycle. Defaults to both.
+    # Which parts to run for this manual cycle.
     collections: bool = True
     comments: bool = True
     max_items: int | None = None
+    # Phase 7D liked passes (default off; opt in explicitly).
+    liked_metadata: bool = False
+    liked_archive: bool = False
+    liked_retry: bool = False
 
 
 class SchedulerRunOnceOut(BaseModel):
@@ -344,11 +348,55 @@ class SchedulerRunOnceOut(BaseModel):
     due_comment_videos_checked: int = 0
     comments_jobs_created: int = 0
     retries_requeued: int = 0
+    # Phase 7D liked passes
+    liked_metadata_selected: int = 0
+    liked_metadata_jobs_created: int = 0
+    liked_archive_selected: int = 0
+    liked_archive_jobs_created: int = 0
+    liked_retry_selected: int = 0
+    liked_retry_jobs_requeued: int = 0
+    skipped_active_jobs: int = 0
+    skipped_duplicates: int = 0
     skipped_frozen: int = 0
     skipped_recent: int = 0
     jobs_created: int = 0
     submitted: int = 0
     job_ids: list[int] = Field(default_factory=list)
+
+
+# ---- Phase 7D: liked-archive progress + queue health ----
+class LikedChannelCount(BaseModel):
+    channel: str
+    count: int
+
+
+class LikedProgressOut(BaseModel):
+    total_liked: int
+    metadata_fetched: int
+    metadata_missing: int
+    body_saved: int
+    body_missing: int
+    active_archive_jobs: int
+    retryable_liked_jobs: int
+    failed_liked_jobs: int
+    partial_liked_jobs: int
+    by_source: dict[str, int] = Field(default_factory=dict)
+    by_channel: list[LikedChannelCount] = Field(default_factory=list)
+    earliest_liked_at: str | None = None
+    latest_liked_at: str | None = None
+    last_archive_job_at: str | None = None
+    last_successful_archive_at: str | None = None
+
+
+class QueueStatusOut(BaseModel):
+    queued: int
+    running: int
+    total_active: int
+    by_type: dict[str, int] = Field(default_factory=dict)
+    by_source_action: dict[str, int] = Field(default_factory=dict)
+    oldest_queued_at: str | None = None
+    oldest_queued_job_id: int | None = None
+    worker_count: int | None = None
 
 
 # --------------------------------------------------------------------------- #

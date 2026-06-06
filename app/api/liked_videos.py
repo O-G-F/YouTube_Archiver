@@ -20,6 +20,7 @@ from app.schemas import (
     LikedArchiveEnqueueOut,
     LikedArchivePlanOut,
     LikedArchiveRequest,
+    LikedProgressOut,
     LikedRetryFailedOut,
     LikedRetryFailedRequest,
     LikedVideoOut,
@@ -164,6 +165,12 @@ def liked_videos_stats(db: Session = Depends(get_db)) -> LikedVideoStatsOut:
 # --------------------------------------------------------------------------- #
 # Phase 7C: plan / enqueue / retry
 # --------------------------------------------------------------------------- #
+@router.get("/progress", response_model=LikedProgressOut)
+def liked_progress(db: Session = Depends(get_db)) -> LikedProgressOut:
+    """Liked-archive progress dashboard data (no personal data / raw_json)."""
+    return LikedProgressOut(**la.progress(db, get_settings()))
+
+
 @router.post("/archive-plan", response_model=LikedArchivePlanOut)
 def archive_plan(req: LikedArchiveRequest, db: Session = Depends(get_db)) -> LikedArchivePlanOut:
     """Preview what an archive run would touch — no jobs are created."""

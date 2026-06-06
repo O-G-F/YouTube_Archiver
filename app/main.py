@@ -30,6 +30,7 @@ from app.api import (
     liked_videos,
     live_chat,
     profiles,
+    queue as queue_api,
     scheduler,
     search,
     search_history,
@@ -98,6 +99,7 @@ app.include_router(library.router)
 app.include_router(liked_videos.router)
 app.include_router(youtube_api.router)
 app.include_router(youtube_doctor.router)
+app.include_router(queue_api.router)
 
 
 # --------------------------------------------------------------------------- #

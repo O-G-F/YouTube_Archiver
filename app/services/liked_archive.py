@@ -307,8 +307,18 @@ class EnqueueResult:
 
 
 def _create_liked_job(
-    session: Session, video: Video, liked: LikedVideo, profile: str
+    session: Session, video: Video, liked: LikedVideo, profile: str,
+    *, extra_meta: dict | None = None,
 ) -> Job:
+    meta = {
+        "enqueued_by": "liked_videos",
+        "source_action": SOURCE_ACTION,
+        "liked_video_id": liked.id,
+        "liked_at": liked.liked_at.isoformat() if liked.liked_at else None,
+        "requested_profile": profile,
+    }
+    if extra_meta:
+        meta.update(extra_meta)
     job = Job(
         type="download",
         status="queued",
@@ -316,17 +326,22 @@ def _create_liked_job(
         video_id=video.id,
         profile_name=profile,
         priority=0,
-        meta={
-            "enqueued_by": "liked_videos",
-            "source_action": SOURCE_ACTION,
-            "liked_video_id": liked.id,
-            "liked_at": liked.liked_at.isoformat() if liked.liked_at else None,
-            "requested_profile": profile,
-        },
+        meta=meta,
     )
     session.add(job)
     session.flush()
     return job
+
+
+def active_liked_archive_count(session: Session) -> int:
+    """Count queued/running liked-archive download jobs (for the suppress brake)."""
+    n = 0
+    for j in session.scalars(
+        select(Job).where(Job.type == "download", Job.status.in_(ACTIVE_STATUSES))
+    ):
+        if (j.meta or {}).get("source_action") == SOURCE_ACTION:
+            n += 1
+    return n
 
 
 def _enqueue(
@@ -340,6 +355,7 @@ def _enqueue(
     dry_run: bool,
     downloads_body: bool,
     submit: bool = True,
+    extra_meta: dict | None = None,
 ) -> EnqueueResult:
     cap = settings.liked_archive_max_enqueue_per_run
     eff_limit = min(limit or settings.liked_archive_default_limit, cap)
@@ -374,7 +390,7 @@ def _enqueue(
         res.selected_count += 1
         if dry_run:
             continue
-        job = _create_liked_job(session, v, lv, profile)
+        job = _create_liked_job(session, v, lv, profile, extra_meta=extra_meta)
         res.job_ids.append(job.id)
 
     if not dry_run:
@@ -398,6 +414,7 @@ def enqueue_metadata(
     profile: str = METADATA_PROFILE,
     dry_run: bool = False,
     submit: bool = True,
+    extra_meta: dict | None = None,
 ) -> EnqueueResult:
     """Enqueue metadata_only jobs (NEVER downloads the body)."""
     get_profile_spec(session, profile)  # validate (raises KeyError -> 400 upstream)
@@ -412,6 +429,7 @@ def enqueue_metadata(
         dry_run=dry_run,
         downloads_body=False,
         submit=submit,
+        extra_meta=extra_meta,
     )
 
 
@@ -424,6 +442,7 @@ def enqueue_archive(
     profile: str | None = None,
     dry_run: bool = False,
     submit: bool = True,
+    extra_meta: dict | None = None,
 ) -> EnqueueResult:
     """Enqueue a BODY archive (downloads the video body with the given profile)."""
     prof = profile or settings.liked_archive_default_profile
@@ -438,6 +457,7 @@ def enqueue_archive(
         dry_run=dry_run,
         downloads_body=True,
         submit=submit,
+        extra_meta=extra_meta,
     )
 
 
@@ -451,8 +471,14 @@ def retryable_liked(
     reason: str | None = None,
     limit: int = 50,
     scan: int = 1000,
+    now: datetime | None = None,
 ):
-    """Failed/partial liked-archive jobs that are retryable and under the cap."""
+    """Failed/partial liked-archive jobs that are retryable and under the cap.
+
+    When ``now`` is given, jobs still inside their backoff window
+    (``next_retry_at`` in the future) are skipped — used by the scheduler so it
+    never retries before the backoff has elapsed.
+    """
     max_attempts = settings.download_retry_max_attempts
     stmt = (
         select(Job)
@@ -467,6 +493,8 @@ def retryable_liked(
             continue
         if (j.retry_count or 0) >= max_attempts:
             continue
+        if now is not None and j.next_retry_at is not None and j.next_retry_at > now:
+            continue  # still inside the backoff window
         c = classify_job(j)
         if not c["retryable"]:
             continue
@@ -478,23 +506,105 @@ def retryable_liked(
     return out
 
 
+def progress(session: Session, settings: Settings, *, top_channels: int = 10) -> dict:
+    """Aggregate liked-archive progress (counts by state / source / channel).
+
+    Personal data (raw_json, like history) is NOT included.
+    """
+    rows = session.execute(
+        select(LikedVideo, Video)
+        .join(Video, Video.id == LikedVideo.video_id, isouter=True)
+        .where(LikedVideo.youtube_video_id.is_not(None))
+    ).all()
+    video_ids = [v.id for _lv, v in rows if v is not None]
+    body_map = _body_count_map(session, video_ids)
+    meta_map = _meta_count_map(session, video_ids)
+
+    seen: set[str] = set()
+    total = meta_fetched = body_saved = 0
+    by_source: dict[str, int] = {}
+    by_channel: dict[str, int] = {}
+    earliest = latest = None
+    for lv, v in rows:
+        by_source[lv.source or "unknown"] = by_source.get(lv.source or "unknown", 0) + 1
+        if lv.liked_at:
+            earliest = lv.liked_at if earliest is None or lv.liked_at < earliest else earliest
+            latest = lv.liked_at if latest is None or lv.liked_at > latest else latest
+        vid = lv.youtube_video_id
+        if vid in seen:
+            continue
+        seen.add(vid)
+        total += 1
+        has_meta = bool(v is not None and (v.title or meta_map.get(v.id, 0) > 0))
+        has_body = bool(v is not None and body_map.get(v.id, 0) > 0)
+        if has_meta:
+            meta_fetched += 1
+        if has_body:
+            body_saved += 1
+        ch = (v.channel_title if v is not None and v.channel_title else lv.channel_title) or "—"
+        by_channel[ch] = by_channel.get(ch, 0) + 1
+
+    # liked-archive job stats (scan recent download jobs)
+    active_archive = failed = partial = 0
+    last_archive_at = last_success_at = None
+    for j in session.scalars(
+        select(Job).where(Job.type == "download").order_by(Job.id.desc()).limit(5000)
+    ):
+        if (j.meta or {}).get("source_action") != SOURCE_ACTION:
+            continue
+        ts = j.finished_at or j.created_at
+        if last_archive_at is None:
+            last_archive_at = ts
+        if j.status in ACTIVE_STATUSES and j.profile_name != METADATA_PROFILE:
+            active_archive += 1
+        elif j.status == "failed":
+            failed += 1
+        elif j.status == "partial_success":
+            partial += 1
+        elif j.status == "success" and last_success_at is None:
+            last_success_at = ts
+
+    retryable = len(retryable_liked(session, settings, limit=10_000))
+    top = sorted(by_channel.items(), key=lambda kv: kv[1], reverse=True)[:top_channels]
+    return {
+        "total_liked": total,
+        "metadata_fetched": meta_fetched,
+        "metadata_missing": total - meta_fetched,
+        "body_saved": body_saved,
+        "body_missing": total - body_saved,
+        "active_archive_jobs": active_archive,
+        "retryable_liked_jobs": retryable,
+        "failed_liked_jobs": failed,
+        "partial_liked_jobs": partial,
+        "by_source": by_source,
+        "by_channel": [{"channel": c, "count": n} for c, n in top],
+        "earliest_liked_at": earliest.isoformat() if earliest else None,
+        "latest_liked_at": latest.isoformat() if latest else None,
+        "last_archive_job_at": last_archive_at.isoformat() if last_archive_at else None,
+        "last_successful_archive_at": last_success_at.isoformat() if last_success_at else None,
+    }
+
+
 def retry_failed_liked(
     session: Session,
     settings: Settings,
     *,
     reason: str | None = None,
     limit: int = 20,
+    now: datetime | None = None,
+    submit: bool = True,
 ) -> list[int]:
-    """Re-queue retryable liked-archive jobs (respects the attempt cap)."""
-    candidates = retryable_liked(session, settings, reason=reason, limit=limit)
+    """Re-queue retryable liked-archive jobs (respects the attempt cap + backoff)."""
+    candidates = retryable_liked(session, settings, reason=reason, limit=limit, now=now)
     job_ids: list[int] = []
     for j, _c in candidates:
         jobs_svc.retry_job(session, j)
         job_ids.append(j.id)
     session.commit()
-    for jid in job_ids:
-        try:
-            jobs_svc.submit_job(jid)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("retry-failed liked: job %s not resubmitted: %s", jid, exc)
+    if submit:
+        for jid in job_ids:
+            try:
+                jobs_svc.submit_job(jid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("retry-failed liked: job %s not resubmitted: %s", jid, exc)
     return job_ids

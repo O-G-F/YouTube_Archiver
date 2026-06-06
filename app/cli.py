@@ -53,6 +53,7 @@ library_app = typer.Typer(help="Hybrid library bootstrap (Takeout + API).")
 youtube_api_app = typer.Typer(help="YouTube Data API OAuth (differential liked sync).")
 doctor_app = typer.Typer(help="Environment diagnostics (general + YouTube fetch stability).")
 youtube_diag_app = typer.Typer(help="YouTube fetch-stability diagnostics (benchmark).")
+queue_app = typer.Typer(help="Job queue health (Phase 7D).")
 app.add_typer(source_app, name="source")
 app.add_typer(download_app, name="download")
 app.add_typer(jobs_app, name="jobs")
@@ -71,6 +72,7 @@ app.add_typer(library_app, name="library")
 app.add_typer(youtube_api_app, name="youtube-api")
 app.add_typer(doctor_app, name="doctor")
 app.add_typer(youtube_diag_app, name="youtube-diagnostics")
+app.add_typer(queue_app, name="queue")
 
 
 # --------------------------------------------------------------------------- #
@@ -1157,16 +1159,28 @@ def scheduler_run_once(
     max_items: int = typer.Option(0, "--max-items"),
     collections: bool = typer.Option(False, "--collections", help="Run collection re-crawl."),
     comments: bool = typer.Option(False, "--comments", help="Run due comment refreshes."),
-    all_: bool = typer.Option(False, "--all", help="Run both collections and comments."),
+    liked_metadata: bool = typer.Option(False, "--liked-metadata", help="Enqueue metadata_only for liked videos (no body)."),
+    liked_archive: bool = typer.Option(False, "--liked-archive", help="Enqueue a small liked BODY archive (downloads bodies!)."),
+    liked_retry: bool = typer.Option(False, "--liked-retry", help="Re-queue retryable liked jobs (backoff respected)."),
+    all_: bool = typer.Option(False, "--all", help="Run collections + comments + all liked passes."),
 ) -> None:
     """Run a single scheduler pass now (works even if SCHEDULER_ENABLED=false).
 
-    Choose what to run with ``--collections`` / ``--comments`` / ``--all``.
-    With no flag, both parts run (same as ``--all``).
+    Choose with ``--collections`` / ``--comments`` / ``--liked-metadata`` /
+    ``--liked-archive`` / ``--liked-retry`` / ``--all``. With no flag, only
+    collections + comments run (liked passes are opt-in for safety).
     """
     from app.services.scheduler import run_once
 
-    if all_ or (not collections and not comments):
+    liked_any = liked_metadata or liked_archive or liked_retry
+    if all_:
+        do_collections = do_comments = True
+        liked_metadata = liked_archive = liked_retry = True
+    elif liked_any:
+        # liked pass(es) requested -> run only those (avoid surprise crawl work)
+        do_collections = collections
+        do_comments = comments
+    elif not collections and not comments:
         do_collections = do_comments = True
     else:
         do_collections, do_comments = collections, comments
@@ -1177,6 +1191,9 @@ def scheduler_run_once(
         max_items=(max_items or None),
         do_collections=do_collections,
         do_comments=do_comments,
+        do_liked_metadata=liked_metadata,
+        do_liked_archive=liked_archive,
+        do_liked_retry=liked_retry,
     )
     typer.echo(
         "scheduler run-once: "
@@ -1184,8 +1201,11 @@ def scheduler_run_once(
         f"collection_jobs={summary['collection_jobs_created']} "
         f"due_comment_videos={summary['due_comment_videos_checked']} "
         f"comment_jobs={summary['comments_jobs_created']} "
-        f"skipped_frozen={summary['skipped_frozen']} "
-        f"skipped_recent={summary['skipped_recent']} "
+        f"liked_metadata={summary['liked_metadata_jobs_created']}/{summary['liked_metadata_selected']} "
+        f"liked_archive={summary['liked_archive_jobs_created']}/{summary['liked_archive_selected']} "
+        f"liked_retry={summary['liked_retry_jobs_requeued']}/{summary['liked_retry_selected']} "
+        f"skipped_active={summary['skipped_active_jobs']} "
+        f"skipped_dup={summary['skipped_duplicates']} "
         f"submitted={summary['submitted']}"
     )
 
@@ -1602,6 +1622,40 @@ def liked_videos_enqueue_archive(
     if now and not dry_run:
         for jid in job_ids:
             _dispatch(jid, True)
+
+
+@queue_app.command("status")
+def queue_status_cmd() -> None:
+    """Show queued/running jobs by type and source_action."""
+    from app.services import queue_health
+
+    with session_scope() as s:
+        q = queue_health.queue_status(s)
+    typer.echo("== queue status ==")
+    typer.echo(f"  queued: {q['queued']}  running: {q['running']}  total active: {q['total_active']}")
+    typer.echo(f"  by type: {q['by_type']}")
+    typer.echo(f"  by source_action: {q['by_source_action']}")
+    typer.echo(f"  oldest queued: job #{q['oldest_queued_job_id']} at {q['oldest_queued_at']}")
+    typer.echo(f"  worker count: {q['worker_count']}")
+
+
+@liked_videos_app.command("progress")
+def liked_videos_progress() -> None:
+    """Show liked-archive progress (metadata/body saved, retryable, by source)."""
+    from app.services import liked_archive as la
+
+    with session_scope() as s:
+        p = la.progress(s, get_settings())
+    typer.echo("== liked archive progress ==")
+    typer.echo(f"  total liked (unique): {p['total_liked']}")
+    typer.echo(f"  metadata fetched:     {p['metadata_fetched']}  (missing {p['metadata_missing']})")
+    typer.echo(f"  body saved:           {p['body_saved']}  (missing {p['body_missing']})")
+    typer.echo(f"  active archive jobs:  {p['active_archive_jobs']}")
+    typer.echo(f"  retryable / failed / partial: {p['retryable_liked_jobs']} / {p['failed_liked_jobs']} / {p['partial_liked_jobs']}")
+    typer.echo(f"  by source: {p['by_source']}")
+    if p["by_channel"]:
+        typer.echo("  top channels: " + ", ".join(f"{c['channel']}({c['count']})" for c in p["by_channel"][:5]))
+    typer.echo(f"  last archive job at: {p['last_archive_job_at']}  | last success: {p['last_successful_archive_at']}")
 
 
 @liked_videos_app.command("retryable")

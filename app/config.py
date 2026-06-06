@@ -130,7 +130,26 @@ class Settings(BaseSettings):
     liked_archive_job_delay_seconds: float = 0.0
     # Optional scheduler pickup of pending liked archives (default OFF).
     scheduler_liked_archive_enabled: bool = False
-    scheduler_liked_archive_limit_per_run: int = 5
+    scheduler_liked_archive_limit_per_run: int = 2  # body DL is heavy -> tiny
+
+    # ---- Scheduler liked passes (Phase 7D) — default OFF / small limits ----
+    # metadata_only pass (no body DL): safe to run a bit more.
+    scheduler_liked_metadata_enabled: bool = False
+    scheduler_liked_metadata_limit_per_run: int = 10
+    # body archive pass tuning (empty -> liked_archive_default_profile / all sources).
+    scheduler_liked_archive_profile: str = ""
+    scheduler_liked_archive_source: str = ""
+    scheduler_liked_archive_missing_body_only: bool = True
+    # retryable liked re-queue pass (respects next_retry_at + attempt cap).
+    scheduler_liked_retry_enabled: bool = False
+    scheduler_liked_retry_limit_per_run: int = 3
+    # Global brake: skip a liked enqueue pass while liked-archive jobs are still
+    # queued/running (avoid piling up while a batch is in flight).
+    scheduler_liked_suppress_when_active: bool = True
+
+    @property
+    def effective_scheduler_liked_archive_profile(self) -> str:
+        return (self.scheduler_liked_archive_profile or "").strip() or self.liked_archive_default_profile
 
     # ---- YouTube fetch stabilization secrets (Phase 7A / 7B) ----
     # All are SECRETS: never returned by the API / shown in the UI (only a

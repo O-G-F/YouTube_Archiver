@@ -474,9 +474,14 @@ SCHEDULER_COMMENTS_LIMIT_PER_RUN=10
 手動 1 パス（`SCHEDULER_ENABLED` に関係なく実行、対象を選択可能）:
 
 ```bash
-archiver scheduler run-once --all            # collections + comments（無指定時も both）
+archiver scheduler run-once --all            # collections + comments + liked passes
 archiver scheduler run-once --comments        # コメントのみ
 archiver scheduler run-once --collections     # 再クロールのみ
+archiver scheduler run-once --liked-metadata  # liked metadata（本体非保存）【Phase 7D】
+archiver scheduler run-once --liked-archive    # liked body archive（本体DL・少量）【Phase 7D】
+archiver scheduler run-once --liked-retry      # liked retryable 再queue（backoff後）【Phase 7D】
+archiver liked-videos progress                 # 進捗集計【Phase 7D】
+archiver queue status                          # キュー在庫（type/source_action別）【Phase 7D】
 # API:
 curl -s -XPOST localhost:8000/api/scheduler/run-once -H 'content-type: application/json' \
   -d '{"collections":true,"comments":true}'
@@ -966,6 +971,68 @@ archiver liked-videos enqueue-archive --limit 1 --profile video_compressed_1080p
 
 - liked archive は **limit 必須/安全既定**で大量 DL を回避。raw_json（高評価履歴の個人データ）は既定非表示。body archive は body DL を明示。`metadata_only` の**本体非保存**を維持。secret/cookie/token/PO-token は引き続き UI/API/log に出さない。
 
+### Liked archive scheduler + progress dashboard（Phase 7D）
+
+Phase 7C の手動運用（plan / enqueue / retry）を、**少量ずつ安全に自動実行**できるようにした層です。scheduler は **既定すべて OFF**（誤って大量 DL しないため）で、明示的に有効化／run-once したときだけ動きます。
+
+#### scheduler liked passes（すべて opt-in・既定 OFF）
+
+| pass | 設定 | 内容 | 推奨 limit |
+|---|---|---|---|
+| metadata | `SCHEDULER_LIKED_METADATA_ENABLED` / `_LIMIT_PER_RUN` | metadata 未取得を `metadata_only` で取得（**本体非保存**） | 10〜50 |
+| archive | `SCHEDULER_LIKED_ARCHIVE_ENABLED` / `_LIMIT_PER_RUN` / `_PROFILE` / `_SOURCE` / `_MISSING_BODY_ONLY` | body 未保存を archive（**本体 DL！**） | **1〜3** |
+| retry | `SCHEDULER_LIKED_RETRY_ENABLED` / `_LIMIT_PER_RUN` | retryable liked job を再 queue（backoff 後のみ） | 1〜5 |
+
+```bash
+# 個別 run-once（SCHEDULER_*_ENABLED に関係なく即実行）
+archiver scheduler run-once --liked-metadata     # 本体非保存
+archiver scheduler run-once --liked-archive       # 本体 DL（少量）
+archiver scheduler run-once --liked-retry
+archiver scheduler run-once --all                 # collections+comments+liked 全部
+# API
+curl -XPOST /api/scheduler/run-once -d '{"liked_metadata":true}'   # liked のみ実行（collections/comments は走らない）
+```
+
+#### safety-first（大量 DL を避ける仕組み）
+
+- 1 周期の enqueue 数は **`_LIMIT_PER_RUN` で上限**（body archive は既定 2）。
+- **active 抑制**: liked-archive の **body ジョブ**が queued/running の間は archive pass を**スキップ**（`skipped_active_jobs`）。`SCHEDULER_LIKED_SUPPRESS_WHEN_ACTIVE=true`。metadata_only は対象外（軽いので継続可）。
+- **dedup**: 同一 video×profile の queued/running があれば重複 enqueue しない（`skipped_duplicates`）。
+- **backoff 尊重**: retry pass は `next_retry_at` が未来のジョブを**スキップ**し、`retry_count` 上限を超えたら再試行しない（`--force` は使わない）。
+- body DL profile は**明示設定時のみ**（metadata_only が既定）。
+
+#### run history（job.meta タグ）
+
+scheduler が作るジョブは `job.meta` に `scheduled_by`（`scheduler_liked_metadata`/`_archive`/`_retry`）と `selected_by`（`missing_metadata`/`missing_body`/`retryable`）を保存。run-once の結果は `liked_metadata_selected/jobs_created` / `liked_archive_selected/jobs_created` / `liked_retry_selected/jobs_requeued` / `skipped_active_jobs` / `skipped_duplicates` / `job_ids` を返します。
+
+#### progress dashboard
+
+```bash
+archiver liked-videos progress     # GET /api/liked-videos/progress
+```
+
+`total_liked` / `metadata_fetched`・`metadata_missing` / `body_saved`・`body_missing` / `active_archive_jobs` / `retryable_liked_jobs` / `failed_liked_jobs` / `partial_liked_jobs` / `by_source` / `by_channel`(top N) / `earliest|latest_liked_at` / `last_archive_job_at` / `last_successful_archive_at`。**raw_json（個人データ）は返しません**。UI（Liked Videos 画面上部）に進捗カード＋ source 内訳＋ run-once ボタン（metadata / archive=確認付き / retry）＋ queue 状態を表示。
+
+#### queue health
+
+```bash
+archiver queue status              # GET /api/queue/status
+```
+
+queued/running、`by_type`、`by_source_action`、oldest queued、（取得できれば）worker 数。scheduler の active 抑制はこの「在庫」を見て判断します。
+
+#### Jobs 画面
+
+`source_action` フィルタ（liked_archive / scheduler_liked_metadata / scheduler_liked_archive / scheduler_liked_retry / comments_refresh / subtitles_refresh / takeout_import）を追加。progress の「View liked jobs →」から `/jobs?source_action=liked_archive` に絞り込み遷移できます。
+
+#### 推奨運用
+
+1. `liked-videos progress` で現状把握 → 2. `scheduler run-once --liked-metadata`（多め）で metadata を埋める → 3. `--liked-archive`（**1〜3 件**）で body を少量保存 → 4. 429 / Incomplete data は `--liked-retry`（backoff 後）で再試行 → 5. 常駐自動化したい場合のみ各 `SCHEDULER_LIKED_*_ENABLED=true` ＋ `SCHEDULER_INTERVAL_SECONDS` を長め（数時間）に。
+
+### セキュリティ（7D）
+
+- scheduler は**既定 OFF・小 limit・active 抑制・backoff 尊重**で大量 DL を避ける設計。progress/queue API は件数のみで raw_json/secret を返さない。`metadata_only` の**本体非保存**を維持し、body DL は UI/CLI/API で明示。
+
 ---
 
 ## ストレージ構成
@@ -1094,7 +1161,8 @@ archiver live-chat stats VIDEO_ID
 | POST | `/api/collections/{id}/enable` ・ `/disable` | scheduler 対象の有効/無効 |
 | PATCH | `/api/collections/{id}` | `{"enabled","crawl_policy","profile"}` を更新 |
 | GET | `/api/scheduler/status` | scheduler 設定と対象数（collections + comments） |
-| POST | `/api/scheduler/run-once` | 手動で1パス実行（`{"collections","comments","max_items"}`、詳細サマリ返却） |
+| POST | `/api/scheduler/run-once` | 手動で1パス実行（`{"collections","comments","liked_metadata","liked_archive","liked_retry","max_items"}`、liked サマリ含む）【Phase 2B/7D】 |
+| GET | `/api/queue/status` | キュー在庫（queued/running・by_type・by_source_action・oldest・worker数）【Phase 7D】 |
 | POST | `/api/takeout/preview` | Takeout ZIP の preview（`{"path"}`、保存なし） |
 | POST | `/api/takeout/import` | 視聴履歴 import（`{"path","limit","dry_run"}`） |
 | POST | `/api/takeout/import-subscriptions` | 登録チャンネル import |
@@ -1158,8 +1226,10 @@ archiver live-chat stats VIDEO_ID
 | POST | `/api/liked-videos/archive-plan` | 一括アーカイブの plan/dry-run（件数・推奨 limit/delay、job 作成なし）【Phase 7C】 |
 | POST | `/api/liked-videos/enqueue-metadata-v2` | metadata 一括（filters+dry-run、本体保存なし）【Phase 7C】 |
 | POST | `/api/liked-videos/enqueue-archive` | **本体 archive** 一括（body DL！ `downloads_body=true`、dry-run 可）【Phase 7C】 |
-| GET | `/api/liked-videos/retryable` | liked 由来の retryable ジョブ一覧（`?reason=&limit=`）【Phase 7C】 |
-| POST | `/api/liked-videos/retry-failed` | liked 由来 retryable を再 queue（`{reason,limit}`、回数上限尊重）【Phase 7C】 |
+| GET | `/api/liked-videos/retryable` | liked 由来の retryable ジョブ一覧(`?reason=&limit=`)【Phase 7C】 |
+| POST | `/api/liked-videos/retry-failed` | liked 由来 retryable を再 queue(`{reason,limit}`、回数上限尊重)【Phase 7C】 |
+| GET | `/api/liked-videos/progress` | 進捗集計(metadata/body 保存・retryable・by_source/channel、raw_json 非返却)【Phase 7D】 |
+| GET | `/api/jobs?source_action=` | `source_action`/`scheduled_by` でジョブ絞り込み(liked_archive 等)【Phase 7D】 |
 | GET | `/api/takeout/files` | `TAKEOUT_IMPORT_ROOT` 配下の ZIP 一覧（root 外は不可）【Phase 5A】 |
 
 `/api/jobs`・`/api/jobs/{id}` は **`classification`**（429/partial/retryable/warnings）を含みます【Phase 5B】。Videos 一覧は `?channel_id=&sort=` を追加。

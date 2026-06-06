@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
 import { fmtDate } from "../lib/format";
@@ -15,10 +15,16 @@ const TYPES = [
 const REASONS = [
   "", "rate_limited", "incomplete_data", "fragments_failed", "subtitles_failed", "comments_failed", "impersonation",
 ];
+const SOURCE_ACTIONS = [
+  "", "liked_archive", "liked_videos", "scheduler_liked_metadata", "scheduler_liked_archive",
+  "scheduler_liked_retry", "comments_refresh", "subtitles_refresh", "takeout_import",
+];
 
 export default function Jobs() {
+  const [params, setParams] = useSearchParams();
   const [status, setStatus] = useState("");
   const [type, setType] = useState("");
+  const [sourceAction, setSourceAction] = useState(params.get("source_action") ?? "");
   const [retryableOnly, setRetryableOnly] = useState(false);
   const [reason, setReason] = useState("");
   const [auto, setAuto] = useState(true);
@@ -26,12 +32,24 @@ export default function Jobs() {
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
 
+  function onSourceAction(v: string) {
+    setSourceAction(v);
+    if (v) params.set("source_action", v);
+    else params.delete("source_action");
+    setParams(params, { replace: true });
+  }
+
   const { data, error, loading, reload } = useFetch<Job[]>(
     () =>
       retryableOnly
         ? api.retryableJobs({ reason: reason || undefined, type: type || undefined, limit: 100 })
-        : api.jobs({ status: status || undefined, type: type || undefined, limit: 100 }),
-    [status, type, retryableOnly, reason],
+        : api.jobs({
+            status: status || undefined,
+            type: type || undefined,
+            source_action: sourceAction || undefined,
+            limit: 100,
+          }),
+    [status, type, sourceAction, retryableOnly, reason],
     auto ? 6000 : undefined
   );
 
@@ -85,6 +103,16 @@ export default function Jobs() {
             {TYPES.map((t) => (
               <option key={t} value={t}>
                 {t || "all"}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="field inline">
+          <label>Source</label>
+          <select value={sourceAction} disabled={retryableOnly} onChange={(e) => onSourceAction(e.target.value)}>
+            {SOURCE_ACTIONS.map((s) => (
+              <option key={s} value={s}>
+                {s || "any"}
               </option>
             ))}
           </select>

@@ -134,6 +134,69 @@ def _enqueue_due_comments(s, settings: Settings, now: datetime, limit: int | Non
     return job_ids
 
 
+def _active_liked_body_count(s) -> int:
+    """Active (queued/running) liked-archive BODY jobs (profile != metadata_only)."""
+    from app.models import Job
+
+    n = 0
+    for j in s.scalars(
+        select(Job).where(Job.type == "download", Job.status.in_(("queued", "running")))
+    ):
+        meta = j.meta or {}
+        if meta.get("source_action") == "liked_archive" and j.profile_name != "metadata_only":
+            n += 1
+    return n
+
+
+def _run_liked_metadata(s, settings: Settings, limit: int) -> dict:
+    """Scheduler pass: enqueue metadata_only for liked videos missing metadata."""
+    from app.services import liked_archive as la
+
+    r = la.enqueue_metadata(
+        s, settings,
+        filters=la.LikedFilters(missing_metadata=True),
+        limit=limit, submit=False,
+        extra_meta={"scheduled_by": "scheduler_liked_metadata", "selected_by": "missing_metadata"},
+    )
+    return {"selected": r.selected_count, "jobs_created": r.jobs_created,
+            "job_ids": list(r.job_ids), "skipped_active": 0, "skipped_dup": r.skipped_existing_job}
+
+
+def _run_liked_archive(s, settings: Settings, limit: int) -> dict:
+    """Scheduler pass: enqueue a small BODY archive (downloads bodies)."""
+    from app.services import liked_archive as la
+
+    # Safety brake: don't pile body DLs while one is already in flight.
+    if settings.scheduler_liked_suppress_when_active and _active_liked_body_count(s) > 0:
+        return {"selected": 0, "jobs_created": 0, "job_ids": [], "skipped_active": 1, "skipped_dup": 0}
+    source = (settings.scheduler_liked_archive_source or "").strip() or None
+    r = la.enqueue_archive(
+        s, settings,
+        filters=la.LikedFilters(
+            source=source, missing_body=settings.scheduler_liked_archive_missing_body_only
+        ),
+        limit=limit,
+        profile=settings.effective_scheduler_liked_archive_profile,
+        submit=False,
+        extra_meta={"scheduled_by": "scheduler_liked_archive", "selected_by": "missing_body"},
+    )
+    return {"selected": r.selected_count, "jobs_created": r.jobs_created,
+            "job_ids": list(r.job_ids), "skipped_active": 0, "skipped_dup": r.skipped_existing_job}
+
+
+def _run_liked_retry(s, settings: Settings, now: datetime, limit: int) -> dict:
+    """Scheduler pass: re-queue retryable liked jobs whose backoff has elapsed."""
+    from app.services import liked_archive as la
+
+    candidates = la.retryable_liked(s, settings, limit=limit, now=now)
+    job_ids: list[int] = []
+    for j, _c in candidates:
+        j.meta = {**(j.meta or {}), "scheduled_by": "scheduler_liked_retry", "selected_by": "retryable"}
+        jobs_svc.retry_job(s, j)
+        job_ids.append(j.id)
+    return {"selected": len(candidates), "requeued": len(job_ids), "job_ids": job_ids}
+
+
 def run_once(
     settings: Settings | None = None,
     *,
@@ -141,6 +204,9 @@ def run_once(
     max_items: int | None = None,
     do_collections: bool = True,
     do_comments: bool = True,
+    do_liked_metadata: bool = False,
+    do_liked_archive: bool = False,
+    do_liked_retry: bool = False,
 ) -> dict:
     """One scheduler cycle: re-crawl collections and/or enqueue due comment refreshes.
 
@@ -156,34 +222,51 @@ def run_once(
     run_collections = do_collections and (settings.scheduler_enabled if is_scheduler else True)
     run_comments = do_comments and (settings.scheduler_comments_enabled if is_scheduler else True)
     run_retries = settings.scheduler_retry_enabled if is_scheduler else False
+    # Liked passes: scheduler honours the enable flags; a manual run honours the
+    # explicit do_liked_* flags (used by run-once --liked-* / API).
+    run_liked_meta = (settings.scheduler_liked_metadata_enabled if is_scheduler else do_liked_metadata)
+    run_liked_arch = (settings.scheduler_liked_archive_enabled if is_scheduler else do_liked_archive)
+    run_liked_retry = (settings.scheduler_liked_retry_enabled if is_scheduler else do_liked_retry)
 
-    empty = {
-        "enabled": run_collections or run_comments or run_retries,
+    base = {
         "reason": reason,
         "collections_checked": 0,
         "collection_jobs_created": 0,
         "due_comment_videos_checked": 0,
         "comments_jobs_created": 0,
         "retries_requeued": 0,
+        "liked_metadata_selected": 0,
+        "liked_metadata_jobs_created": 0,
+        "liked_archive_selected": 0,
+        "liked_archive_jobs_created": 0,
+        "liked_retry_selected": 0,
+        "liked_retry_jobs_requeued": 0,
+        "skipped_active_jobs": 0,
+        "skipped_duplicates": 0,
         "skipped_frozen": 0,
         "skipped_recent": 0,
         "jobs_created": 0,
         "submitted": 0,
         "job_ids": [],
     }
-    if not run_collections and not run_comments and not run_retries:
+    any_run = any([run_collections, run_comments, run_retries, run_liked_meta, run_liked_arch, run_liked_retry])
+    if not any_run:
         _scheduler_log(settings, f"skip: nothing to do (reason={reason})")
-        return empty
+        return {**base, "enabled": False}
 
     now = _now()
     cap = max_items if max_items is not None else settings.expand_max_items
     collection_job_ids: list[int] = []
     comment_job_ids: list[int] = []
     retry_job_ids: list[int] = []
+    liked_job_ids: list[int] = []
     collections_checked = 0
     due_checked = 0
     skipped_frozen = 0
     skipped_recent = 0
+    lm = {"selected": 0, "jobs_created": 0, "job_ids": [], "skipped_active": 0, "skipped_dup": 0}
+    larch = {"selected": 0, "jobs_created": 0, "job_ids": [], "skipped_active": 0, "skipped_dup": 0}
+    lretry = {"selected": 0, "requeued": 0, "job_ids": []}
 
     with session_scope() as s:
         if run_collections:
@@ -200,9 +283,16 @@ def run_once(
             retry_job_ids = _requeue_due_retries(
                 s, now, settings.scheduler_retry_limit_per_run
             )
+        if run_liked_meta:
+            lm = _run_liked_metadata(s, settings, settings.scheduler_liked_metadata_limit_per_run)
+        if run_liked_arch:
+            larch = _run_liked_archive(s, settings, settings.scheduler_liked_archive_limit_per_run)
+        if run_liked_retry:
+            lretry = _run_liked_retry(s, settings, now, settings.scheduler_liked_retry_limit_per_run)
+        liked_job_ids = list(lm["job_ids"]) + list(larch["job_ids"]) + list(lretry["job_ids"])
         s.commit()
 
-    job_ids = collection_job_ids + comment_job_ids + retry_job_ids
+    job_ids = collection_job_ids + comment_job_ids + retry_job_ids + liked_job_ids
     submitted = 0
     for jid in job_ids:
         try:
@@ -219,6 +309,14 @@ def run_once(
         "due_comment_videos_checked": due_checked,
         "comments_jobs_created": len(comment_job_ids),
         "retries_requeued": len(retry_job_ids),
+        "liked_metadata_selected": lm["selected"],
+        "liked_metadata_jobs_created": lm["jobs_created"],
+        "liked_archive_selected": larch["selected"],
+        "liked_archive_jobs_created": larch["jobs_created"],
+        "liked_retry_selected": lretry["selected"],
+        "liked_retry_jobs_requeued": lretry["requeued"],
+        "skipped_active_jobs": lm["skipped_active"] + larch["skipped_active"],
+        "skipped_duplicates": lm["skipped_dup"] + larch["skipped_dup"],
         "skipped_frozen": skipped_frozen,
         "skipped_recent": skipped_recent,
         "jobs_created": len(job_ids),

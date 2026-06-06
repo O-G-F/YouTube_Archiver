@@ -153,6 +153,8 @@ pre.json { color: #c9d1d9; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0; }
 .form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted, #9aa4b2); }
 .form-grid input, .form-grid select { padding: 6px 8px; }
+.btn-link { align-self: center; font-size: 13px; color: var(--accent, #4f9cf9); text-decoration: none; }
+.btn-link:hover { text-decoration: underline; }
 
 /* ---- Phase 5B: watch / player layout ---- */
 .watch-layout { display: grid; grid-template-columns: minmax(0,1fr) 340px; gap: 22px; align-items: start; }
