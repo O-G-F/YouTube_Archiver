@@ -62,6 +62,7 @@ export default function JobDetail() {
     | undefined;
   const recommendations = (meta.recommendations as string[] | undefined) ?? [];
   const isLikedArchive = meta.source_action === "liked_archive";
+  const schedulerRunId = meta.scheduler_run_id as string | undefined;
 
   return (
     <div>
@@ -97,6 +98,14 @@ export default function JobDetail() {
           {meta.requested_profile && meta.requested_profile !== "metadata_only"
             ? " (downloads the video body)"
             : " (metadata only, no body)"}
+          {schedulerRunId && (
+            <>
+              {" "}· scheduler run{" "}
+              <Link to={`/jobs?scheduler_run_id=${schedulerRunId}`}>
+                <code>{schedulerRunId.slice(0, 10)}</code>
+              </Link>
+            </>
+          )}
           .
         </div>
       )}

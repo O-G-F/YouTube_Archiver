@@ -44,6 +44,7 @@ subtitles_app = typer.Typer(help="Subtitles-only refresh (no body re-download)."
 profiles_app = typer.Typer(help="Download profiles.")
 collections_app = typer.Typer(help="Inspect and re-crawl playlist/channel collections.")
 scheduler_app = typer.Typer(help="Run the collection re-crawl scheduler.")
+scheduler_runs_app = typer.Typer(help="Scheduler run history (Phase 7E).")
 takeout_app = typer.Typer(help="Google Takeout preview / import.")
 watch_history_app = typer.Typer(help="Inspect imported watch history.")
 search_history_app = typer.Typer(help="Inspect imported search history.")
@@ -63,6 +64,7 @@ app.add_typer(subtitles_app, name="subtitles")
 app.add_typer(profiles_app, name="profiles")
 app.add_typer(collections_app, name="collections")
 app.add_typer(scheduler_app, name="scheduler")
+scheduler_app.add_typer(scheduler_runs_app, name="runs")
 app.add_typer(takeout_app, name="takeout")
 app.add_typer(watch_history_app, name="watch-history")
 app.add_typer(search_history_app, name="search-history")
@@ -1218,6 +1220,88 @@ def scheduler_run() -> None:
     run_forever(get_settings())
 
 
+@scheduler_runs_app.callback(invoke_without_command=True)
+def scheduler_runs_list(
+    ctx: typer.Context,
+    limit: int = typer.Option(20, "--limit"),
+    run_type: str = typer.Option("", "--type", help="filter by run_type"),
+) -> None:
+    """List recent scheduler runs (Phase 7E)."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from app.services import scheduler as sch
+
+    with session_scope() as s:
+        runs = sch.list_runs(s, run_type=(run_type or None), limit=limit)
+        if not runs:
+            typer.echo("No scheduler runs recorded yet.")
+            return
+        for r in runs:
+            typer.echo(
+                f"  {r.run_id}  {r.run_type:<16} {r.status:<16} "
+                f"created={r.jobs_created} skipped(active/dup/backoff)="
+                f"{r.skipped_active_jobs}/{r.skipped_duplicates}/{r.skipped_backoff} "
+                f"body {r.body_count_before}->{r.body_count_after}  {r.started_at}"
+            )
+
+
+@scheduler_runs_app.command("show")
+def scheduler_runs_show(run_id: str = typer.Argument(...)) -> None:
+    """Show one scheduler run + its jobs."""
+    from app.services import scheduler as sch
+
+    with session_scope() as s:
+        r = sch.get_run(s, run_id)
+        if r is None:
+            typer.echo(f"run {run_id} not found")
+            raise typer.Exit(code=1)
+        typer.echo(f"== scheduler run {r.run_id} ==")
+        typer.echo(f"  type={r.run_type} status={r.status} reason={r.reason}")
+        typer.echo(f"  started={r.started_at} finished={r.finished_at}")
+        typer.echo(f"  selected={r.selected_count} created={r.jobs_created} submitted={r.jobs_submitted}")
+        typer.echo(f"  skipped active/dup/backoff: {r.skipped_active_jobs}/{r.skipped_duplicates}/{r.skipped_backoff}")
+        typer.echo(f"  body {r.body_count_before} -> {r.body_count_after}")
+        typer.echo(f"  retryable/failed/partial/success(body): {r.retryable_count}/{r.failed_count}/{r.partial_count}/{r.success_count}")
+        jobs = sch.run_jobs(s, run_id)
+        typer.echo(f"  jobs ({len(jobs)}): " + ", ".join(f"#{j.id}({j.profile_name},{j.status})" for j in jobs[:20]))
+
+
+@scheduler_app.command("stats")
+def scheduler_stats_cmd(lookback: int = typer.Option(50, "--lookback")) -> None:
+    """Aggregate recent scheduler runs (status rates, totals)."""
+    from app.services import scheduler as sch
+
+    with session_scope() as s:
+        st = sch.scheduler_stats(s, lookback=lookback)
+    typer.echo("== scheduler stats ==")
+    typer.echo(f"  runs considered: {st['runs_considered']}")
+    typer.echo(f"  by type: {st['by_type']}")
+    typer.echo(f"  by status: {st['by_status']}")
+    typer.echo(f"  jobs created/submitted: {st['jobs_created']}/{st['jobs_submitted']}")
+    typer.echo(f"  skipped active/dup/backoff: {st['skipped_active_jobs']}/{st['skipped_duplicates']}/{st['skipped_backoff']}")
+    typer.echo(f"  last run: {st['last_run_id']} ({st['last_run_type']}, {st['last_run_status']}) at {st['last_run_at']}")
+
+
+@scheduler_app.command("recommend-settings")
+def scheduler_recommend_settings_cmd(lookback: int = typer.Option(30, "--lookback")) -> None:
+    """Suggest safe archive/retry limits from recent results (does NOT apply)."""
+    from app.services import scheduler as sch
+
+    with session_scope() as s:
+        rec = sch.recommend_settings(s, get_settings(), lookback=lookback)
+    typer.echo("== recommended settings (suggestion only — not applied) ==")
+    typer.echo(f"  based on: {rec['based_on']}")
+    typer.echo(f"  rates: success={rec['rates'].get('success_rate')} throttle={rec['rates'].get('throttle_rate')}")
+    cur, rc = rec["current"], rec["recommended"]
+    for k in rc:
+        flag = "  <= CHANGE" if rc[k] != cur.get(k) else ""
+        typer.echo(f"  {k}: {cur.get(k)} -> {rc[k]}{flag}")
+    typer.echo("  reasons:")
+    for r in rec["reasons"]:
+        typer.echo(f"   - {r}")
+    typer.echo(f"  {rec['note']}")
+
+
 # --------------------------------------------------------------------------- #
 # takeout
 # --------------------------------------------------------------------------- #
@@ -1640,9 +1724,27 @@ def queue_status_cmd() -> None:
 
 
 @liked_videos_app.command("progress")
-def liked_videos_progress() -> None:
+def liked_videos_progress(
+    history: bool = typer.Option(False, "--history", help="Show progress snapshots over time."),
+) -> None:
     """Show liked-archive progress (metadata/body saved, retryable, by source)."""
     from app.services import liked_archive as la
+
+    if history:
+        from app.services import scheduler as sch
+
+        with session_scope() as s:
+            points = sch.progress_history(s, limit=30)
+        if not points:
+            typer.echo("No progress history yet (run a scheduler pass first).")
+            return
+        typer.echo("== liked progress history (oldest -> newest) ==")
+        for p in points:
+            typer.echo(
+                f"  {p['at']}  {p['run_type']:<16} meta {p['metadata_fetched']}/{p['total_liked']} "
+                f"body {p['body_saved']}/{p['total_liked']} retryable={p['retryable_liked_jobs']}"
+            )
+        return
 
     with session_scope() as s:
         p = la.progress(s, get_settings())

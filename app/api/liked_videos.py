@@ -20,6 +20,8 @@ from app.schemas import (
     LikedArchiveEnqueueOut,
     LikedArchivePlanOut,
     LikedArchiveRequest,
+    LikedProgressHistoryOut,
+    LikedProgressHistoryPoint,
     LikedProgressOut,
     LikedRetryFailedOut,
     LikedRetryFailedRequest,
@@ -169,6 +171,17 @@ def liked_videos_stats(db: Session = Depends(get_db)) -> LikedVideoStatsOut:
 def liked_progress(db: Session = Depends(get_db)) -> LikedProgressOut:
     """Liked-archive progress dashboard data (no personal data / raw_json)."""
     return LikedProgressOut(**la.progress(db, get_settings()))
+
+
+@router.get("/progress/history", response_model=LikedProgressHistoryOut)
+def liked_progress_history(
+    db: Session = Depends(get_db), limit: int = Query(default=50, le=500)
+) -> LikedProgressHistoryOut:
+    """Liked-progress snapshots over time (from scheduler runs; no raw_json)."""
+    from app.services import scheduler as scheduler_svc
+
+    points = [LikedProgressHistoryPoint(**p) for p in scheduler_svc.progress_history(db, limit=limit)]
+    return LikedProgressHistoryOut(points=points)
 
 
 @router.post("/archive-plan", response_model=LikedArchivePlanOut)

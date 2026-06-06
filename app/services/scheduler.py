@@ -15,6 +15,7 @@ Scheduler-created jobs are tagged ``meta.scheduled_by`` and carry the resolved
 from __future__ import annotations
 
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -148,7 +149,7 @@ def _active_liked_body_count(s) -> int:
     return n
 
 
-def _run_liked_metadata(s, settings: Settings, limit: int) -> dict:
+def _run_liked_metadata(s, settings: Settings, limit: int, run_id: str) -> dict:
     """Scheduler pass: enqueue metadata_only for liked videos missing metadata."""
     from app.services import liked_archive as la
 
@@ -156,13 +157,17 @@ def _run_liked_metadata(s, settings: Settings, limit: int) -> dict:
         s, settings,
         filters=la.LikedFilters(missing_metadata=True),
         limit=limit, submit=False,
-        extra_meta={"scheduled_by": "scheduler_liked_metadata", "selected_by": "missing_metadata"},
+        extra_meta={
+            "scheduled_by": "scheduler_liked_metadata",
+            "selected_by": "missing_metadata",
+            "scheduler_run_id": run_id,
+        },
     )
     return {"selected": r.selected_count, "jobs_created": r.jobs_created,
             "job_ids": list(r.job_ids), "skipped_active": 0, "skipped_dup": r.skipped_existing_job}
 
 
-def _run_liked_archive(s, settings: Settings, limit: int) -> dict:
+def _run_liked_archive(s, settings: Settings, limit: int, run_id: str) -> dict:
     """Scheduler pass: enqueue a small BODY archive (downloads bodies)."""
     from app.services import liked_archive as la
 
@@ -178,23 +183,126 @@ def _run_liked_archive(s, settings: Settings, limit: int) -> dict:
         limit=limit,
         profile=settings.effective_scheduler_liked_archive_profile,
         submit=False,
-        extra_meta={"scheduled_by": "scheduler_liked_archive", "selected_by": "missing_body"},
+        extra_meta={
+            "scheduled_by": "scheduler_liked_archive",
+            "selected_by": "missing_body",
+            "scheduler_run_id": run_id,
+        },
     )
     return {"selected": r.selected_count, "jobs_created": r.jobs_created,
             "job_ids": list(r.job_ids), "skipped_active": 0, "skipped_dup": r.skipped_existing_job}
 
 
-def _run_liked_retry(s, settings: Settings, now: datetime, limit: int) -> dict:
+def _run_liked_retry(s, settings: Settings, now: datetime, limit: int, run_id: str) -> dict:
     """Scheduler pass: re-queue retryable liked jobs whose backoff has elapsed."""
     from app.services import liked_archive as la
 
     candidates = la.retryable_liked(s, settings, limit=limit, now=now)
+    # count retryable jobs still inside their backoff window (skipped this pass)
+    all_retryable = la.retryable_liked(s, settings, limit=10_000)  # now=None -> ignores backoff
+    skipped_backoff = sum(
+        1 for j, _c in all_retryable if j.next_retry_at is not None and j.next_retry_at > now
+    )
     job_ids: list[int] = []
     for j, _c in candidates:
-        j.meta = {**(j.meta or {}), "scheduled_by": "scheduler_liked_retry", "selected_by": "retryable"}
+        j.meta = {
+            **(j.meta or {}),
+            "scheduled_by": "scheduler_liked_retry",
+            "selected_by": "retryable",
+            "scheduler_run_id": run_id,
+        }
         jobs_svc.retry_job(s, j)
         job_ids.append(j.id)
-    return {"selected": len(candidates), "requeued": len(job_ids), "job_ids": job_ids}
+    return {"selected": len(candidates), "requeued": len(job_ids),
+            "job_ids": job_ids, "skipped_backoff": skipped_backoff}
+
+
+def _body_count(s) -> int:
+    from app.models import MediaFile
+
+    return int(
+        s.scalar(
+            select(func.count(MediaFile.id)).where(MediaFile.media_type.in_(("video", "audio")))
+        )
+        or 0
+    )
+
+
+def _liked_snapshot(settings: Settings) -> dict:
+    """Point-in-time {progress, queue, body} snapshot (own session; fail-safe)."""
+    from app.services import liked_archive as la
+    from app.services import queue_health
+
+    try:
+        with session_scope() as s:
+            return {
+                "progress": la.progress(s, settings),
+                "queue": queue_health.queue_status(s),
+                "body": _body_count(s),
+            }
+    except Exception:  # noqa: BLE001
+        logger.exception("scheduler: liked snapshot failed")
+        return {"progress": {}, "queue": {}, "body": 0}
+
+
+def _record_scheduler_run(s, settings, *, run_id, run_type, reason, started_at, summary,
+                          progress_before, progress_after, queue_before, queue_after,
+                          body_before, body_after, skipped_backoff) -> None:
+    """Persist a SchedulerRun row. Fail-safe: never breaks job processing."""
+    from app.models import SchedulerRun
+
+    try:
+        liked_created = (
+            summary["liked_metadata_jobs_created"]
+            + summary["liked_archive_jobs_created"]
+            + summary["liked_retry_jobs_requeued"]
+        )
+        non_liked_created = summary["collection_jobs_created"] + summary["comments_jobs_created"]
+        total_created = liked_created + non_liked_created
+        skipped = summary["skipped_active_jobs"] + summary["skipped_duplicates"] + skipped_backoff
+        # status: failed only if the pass errored (handled by caller); else
+        # partial_success when something was skipped or retryable work remains.
+        if total_created == 0 and skipped > 0:
+            status = "partial_success"
+        elif (progress_after or {}).get("retryable_liked_jobs", 0) > 0 and run_type in (
+            "liked_archive", "liked_retry", "all"
+        ):
+            status = "partial_success"
+        else:
+            status = "success"
+        run = SchedulerRun(
+            run_id=run_id,
+            run_type=run_type,
+            reason=reason,
+            started_at=started_at,
+            finished_at=_now(),
+            status=status,
+            selected_count=summary["liked_metadata_selected"]
+            + summary["liked_archive_selected"]
+            + summary["liked_retry_selected"],
+            jobs_created=total_created,
+            jobs_submitted=summary["submitted"],
+            skipped_active_jobs=summary["skipped_active_jobs"],
+            skipped_duplicates=summary["skipped_duplicates"],
+            skipped_backoff=skipped_backoff,
+            retryable_count=(progress_after or {}).get("retryable_liked_jobs", 0),
+            failed_count=(progress_after or {}).get("failed_liked_jobs", 0),
+            partial_count=(progress_after or {}).get("partial_liked_jobs", 0),
+            success_count=(progress_after or {}).get("body_saved", 0),
+            body_count_before=body_before,
+            body_count_after=body_after,
+            meta={
+                "summary": summary,
+                "progress_before": progress_before,
+                "progress_after": progress_after,
+                "queue_before": queue_before,
+                "queue_after": queue_after,
+            },
+        )
+        s.add(run)
+        s.flush()
+    except Exception:  # noqa: BLE001 - recording must never break the run
+        logger.exception("scheduler: failed to record SchedulerRun %s", run_id)
 
 
 def run_once(
@@ -255,6 +363,8 @@ def run_once(
         return {**base, "enabled": False}
 
     now = _now()
+    started_at = now
+    run_id = uuid.uuid4().hex[:16]
     cap = max_items if max_items is not None else settings.expand_max_items
     collection_job_ids: list[int] = []
     comment_job_ids: list[int] = []
@@ -266,7 +376,18 @@ def run_once(
     skipped_recent = 0
     lm = {"selected": 0, "jobs_created": 0, "job_ids": [], "skipped_active": 0, "skipped_dup": 0}
     larch = {"selected": 0, "jobs_created": 0, "job_ids": [], "skipped_active": 0, "skipped_dup": 0}
-    lretry = {"selected": 0, "requeued": 0, "job_ids": []}
+    lretry = {"selected": 0, "requeued": 0, "job_ids": [], "skipped_backoff": 0}
+    # run-type for history (single pass -> its name; multiple -> "all")
+    active_types = [
+        t for t, on in [
+            ("collections", run_collections), ("comments", run_comments),
+            ("liked_metadata", run_liked_meta), ("liked_archive", run_liked_arch),
+            ("liked_retry", run_liked_retry),
+        ] if on
+    ]
+    run_type = active_types[0] if len(active_types) == 1 else "all"
+
+    snap_before = _liked_snapshot(settings)
 
     with session_scope() as s:
         if run_collections:
@@ -284,11 +405,11 @@ def run_once(
                 s, now, settings.scheduler_retry_limit_per_run
             )
         if run_liked_meta:
-            lm = _run_liked_metadata(s, settings, settings.scheduler_liked_metadata_limit_per_run)
+            lm = _run_liked_metadata(s, settings, settings.scheduler_liked_metadata_limit_per_run, run_id)
         if run_liked_arch:
-            larch = _run_liked_archive(s, settings, settings.scheduler_liked_archive_limit_per_run)
+            larch = _run_liked_archive(s, settings, settings.scheduler_liked_archive_limit_per_run, run_id)
         if run_liked_retry:
-            lretry = _run_liked_retry(s, settings, now, settings.scheduler_liked_retry_limit_per_run)
+            lretry = _run_liked_retry(s, settings, now, settings.scheduler_liked_retry_limit_per_run, run_id)
         liked_job_ids = list(lm["job_ids"]) + list(larch["job_ids"]) + list(lretry["job_ids"])
         s.commit()
 
@@ -322,10 +443,223 @@ def run_once(
         "jobs_created": len(job_ids),
         "submitted": submitted,
         "job_ids": job_ids,
+        "run_id": run_id,
     }
+
+    # Record the run + a progress/queue snapshot (Phase 7E). Fail-safe.
+    snap_after = _liked_snapshot(settings)
+    try:
+        with session_scope() as s:
+            _record_scheduler_run(
+                s, settings,
+                run_id=run_id, run_type=run_type, reason=reason, started_at=started_at,
+                summary=summary,
+                progress_before=snap_before.get("progress"), progress_after=snap_after.get("progress"),
+                queue_before=snap_before.get("queue"), queue_after=snap_after.get("queue"),
+                body_before=snap_before.get("body", 0), body_after=snap_after.get("body", 0),
+                skipped_backoff=lretry.get("skipped_backoff", 0),
+            )
+            s.commit()
+    except Exception:  # noqa: BLE001 - never let history recording break a run
+        logger.exception("scheduler: run recording failed (run_id=%s)", run_id)
+
+    summary["skipped_backoff"] = lretry.get("skipped_backoff", 0)
     _scheduler_log(settings, f"run_once {summary}")
     logger.info("scheduler run_once: %s", summary)
     return summary
+
+
+def list_runs(s, *, run_type: str | None = None, limit: int = 50) -> list:
+    from app.models import SchedulerRun
+
+    stmt = select(SchedulerRun).order_by(SchedulerRun.id.desc())
+    if run_type:
+        stmt = stmt.where(SchedulerRun.run_type == run_type)
+    return list(s.scalars(stmt.limit(limit)))
+
+
+def get_run(s, run_id: str):
+    from app.models import SchedulerRun
+
+    return s.scalar(select(SchedulerRun).where(SchedulerRun.run_id == run_id))
+
+
+def run_jobs(s, run_id: str, *, limit: int = 500) -> list:
+    """Jobs created by a scheduler run (job.meta.scheduler_run_id == run_id)."""
+    from app.models import Job
+
+    out = []
+    for j in s.scalars(select(Job).order_by(Job.id.desc()).limit(2000)):
+        if (j.meta or {}).get("scheduler_run_id") == run_id:
+            out.append(j)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def progress_history(s, *, limit: int = 50) -> list[dict]:
+    """Liked-progress snapshots over time (from scheduler runs that captured one)."""
+    from app.models import SchedulerRun
+
+    runs = list(s.scalars(select(SchedulerRun).order_by(SchedulerRun.id.desc()).limit(limit)))
+    points: list[dict] = []
+    for r in reversed(runs):  # chronological
+        prog = ((r.meta or {}).get("progress_after")) or {}
+        if not prog:
+            continue
+        points.append({
+            "run_id": r.run_id,
+            "run_type": r.run_type,
+            "at": (r.finished_at or r.started_at).isoformat() if (r.finished_at or r.started_at) else None,
+            "total_liked": prog.get("total_liked", 0),
+            "metadata_fetched": prog.get("metadata_fetched", 0),
+            "metadata_missing": prog.get("metadata_missing", 0),
+            "body_saved": prog.get("body_saved", 0),
+            "body_missing": prog.get("body_missing", 0),
+            "retryable_liked_jobs": prog.get("retryable_liked_jobs", 0),
+            "failed_liked_jobs": prog.get("failed_liked_jobs", 0),
+            "partial_liked_jobs": prog.get("partial_liked_jobs", 0),
+            "active_archive_jobs": prog.get("active_archive_jobs", 0),
+        })
+    return points
+
+
+def scheduler_stats(s, *, lookback: int = 50) -> dict:
+    """Aggregate recent scheduler runs (status rates, totals, by run_type)."""
+    from app.models import SchedulerRun
+
+    runs = list(s.scalars(select(SchedulerRun).order_by(SchedulerRun.id.desc()).limit(lookback)))
+    total = len(runs)
+    by_type: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    jobs_created = jobs_submitted = skipped_active = skipped_dup = skipped_backoff = 0
+    for r in runs:
+        by_type[r.run_type] = by_type.get(r.run_type, 0) + 1
+        by_status[r.status] = by_status.get(r.status, 0) + 1
+        jobs_created += r.jobs_created
+        jobs_submitted += r.jobs_submitted
+        skipped_active += r.skipped_active_jobs
+        skipped_dup += r.skipped_duplicates
+        skipped_backoff += r.skipped_backoff
+    last = runs[0] if runs else None
+    return {
+        "runs_considered": total,
+        "by_type": by_type,
+        "by_status": by_status,
+        "jobs_created": jobs_created,
+        "jobs_submitted": jobs_submitted,
+        "skipped_active_jobs": skipped_active,
+        "skipped_duplicates": skipped_dup,
+        "skipped_backoff": skipped_backoff,
+        "last_run_id": last.run_id if last else None,
+        "last_run_type": last.run_type if last else None,
+        "last_run_status": last.status if last else None,
+        "last_run_at": last.started_at.isoformat() if last else None,
+    }
+
+
+def _archive_outcome_rates(s, *, scan: int = 300) -> dict:
+    """Outcome rates for liked-archive BODY jobs (from classification)."""
+    from app.models import Job
+    from app.services.job_classify import classify_job
+
+    finished = rate_limited = incomplete = success = failed = 0
+    for j in s.scalars(select(Job).where(Job.type == "download").order_by(Job.id.desc()).limit(scan)):
+        meta = j.meta or {}
+        if meta.get("source_action") != "liked_archive" or j.profile_name == "metadata_only":
+            continue
+        if j.status in ("queued", "running"):
+            continue
+        finished += 1
+        if j.status == "success":
+            success += 1
+        else:
+            failed += 1
+        reasons = classify_job(j).get("reasons", [])
+        if "rate_limited" in reasons:
+            rate_limited += 1
+        if "incomplete_data" in reasons:
+            incomplete += 1
+    return {
+        "finished": finished,
+        "success": success,
+        "failed": failed,
+        "rate_limited": rate_limited,
+        "incomplete_data": incomplete,
+        "success_rate": round(success / finished, 3) if finished else None,
+        "throttle_rate": round((rate_limited + incomplete) / finished, 3) if finished else None,
+    }
+
+
+def recommend_settings(s, settings: Settings, *, lookback: int = 30) -> dict:
+    """Suggest safe archive/retry limits from recent results. NEVER auto-applies."""
+    rates = _archive_outcome_rates(s)
+    progress = None
+    try:
+        from app.services import liked_archive as la
+
+        progress = la.progress(s, settings)
+    except Exception:  # noqa: BLE001
+        progress = {}
+    from app.services import liked_archive as la2
+
+    active_body = la2.active_liked_archive_count(s)
+    retryable = (progress or {}).get("retryable_liked_jobs", 0)
+
+    cur_archive = settings.scheduler_liked_archive_limit_per_run
+    cur_retry = settings.scheduler_liked_retry_limit_per_run
+    cur_delay = settings.liked_archive_job_delay_seconds or settings.download_job_delay_seconds or 0
+
+    rec_archive = cur_archive
+    rec_retry = cur_retry
+    rec_delay = cur_delay
+    reasons: list[str] = []
+
+    throttle = rates["throttle_rate"]
+    success_rate = rates["success_rate"]
+    if throttle is not None and throttle >= 0.3:
+        rec_archive = 1
+        rec_delay = max(int(cur_delay) or 0, 300)
+        reasons.append(
+            f"Throttle rate {int(throttle*100)}% (429/incomplete) is high → archive limit 1, "
+            f"longer delay (>= {rec_delay}s)."
+        )
+    elif success_rate is not None and success_rate >= 0.8 and active_body == 0:
+        rec_archive = min(cur_archive + 1, 5)
+        reasons.append(
+            f"Success rate {int(success_rate*100)}% is good and no active body jobs → "
+            f"archive limit may rise to {rec_archive} (cap 5)."
+        )
+    else:
+        reasons.append("Not enough signal to change the archive limit → keep current.")
+
+    if active_body > 0:
+        reasons.append("Active body jobs in flight → keep SUPPRESS_WHEN_ACTIVE on.")
+    if retryable >= 5:
+        rec_retry = min(cur_retry, 2)
+        reasons.append(
+            f"{retryable} retryable liked jobs → keep retry limit small ({rec_retry}); "
+            f"raise DOWNLOAD_RETRY_BACKOFF_SECONDS so retries wait longer."
+        )
+
+    return {
+        "based_on": {"finished_archive_jobs": rates["finished"], "retryable": retryable, "active_body_jobs": active_body},
+        "rates": rates,
+        "current": {
+            "scheduler_liked_archive_limit_per_run": cur_archive,
+            "scheduler_liked_retry_limit_per_run": cur_retry,
+            "liked_archive_job_delay_seconds": cur_delay,
+            "scheduler_liked_suppress_when_active": settings.scheduler_liked_suppress_when_active,
+        },
+        "recommended": {
+            "scheduler_liked_archive_limit_per_run": rec_archive,
+            "scheduler_liked_retry_limit_per_run": rec_retry,
+            "liked_archive_job_delay_seconds": rec_delay,
+            "scheduler_liked_suppress_when_active": True,
+        },
+        "reasons": reasons,
+        "note": "Recommendation only — settings are NOT changed automatically.",
+    }
 
 
 def run_forever(settings: Settings | None = None) -> None:

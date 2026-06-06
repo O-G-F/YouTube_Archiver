@@ -25,6 +25,7 @@ export default function Jobs() {
   const [status, setStatus] = useState("");
   const [type, setType] = useState("");
   const [sourceAction, setSourceAction] = useState(params.get("source_action") ?? "");
+  const schedulerRunId = params.get("scheduler_run_id") ?? "";
   const [retryableOnly, setRetryableOnly] = useState(false);
   const [reason, setReason] = useState("");
   const [auto, setAuto] = useState(true);
@@ -47,9 +48,10 @@ export default function Jobs() {
             status: status || undefined,
             type: type || undefined,
             source_action: sourceAction || undefined,
+            scheduler_run_id: schedulerRunId || undefined,
             limit: 100,
           }),
-    [status, type, sourceAction, retryableOnly, reason],
+    [status, type, sourceAction, schedulerRunId, retryableOnly, reason],
     auto ? 6000 : undefined
   );
 
@@ -85,6 +87,21 @@ export default function Jobs() {
     <div>
       <h1 className="page-title">Jobs</h1>
       <p className="page-sub">All download / expand / refresh jobs (most recent first).</p>
+      {schedulerRunId && (
+        <div className="flash">
+          Filtered to scheduler run <code>{schedulerRunId.slice(0, 12)}</code>.{" "}
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              params.delete("scheduler_run_id");
+              setParams(params, { replace: true });
+            }}
+          >
+            clear
+          </a>
+        </div>
+      )}
 
       <div className="toolbar">
         <div className="field inline">

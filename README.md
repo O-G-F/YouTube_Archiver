@@ -481,7 +481,12 @@ archiver scheduler run-once --liked-metadata  # liked metadata（本体非保存
 archiver scheduler run-once --liked-archive    # liked body archive（本体DL・少量）【Phase 7D】
 archiver scheduler run-once --liked-retry      # liked retryable 再queue（backoff後）【Phase 7D】
 archiver liked-videos progress                 # 進捗集計【Phase 7D】
+archiver liked-videos progress --history       # progress 時系列【Phase 7E】
 archiver queue status                          # キュー在庫（type/source_action別）【Phase 7D】
+archiver scheduler runs --limit 20             # 実行履歴一覧【Phase 7E】
+archiver scheduler runs show RUN_ID            # run 詳細 + jobs【Phase 7E】
+archiver scheduler stats                       # 実行集計【Phase 7E】
+archiver scheduler recommend-settings          # 安全寄り推奨値（自動変更なし）【Phase 7E】
 # API:
 curl -s -XPOST localhost:8000/api/scheduler/run-once -H 'content-type: application/json' \
   -d '{"collections":true,"comments":true}'
@@ -1033,6 +1038,53 @@ queued/running、`by_type`、`by_source_action`、oldest queued、（取得で�
 
 - scheduler は**既定 OFF・小 limit・active 抑制・backoff 尊重**で大量 DL を避ける設計。progress/queue API は件数のみで raw_json/secret を返さない。`metadata_only` の**本体非保存**を維持し、body DL は UI/CLI/API で明示。
 
+### Scheduler run history / progress 時系列 / adaptive throttle（Phase 7E）
+
+Phase 7D の「現在状態」に加え、**scheduler 実行履歴**を `scheduler_runs` テーブルに保存し、進捗の**時系列**と**安全寄りの推奨値**を確認できるようにした層です。
+
+#### run history（`scheduler_runs`）
+
+`run_once` 1 回ごとに 1 行を記録：`run_id`(一意) / `run_type`(liked_metadata|liked_archive|liked_retry|comments|collections|all) / `status`(success|partial_success|failed) / selected・created・submitted / `skipped_active_jobs`・`skipped_duplicates`・`skipped_backoff` / `retryable_count`・`failed_count`・`partial_count`・`success_count` / `body_count_before`→`after` / `meta`(summary + progress/queue スナップショット)。記録失敗は**本体ジョブを壊さない**（fail-safe・ログのみ）。
+
+```bash
+archiver scheduler runs --limit 20         # GET /api/scheduler/runs
+archiver scheduler runs show RUN_ID        # GET /api/scheduler/runs/{id} (+ /jobs)
+archiver scheduler stats                   # GET /api/scheduler/stats
+```
+
+#### job ↔ run 連携
+
+scheduler が作るジョブは `job.meta.scheduler_run_id`（＋ `scheduled_by`/`selected_by`）を保存。Job Detail に scheduler run リンク、`GET /api/jobs?scheduler_run_id=...`（UI: Jobs に絞り込みバナー）で run のジョブを一覧。
+
+#### progress 時系列
+
+run 完了時に liked progress スナップショット（total/metadata/body/retryable…）を run の `meta` に保存。`GET /api/liked-videos/progress/history`（`archiver liked-videos progress --history`、UI: Liked Videos の **History タブ**）で時系列を**表**表示（個人データ/raw_json は返さない）。
+
+#### adaptive throttle（推奨のみ・自動変更しない）
+
+```bash
+archiver scheduler recommend-settings      # POST /api/scheduler/recommend-settings
+```
+
+直近の liked_archive 実 DL ジョブの **成功率 / throttle 率（429+incomplete）**・active body 数・retryable 数から、安全寄りの値を**提案だけ**します（**設定は自動変更しません**）：
+
+| 観測 | 推奨 |
+|---|---|
+| throttle 率 ≥ 30%（429/incomplete 多い） | `SCHEDULER_LIKED_ARCHIVE_LIMIT_PER_RUN=1`・`LIKED_ARCHIVE_JOB_DELAY_SECONDS` を長く（≥300s） |
+| 成功率 ≥ 80% かつ active body=0 | archive limit を +1（上限 5）まで微増可 |
+| active body job あり | `SCHEDULER_LIKED_SUPPRESS_WHEN_ACTIVE` を維持 |
+| retryable ≥ 5 | retry limit を小さく・`DOWNLOAD_RETRY_BACKOFF_SECONDS` を長く |
+
+**429 が多い時の読み方**: throttle 率が高い＝YouTube 側の制限。limit を 1 に・delay を伸ばし、`--liked-retry` は backoff 経過後に少しずつ。成功率が戻るまで body archive を増やさないこと。
+
+#### scheduler を安全に使う推奨運用
+
+1. `scheduler stats` / `runs` で直近の傾向確認 → 2. `recommend-settings` で推奨値を確認（手動で `.env` に反映するか判断）→ 3. `--liked-metadata`（多め）→ `--liked-archive`（1〜3）→ `--liked-retry`（backoff 後）→ 4. `progress --history` で前進を確認。常駐は各 `SCHEDULER_LIKED_*_ENABLED=true` ＋長め interval。
+
+### セキュリティ（7E）
+
+- run history / progress history / stats / recommend は**件数・集計のみ**で raw_json/secret を返さない。adaptive throttle は**提案だけで設定を自動変更しない**。run 記録は fail-safe（失敗してもジョブ処理継続）。`metadata_only` の**本体非保存**・body DL の明示を維持。
+
 ---
 
 ## ストレージ構成
@@ -1163,6 +1215,13 @@ archiver live-chat stats VIDEO_ID
 | GET | `/api/scheduler/status` | scheduler 設定と対象数（collections + comments） |
 | POST | `/api/scheduler/run-once` | 手動で1パス実行（`{"collections","comments","liked_metadata","liked_archive","liked_retry","max_items"}`、liked サマリ含む）【Phase 2B/7D】 |
 | GET | `/api/queue/status` | キュー在庫（queued/running・by_type・by_source_action・oldest・worker数）【Phase 7D】 |
+| GET | `/api/scheduler/runs` | scheduler 実行履歴一覧（`?run_type=&limit=`）【Phase 7E】 |
+| GET | `/api/scheduler/runs/{run_id}` | 1 run の詳細（meta に progress/queue スナップショット）【Phase 7E】 |
+| GET | `/api/scheduler/runs/{run_id}/jobs` | その run が作成したジョブ一覧【Phase 7E】 |
+| GET | `/api/scheduler/stats` | 直近 run の集計（status/type 別・skip 合計）【Phase 7E】 |
+| POST | `/api/scheduler/recommend-settings` | 安全寄り推奨値（`{lookback}`、**自動変更なし**）【Phase 7E】 |
+| GET | `/api/liked-videos/progress/history` | progress 時系列スナップショット（raw_json 非返却）【Phase 7E】 |
+| GET | `/api/jobs?scheduler_run_id=` | scheduler run 単位でジョブ絞り込み【Phase 7E】 |
 | POST | `/api/takeout/preview` | Takeout ZIP の preview（`{"path"}`、保存なし） |
 | POST | `/api/takeout/import` | 視聴履歴 import（`{"path","limit","dry_run"}`） |
 | POST | `/api/takeout/import-subscriptions` | 登録チャンネル import |
@@ -1325,7 +1384,8 @@ live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_e
   - `0008` `liked_videos` テーブル追加（`source`/`youtube_video_id`/`title`/`channel_title`/`url`/`liked_at`/`video_id`(FK)/`raw_json`/`created_at`、`(source, youtube_video_id)` ユニーク、各種 index）（Phase 6A・SQLite/PostgreSQL 両対応）
   - Phase 6B は**マイグレーション追加なし**（既存 `liked_videos.source` を `takeout_my_activity`/`takeout_youtube`/`youtube_data_api` で運用、channel_id は `raw_json` + Video stub へ反映）
   - `0009` `jobs` に `retry_count`(server_default 0) / `retry_of_job_id` / `next_retry_at`(index)（Phase 7A・retry/backoff。SQLite 互換のため自己参照 FK はプレーン列で追加）
-  - Phase 7B / 7C は**マイグレーション追加なし**（7B 診断結果は `job.meta.diagnostic`、7C liked archive は既存 `Job`/`MediaFile`/`LikedVideo` を再利用し `job.meta.source_action=liked_archive` でタグ付け）
+  - Phase 7B / 7C / 7D は**マイグレーション追加なし**（7B 診断結果は `job.meta.diagnostic`、7C/7D liked archive は既存 `Job`/`MediaFile`/`LikedVideo` を再利用し `job.meta.source_action`/`scheduled_by`/`selected_by` でタグ付け）
+  - `a1b2c3d4e5f6` `scheduler_runs` テーブル新規（Phase 7E・実行履歴 + progress/queue スナップショット。整数カウント列は `server_default '0'` で PostgreSQL/SQLite 両対応）
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
 - 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 

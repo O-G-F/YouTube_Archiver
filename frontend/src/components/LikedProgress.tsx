@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
 import { ErrorBox, Loading } from "./ui";
+import { SchedulerHistory } from "./SchedulerHistory";
 import type { SchedulerRunOnceResult } from "../api/types";
 
 function pct(n: number, d: number): string {
@@ -13,6 +14,7 @@ function pct(n: number, d: number): string {
 export function LikedProgressDashboard({ onChanged }: { onChanged?: () => void }) {
   const progress = useFetch(() => api.likedProgress(), []);
   const queue = useFetch(() => api.queueStatus(), []);
+  const [tab, setTab] = useState<"now" | "history">("now");
   const [busy, setBusy] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -58,10 +60,15 @@ export function LikedProgressDashboard({ onChanged }: { onChanged?: () => void }
     <div className="panel">
       <div className="spread">
         <h2>Liked archive progress</h2>
-        <button onClick={reloadAll}>↻</button>
+        <div className="tabs">
+          <button className={tab === "now" ? "active" : ""} onClick={() => setTab("now")}>Now</button>
+          <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>History</button>
+          <button className="right" onClick={reloadAll}>↻</button>
+        </div>
       </div>
-      <ErrorBox error={progress.error} />
-      {progress.loading && !p ? (
+      {tab === "history" && <SchedulerHistory />}
+      {tab === "now" && <ErrorBox error={progress.error} />}
+      {tab === "now" && (progress.loading && !p ? (
         <Loading />
       ) : p ? (
         <>
@@ -120,7 +127,7 @@ export function LikedProgressDashboard({ onChanged }: { onChanged?: () => void }
           {flash && <div className="flash">{flash}</div>}
           <ErrorBox error={err} />
         </>
-      ) : null}
+      ) : null)}
     </div>
   );
 }

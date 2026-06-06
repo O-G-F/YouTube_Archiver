@@ -36,7 +36,11 @@ import type {
   LikedArchivePlan,
   LikedArchiveEnqueueResult,
   LikedProgress,
+  LikedProgressHistoryPoint,
   QueueStatus,
+  SchedulerRun,
+  SchedulerStats,
+  RecommendSettings,
 } from "./types";
 
 export interface LikedArchiveBody {
@@ -88,8 +92,14 @@ export const api = {
   }) => apiPost<SchedulerRunOnceResult>("/api/scheduler/run-once", body),
 
   // Jobs
-  jobs: (p: { status?: string; type?: string; source_action?: string; limit?: number; offset?: number }) =>
-    apiGet<Job[]>(`/api/jobs${qs(p)}`),
+  jobs: (p: {
+    status?: string;
+    type?: string;
+    source_action?: string;
+    scheduler_run_id?: string;
+    limit?: number;
+    offset?: number;
+  }) => apiGet<Job[]>(`/api/jobs${qs(p)}`),
   retryableJobs: (p: { reason?: string; type?: string; limit?: number } = {}) =>
     apiGet<Job[]>(`/api/jobs/retryable${qs(p)}`),
   job: (id: number) => apiGet<JobDetail>(`/api/jobs/${id}`),
@@ -222,7 +232,18 @@ export const api = {
   likedRetryFailed: (body: { reason?: string; limit?: number }) =>
     apiPost<{ retried: number; job_ids: number[] }>("/api/liked-videos/retry-failed", body),
   likedProgress: () => apiGet<LikedProgress>("/api/liked-videos/progress"),
+  likedProgressHistory: (limit = 50) =>
+    apiGet<{ points: LikedProgressHistoryPoint[] }>(`/api/liked-videos/progress/history${qs({ limit })}`),
   queueStatus: () => apiGet<QueueStatus>("/api/queue/status"),
+
+  // Phase 7E: scheduler run history / stats / recommendations
+  schedulerRuns: (p: { run_type?: string; limit?: number } = {}) =>
+    apiGet<SchedulerRun[]>(`/api/scheduler/runs${qs(p)}`),
+  schedulerRun: (runId: string) => apiGet<SchedulerRun>(`/api/scheduler/runs/${runId}`),
+  schedulerRunJobs: (runId: string) => apiGet<Job[]>(`/api/scheduler/runs/${runId}/jobs`),
+  schedulerStats: () => apiGet<SchedulerStats>("/api/scheduler/stats"),
+  schedulerRecommend: (lookback = 30) =>
+    apiPost<RecommendSettings>("/api/scheduler/recommend-settings", { lookback }),
 
   // YouTube fetch-stability doctor / diagnostics (Phase 7B)
   doctorYoutube: () => apiGet<YouTubeDoctor>("/api/doctor/youtube"),

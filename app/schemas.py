@@ -357,11 +357,13 @@ class SchedulerRunOnceOut(BaseModel):
     liked_retry_jobs_requeued: int = 0
     skipped_active_jobs: int = 0
     skipped_duplicates: int = 0
+    skipped_backoff: int = 0
     skipped_frozen: int = 0
     skipped_recent: int = 0
     jobs_created: int = 0
     submitted: int = 0
     job_ids: list[int] = Field(default_factory=list)
+    run_id: str | None = None  # Phase 7E: link to the scheduler_runs record
 
 
 # ---- Phase 7D: liked-archive progress + queue health ----
@@ -397,6 +399,82 @@ class QueueStatusOut(BaseModel):
     oldest_queued_at: str | None = None
     oldest_queued_job_id: int | None = None
     worker_count: int | None = None
+
+
+# ---- Phase 7E: scheduler run history / stats / recommendations ----
+class SchedulerRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    run_id: str
+    run_type: str
+    reason: str | None = None
+    started_at: datetime
+    finished_at: datetime | None = None
+    status: str
+    selected_count: int = 0
+    jobs_created: int = 0
+    jobs_submitted: int = 0
+    skipped_active_jobs: int = 0
+    skipped_duplicates: int = 0
+    skipped_backoff: int = 0
+    retryable_count: int = 0
+    failed_count: int = 0
+    partial_count: int = 0
+    success_count: int = 0
+    body_count_before: int = 0
+    body_count_after: int = 0
+
+
+class SchedulerRunDetailOut(SchedulerRunOut):
+    meta: dict | None = None  # summary + progress/queue snapshots (no raw_json)
+
+
+class SchedulerStatsOut(BaseModel):
+    runs_considered: int
+    by_type: dict[str, int] = Field(default_factory=dict)
+    by_status: dict[str, int] = Field(default_factory=dict)
+    jobs_created: int = 0
+    jobs_submitted: int = 0
+    skipped_active_jobs: int = 0
+    skipped_duplicates: int = 0
+    skipped_backoff: int = 0
+    last_run_id: str | None = None
+    last_run_type: str | None = None
+    last_run_status: str | None = None
+    last_run_at: str | None = None
+
+
+class LikedProgressHistoryPoint(BaseModel):
+    run_id: str
+    run_type: str
+    at: str | None = None
+    total_liked: int = 0
+    metadata_fetched: int = 0
+    metadata_missing: int = 0
+    body_saved: int = 0
+    body_missing: int = 0
+    retryable_liked_jobs: int = 0
+    failed_liked_jobs: int = 0
+    partial_liked_jobs: int = 0
+    active_archive_jobs: int = 0
+
+
+class LikedProgressHistoryOut(BaseModel):
+    points: list[LikedProgressHistoryPoint] = Field(default_factory=list)
+
+
+class RecommendSettingsRequest(BaseModel):
+    lookback: int = 30
+
+
+class RecommendSettingsOut(BaseModel):
+    based_on: dict = Field(default_factory=dict)
+    rates: dict = Field(default_factory=dict)
+    current: dict = Field(default_factory=dict)
+    recommended: dict = Field(default_factory=dict)
+    reasons: list[str] = Field(default_factory=list)
+    note: str
 
 
 # --------------------------------------------------------------------------- #

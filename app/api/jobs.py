@@ -40,6 +40,9 @@ def list_jobs(
     source_action: str | None = Query(
         default=None, description="filter by job.meta.source_action / scheduled_by / enqueued_by"
     ),
+    scheduler_run_id: str | None = Query(
+        default=None, description="filter by job.meta.scheduler_run_id"
+    ),
     limit: int = Query(default=50, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> list[JobOutClassified]:
@@ -48,15 +51,19 @@ def list_jobs(
         stmt = stmt.where(Job.status == status)
     if type:
         stmt = stmt.where(Job.type == type)
-    # source_action lives in job.meta (JSON) -> filter in Python over a wider scan.
-    if source_action:
-        stmt = stmt.limit(max(limit + offset, 500))
+    # source_action / scheduler_run_id live in job.meta (JSON) -> filter in Python.
+    if source_action or scheduler_run_id:
+        stmt = stmt.limit(max(limit + offset, 1000))
         rows = []
         for j in db.scalars(stmt):
             meta = j.meta or {}
-            tags = {meta.get("source_action"), meta.get("scheduled_by"), meta.get("enqueued_by")}
-            if source_action in tags:
-                rows.append(j)
+            if scheduler_run_id and meta.get("scheduler_run_id") != scheduler_run_id:
+                continue
+            if source_action:
+                tags = {meta.get("source_action"), meta.get("scheduled_by"), meta.get("enqueued_by")}
+                if source_action not in tags:
+                    continue
+            rows.append(j)
         rows = rows[offset : offset + limit]
     else:
         rows = list(db.scalars(stmt.limit(limit).offset(offset)))

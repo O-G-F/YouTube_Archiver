@@ -549,3 +549,65 @@ export interface QueueStatus {
   oldest_queued_job_id: number | null;
   worker_count: number | null;
 }
+
+export interface SchedulerRun {
+  id: number;
+  run_id: string;
+  run_type: string;
+  reason: string | null;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  selected_count: number;
+  jobs_created: number;
+  jobs_submitted: number;
+  skipped_active_jobs: number;
+  skipped_duplicates: number;
+  skipped_backoff: number;
+  retryable_count: number;
+  failed_count: number;
+  partial_count: number;
+  success_count: number;
+  body_count_before: number;
+  body_count_after: number;
+  meta?: Record<string, unknown> | null;
+}
+
+export interface SchedulerStats {
+  runs_considered: number;
+  by_type: Record<string, number>;
+  by_status: Record<string, number>;
+  jobs_created: number;
+  jobs_submitted: number;
+  skipped_active_jobs: number;
+  skipped_duplicates: number;
+  skipped_backoff: number;
+  last_run_id: string | null;
+  last_run_type: string | null;
+  last_run_status: string | null;
+  last_run_at: string | null;
+}
+
+export interface LikedProgressHistoryPoint {
+  run_id: string;
+  run_type: string;
+  at: string | null;
+  total_liked: number;
+  metadata_fetched: number;
+  metadata_missing: number;
+  body_saved: number;
+  body_missing: number;
+  retryable_liked_jobs: number;
+  failed_liked_jobs: number;
+  partial_liked_jobs: number;
+  active_archive_jobs: number;
+}
+
+export interface RecommendSettings {
+  based_on: Record<string, number>;
+  rates: Record<string, number | null>;
+  current: Record<string, number | boolean>;
+  recommended: Record<string, number | boolean>;
+  reasons: string[];
+  note: string;
+}

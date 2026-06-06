@@ -456,6 +456,48 @@ class LikedVideo(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class SchedulerRun(Base):
+    """A single scheduler pass record (Phase 7E).
+
+    Captures what one ``run_once`` did (per-pass counts + skips) plus a
+    point-in-time liked-progress / body snapshot, so the UI/CLI can show run
+    history, progress over time, and recommend safe limits. ``meta`` holds the
+    full summary, the progress snapshot, and queue-before/after (no personal
+    data / raw_json).
+    """
+
+    __tablename__ = "scheduler_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    # run_type: liked_metadata | liked_archive | liked_retry | comments
+    #           | collections | all | mixed
+    run_type: Mapped[str] = mapped_column(String(32), index=True)
+    reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # status: success | partial_success | failed
+    status: Mapped[str] = mapped_column(String(20), default="success")
+
+    selected_count: Mapped[int] = mapped_column(Integer, default=0)
+    jobs_created: Mapped[int] = mapped_column(Integer, default=0)
+    jobs_submitted: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_active_jobs: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_duplicates: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_backoff: Mapped[int] = mapped_column(Integer, default=0)
+
+    # point-in-time liked-job pool snapshot
+    retryable_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    partial_count: Mapped[int] = mapped_column(Integer, default=0)
+    success_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    body_count_before: Mapped[int] = mapped_column(Integer, default=0)
+    body_count_after: Mapped[int] = mapped_column(Integer, default=0)
+
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
 class DiaryEntry(Base):
     __tablename__ = "diary_entries"
 
