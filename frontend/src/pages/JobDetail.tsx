@@ -55,6 +55,13 @@ export default function JobDetail() {
   const reasons = job.classification?.reasons ?? [];
   const canRetry = ["failed", "canceled", "partial_success"].includes(job.status);
 
+  // youtube_diagnostic report (lives in job.meta) — Phase 7B
+  const meta = (job.meta ?? {}) as Record<string, unknown>;
+  const diag = meta.diagnostic as
+    | { overall?: string; steps?: Array<Record<string, unknown>>; reasons?: string[] }
+    | undefined;
+  const recommendations = (meta.recommendations as string[] | undefined) ?? [];
+
   return (
     <div>
       <div className="spread">
@@ -81,6 +88,58 @@ export default function JobDetail() {
       <ErrorBox error={actionErr} />
       {flash && <div className="flash">{flash}</div>}
       <JobClassificationNote job={job} />
+
+      {job.type === "youtube_diagnostic" && (diag || recommendations.length > 0) && (
+        <div className="panel">
+          <div className="spread">
+            <h2>YouTube diagnostic</h2>
+            {diag?.overall && (
+              <span className={`badge ${diag.overall === "success" ? "ok" : diag.overall === "failed" ? "err" : "warn"}`}>
+                {diag.overall}
+              </span>
+            )}
+          </div>
+          {diag?.steps && diag.steps.length > 0 && (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Step</th><th>Status</th><th>Duration</th><th>Body created</th><th className="wrap">Reasons</th></tr>
+                </thead>
+                <tbody>
+                  {diag.steps.map((s, i) => {
+                    const st = String(s.status ?? "");
+                    const cls = (s.classification ?? {}) as { reasons?: string[] };
+                    return (
+                      <tr key={i}>
+                        <td className="mono small">{String(s.name ?? "")}</td>
+                        <td><span className={`badge ${st === "success" ? "ok" : st === "failed" ? "err" : "warn"}`}>{st}</span></td>
+                        <td className="small">{String(s.duration_seconds ?? "—")}s</td>
+                        <td>
+                          <span className={`badge ${s.media_body_created ? "warn" : "muted"}`}>
+                            {s.media_body_created ? "yes (temp, discarded)" : "no"}
+                          </span>
+                        </td>
+                        <td className="wrap small muted">{(cls.reasons ?? []).join(", ") || "—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {recommendations.length > 0 && (
+            <>
+              <h3>Recommendations</h3>
+              <ul className="muted small" style={{ lineHeight: 1.7 }}>
+                {recommendations.map((r, i) => <li key={i}>{r}</li>)}
+              </ul>
+            </>
+          )}
+          <p className="muted small">
+            診断は「完全解決の保証」ではなく設定と傾向を確認する道具です。DB の media body は増えません（video テストも一時DL→削除）。
+          </p>
+        </div>
+      )}
 
       <div className="grid2">
         <div className="panel">

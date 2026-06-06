@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -118,13 +119,22 @@ class Settings(BaseSettings):
     scheduler_retry_enabled: bool = False
     scheduler_retry_limit_per_run: int = 10
 
-    # ---- YouTube fetch stabilization secrets (Phase 7A) ----
+    # ---- YouTube fetch stabilization secrets (Phase 7A / 7B) ----
     # All are SECRETS: never returned by the API / shown in the UI (only a
     # configured yes/no). cookies_file is defined above (Phase 0).
     # Browser to read cookies from (yt-dlp --cookies-from-browser), e.g. "chrome".
-    cookies_from_browser: str = ""
+    # Accept both COOKIES_FROM_BROWSER and YTDLP_COOKIES_FROM_BROWSER.
+    cookies_from_browser: str = Field(
+        default="",
+        validation_alias=AliasChoices("cookies_from_browser", "ytdlp_cookies_from_browser"),
+    )
     # YouTube PO token (yt-dlp --extractor-args youtube:po_token=...). Secret.
     youtube_po_token: str = ""
+    # YouTube visitor data (pairs with the PO token). Secret.
+    youtube_visitor_data: str = ""
+    # Raw extra extractor-args passthrough (e.g. "youtube:player_client=web").
+    # May contain non-secret tuning; po_token inside it is still masked in logs.
+    ytdlp_extractor_args: str = ""
 
     @property
     def effective_subtitles_sub_langs(self) -> str:
@@ -140,6 +150,50 @@ class Settings(BaseSettings):
     @property
     def po_token_configured(self) -> bool:
         return bool((self.youtube_po_token or "").strip())
+
+    @property
+    def visitor_data_configured(self) -> bool:
+        return bool((self.youtube_visitor_data or "").strip())
+
+    @property
+    def browser_cookies_configured(self) -> bool:
+        return bool((self.cookies_from_browser or "").strip())
+
+    def cookies_file_status(self) -> dict:
+        """Cookie-file status for diagnostics — NEVER includes the path/contents.
+
+        ``configured`` means a cookie source is actually USABLE (browser cookies,
+        or a cookies file that exists) — consistent with ``cookies_configured``.
+        ``file_configured`` only reflects that ``COOKIES_FILE`` is set, so the
+        doctor can flag "path set but file missing".
+        """
+        import os
+        from datetime import datetime, timezone
+        from pathlib import Path as _P
+
+        cf = (self.cookies_file or "").strip()
+        out = {
+            "configured": self.browser_cookies_configured,
+            "file_configured": bool(cf),
+            "file_exists": False,
+            "readable": False,
+            "last_modified": None,
+        }
+        if cf:
+            p = _P(cf)
+            try:
+                if p.is_file():
+                    out["file_exists"] = True
+                    out["readable"] = os.access(cf, os.R_OK)
+                    out["configured"] = True
+                    out["last_modified"] = (
+                        datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+                        .replace(tzinfo=None)
+                        .isoformat()
+                    )
+            except OSError:
+                pass
+        return out
 
     # ---- App ----
     log_level: str = "INFO"

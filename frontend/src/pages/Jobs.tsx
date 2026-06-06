@@ -10,6 +10,7 @@ import type { Job } from "../api/types";
 const STATUSES = ["", "queued", "running", "success", "partial_success", "failed", "canceled"];
 const TYPES = [
   "", "download", "expand", "metadata_refresh", "comments_refresh", "live_chat_refresh", "subtitles_refresh",
+  "youtube_diagnostic",
 ];
 const REASONS = [
   "", "rate_limited", "incomplete_data", "fragments_failed", "subtitles_failed", "comments_failed", "impersonation",

@@ -32,6 +32,7 @@ import type {
   VideoListItem,
   YouTubeApiStatus,
   YouTubeApiSyncResult,
+  YouTubeDoctor,
 } from "./types";
 
 export function mediaUrl(videoId: number, mediaFileId: number): string {
@@ -177,4 +178,9 @@ export const api = {
     ),
   enqueueLikedMetadata: (body: { profile?: string; limit?: number; only_missing_metadata?: boolean }) =>
     apiPost<LikedVideosEnqueueResult>("/api/liked-videos/enqueue-metadata", body),
+
+  // YouTube fetch-stability doctor / diagnostics (Phase 7B)
+  doctorYoutube: () => apiGet<YouTubeDoctor>("/api/doctor/youtube"),
+  youtubeDiagnosticsRun: (body: { url: string; profile?: string; include_video_download?: boolean; timeout?: number }) =>
+    apiPost<Job>("/api/youtube-diagnostics/run", body),
 };

@@ -52,9 +52,11 @@ def redact_args(args: list[str], *, mask_cookies: bool = False) -> list[str]:
             mask_next = False
             continue
         # Inline secrets carried inside a combined arg (e.g. an extractor-arg
-        # "youtube:po_token=XXXX"): mask the value, keep the key.
-        if "po_token=" in arg:
-            out.append(re.sub(r"(po_token=)[^,;\s]+", r"\1******", arg))
+        # "youtube:po_token=XXXX;visitor_data=YYYY"): mask values, keep keys.
+        if "po_token=" in arg or "visitor_data=" in arg:
+            masked = re.sub(r"(po_token=)[^,;\s]+", r"\1******", arg)
+            masked = re.sub(r"(visitor_data=)[^,;\s]+", r"\1******", masked)
+            out.append(masked)
             continue
         out.append(arg)
         if arg in sensitive:

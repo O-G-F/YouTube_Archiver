@@ -39,6 +39,8 @@ def external_ctx(settings: Settings) -> dict:
         "cookies_file": cookies,
         "cookies_from_browser": (settings.cookies_from_browser or "").strip() or None,
         "po_token": (settings.youtube_po_token or "").strip() or None,
+        "visitor_data": (settings.youtube_visitor_data or "").strip() or None,
+        "extractor_args_extra": (settings.ytdlp_extractor_args or "").strip() or None,
         "ffmpeg_location": settings.ffmpeg_location or None,
         "deno_path": settings.deno_path or None,
         "remote_components": settings.effective_remote_components,

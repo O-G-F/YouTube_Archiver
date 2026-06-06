@@ -41,6 +41,7 @@ from app.api import (
     videos,
     watch_history,
     youtube_api,
+    youtube_doctor,
 )
 from app.bootstrap import startup_bootstrap
 from app.config import get_settings
@@ -96,6 +97,7 @@ app.include_router(search.router)
 app.include_router(library.router)
 app.include_router(liked_videos.router)
 app.include_router(youtube_api.router)
+app.include_router(youtube_doctor.router)
 
 
 # --------------------------------------------------------------------------- #

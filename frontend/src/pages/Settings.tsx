@@ -1,6 +1,7 @@
 import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
 import { ErrorBox, Loading } from "../components/ui";
+import { YouTubeDiagnostics } from "../components/YouTubeDiagnostics";
 
 export default function Settings() {
   const settings = useFetch(() => api.settings(), []);
@@ -11,6 +12,8 @@ export default function Settings() {
     <div>
       <h1 className="page-title">Settings / Doctor</h1>
       <p className="page-sub">Read-only. Secrets (cookies, tokens, DB/Redis credentials) are never shown.</p>
+
+      <YouTubeDiagnostics />
 
       <div className="panel">
         <div className="spread">

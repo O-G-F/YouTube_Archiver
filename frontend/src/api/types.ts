@@ -423,6 +423,35 @@ export interface YouTubeApiStatus {
   method: string;
 }
 
+export interface YouTubeCookieStatus {
+  configured: boolean;
+  file_configured: boolean;
+  file_exists: boolean;
+  readable: boolean;
+  last_modified: string | null;
+}
+export interface YouTubeDoctorCheck {
+  name: string;
+  status: string; // ok | warning | failed
+  detail: string;
+}
+export interface YouTubeDoctor {
+  ok: boolean;
+  ytdlp_version: string | null;
+  deno_available: boolean;
+  remote_components: string | null;
+  curl_cffi_installed: boolean;
+  curl_cffi_version: string | null;
+  impersonate_targets: number;
+  impersonation_available: boolean;
+  cookies: YouTubeCookieStatus;
+  browser_cookies_configured: boolean;
+  po_token_configured: boolean;
+  visitor_data_configured: boolean;
+  checks: YouTubeDoctorCheck[];
+  recommendations: string[];
+}
+
 export interface YouTubeApiSyncResult {
   ok: boolean;
   classification: string | null;

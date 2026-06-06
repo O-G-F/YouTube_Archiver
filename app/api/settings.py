@@ -34,6 +34,7 @@ def _mask_url(url: str | None) -> str:
 @router.get("/api/settings", response_model=SettingsOut)
 def get_settings_view(db: Session = Depends(get_db)) -> SettingsOut:
     s = get_settings()
+    _cookie_status = s.cookies_file_status()  # configured/file_exists/readable (NO path)
     items: list[SettingsItem] = [
         SettingsItem(key="version", value=__version__),
         SettingsItem(key="default_profile", value=s.default_profile),
@@ -58,9 +59,28 @@ def get_settings_view(db: Session = Depends(get_db)) -> SettingsOut:
             note="cookies.txt / browser cookies (path hidden)",
         ),
         SettingsItem(
+            key="cookies_file_exists",
+            value="yes" if _cookie_status["file_exists"] else "no",
+            note="COOKIES_FILE found on disk (path hidden)",
+        ),
+        SettingsItem(
+            key="cookies_file_readable",
+            value="yes" if _cookie_status["readable"] else "no",
+        ),
+        SettingsItem(
+            key="browser_cookies_configured",
+            value="yes" if s.browser_cookies_configured else "no",
+            note="--cookies-from-browser (value hidden)",
+        ),
+        SettingsItem(
             key="po_token_configured",
             value="yes" if s.po_token_configured else "no",
             note="YouTube PO token (value hidden)",
+        ),
+        SettingsItem(
+            key="visitor_data_configured",
+            value="yes" if s.visitor_data_configured else "no",
+            note="YouTube visitor data (value hidden)",
         ),
         SettingsItem(key="ytdlp_binary", value=s.ytdlp_binary),
         SettingsItem(key="ffmpeg_location", value=s.ffmpeg_location or "(PATH)"),

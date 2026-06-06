@@ -74,6 +74,8 @@ def run_job(job_id: int) -> None:
             _run_live_chat_refresh(settings, job_id)
         elif jtype == "subtitles_refresh":
             _run_subtitles_refresh(settings, job_id)
+        elif jtype == "youtube_diagnostic":
+            _run_youtube_diagnostic(settings, job_id)
         else:
             raise ValueError(f"unknown job type: {jtype!r}")
     except Exception as exc:  # noqa: BLE001 - we want to record every failure
@@ -699,6 +701,57 @@ def _run_subtitles_refresh(settings: Settings, job_id: int) -> None:
             jobs_svc.mark_failed(s, job, f"yt-dlp exited {run.returncode}\n{err_tail}")
 
         jobs_svc.apply_classification(s, job, settings, err_tail)
+
+
+# --------------------------------------------------------------------------- #
+# youtube_diagnostic (measure fetch stability; NEVER persists a media body)
+# --------------------------------------------------------------------------- #
+def _run_youtube_diagnostic(settings: Settings, job_id: int) -> None:
+    """Run YouTube fetch diagnostics (metadata / subtitles / optional video) and
+    store the report in ``job.meta``. The video test downloads into a throwaway
+    temp dir, so no MediaFile is ever created.
+    """
+    from app.services import youtube_doctor
+
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        meta = job.meta or {}
+        url = meta.get("test_url") or job.url
+        profile = meta.get("profile")
+        include_video = bool(meta.get("include_video_download"))
+        timeout = meta.get("timeout") or None
+        jobs_svc.mark_running(s, job)
+
+    if not url:
+        with session_scope() as s:
+            jobs_svc.mark_failed(s, s.get(Job, job_id), "youtube_diagnostic: no test URL")
+        return
+
+    log_base = storage.job_log_dir(settings, job_id)
+    try:
+        report = youtube_doctor.run_diagnostics(
+            settings, url, profile=profile, include_video_download=include_video,
+            timeout=timeout, log_base=log_base,
+        )
+    except Exception as exc:  # noqa: BLE001
+        with session_scope() as s:
+            jobs_svc.mark_failed(s, s.get(Job, job_id), f"youtube_diagnostic error: {exc}")
+        return
+
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        job.log_path = storage.log_relative(settings, log_base)
+        job.meta = {
+            **(job.meta or {}),
+            "diagnostic": report,
+            "overall": report["overall"],
+            "recommendations": report["recommendations"],
+        }
+        jobs_svc.mark_success(s, job)
+        logger.info(
+            "youtube_diagnostic: job %s overall=%s reasons=%s",
+            job_id, report["overall"], report["reasons"],
+        )
 
 
 # --------------------------------------------------------------------------- #

@@ -936,6 +936,47 @@ class YouTubeApiStatusOut(BaseModel):
     method: str
 
 
+# --------------------------------------------------------------------------- #
+# Phase 7B: YouTube fetch-stabilization doctor / diagnostics
+# --------------------------------------------------------------------------- #
+class YouTubeDoctorCheck(BaseModel):
+    name: str
+    status: str  # ok | warning | failed
+    detail: str  # NEVER contains secret values / cookie paths / tokens
+
+
+class YouTubeCookieStatus(BaseModel):
+    configured: bool = False
+    file_configured: bool = False
+    file_exists: bool = False
+    readable: bool = False
+    last_modified: str | None = None  # NO path is ever included
+
+
+class YouTubeDoctorOut(BaseModel):
+    ok: bool
+    ytdlp_version: str | None = None
+    deno_available: bool = False
+    remote_components: str | None = None
+    curl_cffi_installed: bool = False
+    curl_cffi_version: str | None = None
+    impersonate_targets: int = 0
+    impersonation_available: bool = False
+    cookies: YouTubeCookieStatus = Field(default_factory=YouTubeCookieStatus)
+    browser_cookies_configured: bool = False
+    po_token_configured: bool = False
+    visitor_data_configured: bool = False
+    checks: list[YouTubeDoctorCheck] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+
+
+class YouTubeDiagnosticRequest(BaseModel):
+    url: str
+    profile: str | None = None
+    include_video_download: bool = False
+    timeout: int | None = None
+
+
 class YouTubeApiSyncRequest(BaseModel):
     method: str | None = None  # videos | playlist | auto
     stop_on_existing: bool = True

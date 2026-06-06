@@ -839,6 +839,67 @@ DL の 429・throttling を減らす運用オプション（**このフェーズ
 
 - cookies / PO-token / token を **UI/API/log に出さない**（`redact_args` で `po_token=******`、`logs.mask_secrets` で読み出し時もマスク、Settings は configured yes/no）。`metadata_only`/`subtitles_refresh` の**本体非保存**を維持。retry は回数上限で**無限ループしない**。
 
+### YouTube 取得安定化 doctor / diagnostics（Phase 7B）
+
+「設定の有無」だけでなく「実際に効くか」を測る道具。**完全解決の保証ではなく、設定と傾向を確認するための診断**です（環境により 429 / Incomplete data received は残り得ます）。
+
+#### 設定（すべて secret 扱い・値は UI/API/log に非表示）
+
+| 設定 | 説明 |
+|---|---|
+| `COOKIES_FILE` | cookies.txt のパス。Docker では **`/config/cookies.txt`** 推奨（`/secrets` も可）。Git 非管理。`--cookies`（log では `--cookies ***REDACTED***`）|
+| `COOKIES_FROM_BROWSER` / `YTDLP_COOKIES_FROM_BROWSER` | ブラウザ cookies（例 `chrome`）。両名を受理。**Docker 内はブラウザプロファイルが無く使いにくい**ため通常は cookies.txt 推奨。`--cookies-from-browser`（log マスク）|
+| `YOUTUBE_PO_TOKEN` | PO token（**secret**）。`--extractor-args youtube:po_token=…`（マスク）|
+| `YOUTUBE_VISITOR_DATA` | visitor data（**secret**、PO token とペア）。`youtube:visitor_data=…`（マスク）|
+| `YTDLP_EXTRACTOR_ARGS` | 生の extractor-args 追記（非 secret チューニング）。例 `youtube:player_client=web` |
+| `curl_cffi`（同梱） | yt-dlp の **impersonation**。`impersonation` warning を減らせる**任意依存**。効かない環境では warning 扱いで、既定では強制しない |
+
+> cookies / cookies-from-browser / PO-token / visitor-data / extractor-args は **`profiles.build_ytdlp_args` の 1 箇所**で組み立て、`metadata_only` / `subtitles_refresh` / `comments_refresh` / `live_chat_refresh` / 本体 DL すべてに一貫適用。`--remote-components ejs:github` と deno は維持。
+
+#### PO-token / visitor data の取得（概要）
+
+- ブラウザの devtools / [yt-dlp の PO Token ガイド](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide)等で取得した値を `YOUTUBE_PO_TOKEN` / `YOUTUBE_VISITOR_DATA` に設定するだけ（**完全自動取得は不要**）。値は**絶対に Git 管理しない**（`.env` はコミットしない）。
+
+#### cookies.txt の配置（Docker）
+
+1. ブラウザ拡張等で `cookies.txt`（Netscape 形式）を書き出す。
+2. ホスト側に置き、コンテナの **`/config/cookies.txt`** にマウント（例 `-v $PWD/secrets/cookies.txt:/config/cookies.txt:ro`）。
+3. `COOKIES_FILE=/config/cookies.txt` を設定。doctor で `file_exists` / `readable` を確認（**パス・中身は表示されません**）。
+
+#### doctor youtube（静的・ネットワーク無し）
+
+```bash
+archiver doctor youtube
+# GET /api/doctor/youtube
+```
+
+- yt-dlp version / deno / remote-components / curl_cffi installed・impersonate targets / cookies configured・file_exists・readable / browser cookies configured / PO-token configured / visitor data configured を **ok/warning/failed** で表示し、**recommended actions** を出す。secret 値・cookie パス・token は**一切表示しない**。
+
+#### diagnostic ジョブ（実測・本体は保存しない）
+
+```bash
+# metadata_only + subtitles の実測（本体 DL 無し）
+archiver youtube-diagnostics run --url https://youtu.be/<ID>
+# 任意で小さな本体 DL も試す（一時 dir に DL→即削除、DB の media body は増えない）
+archiver youtube-diagnostics run --url https://youtu.be/<ID> --video --timeout 180
+# doctor からの即時テスト
+archiver doctor youtube --test-url https://youtu.be/<ID>
+```
+
+- API: `POST /api/youtube-diagnostics/run` / `POST /api/doctor/youtube/run`（`job.type=youtube_diagnostic`）。
+- 各ステップで **success/partial/failed・classification・duration・media_body_created** を記録し、**recommendations** を生成（`job.meta.diagnostic` / `job.meta.recommendations`）。video テストは**既定 OFF**、明示時のみ。**一時ディレクトリに DL して即削除**するため、video テストでも **DB の media body は 0**。
+
+#### 推奨運用（429 / Incomplete data を減らす順序）
+
+1. **`metadata_only`** で取得可否と classification を確認。
+2. **`subtitles_refresh`** で字幕を補完（本体非 DL）。
+3. 本体 DL は **delay / backoff 付きで少量ずつ**（`DOWNLOAD_JOB_DELAY_SECONDS` + `DOWNLOAD_RETRY_*`）。
+4. 429 等は **`/api/jobs/retryable`（`archiver jobs retryable`）から時間を置いて再試行**。
+
+### セキュリティ（7B）
+
+- doctor / diagnostics / Settings は **configured yes/no と file_exists/readable のみ**。cookie パス・PO-token・visitor data・OAuth token は **UI/API/log/command に一切出さない**（`redact_args` + `logs.mask_secrets` で `po_token=******` / `visitor_data=******` / `--cookies ***REDACTED***`）。診断の本体 DL は**一時 dir→即削除**で `MediaFile` を作らない。cookies / OAuth secret/token / PO-token / Takeout ZIP は **Git 非管理**。
+
 ---
 
 ## ストレージ構成
@@ -890,6 +951,13 @@ archiver jobs cancel JOB_ID
 
 archiver profiles command PROFILE URL             # dry-run: 実行せずコマンドだけ表示
 archiver doctor                                   # 環境診断（書込/ツール/DB/Redis）
+
+# --- Phase 7B: YouTube 取得安定化 doctor / diagnostics ---
+archiver doctor youtube                                  # 静的診断（configured yes/no・secret 非表示）
+archiver doctor youtube --test-url https://youtu.be/<ID> # 静的 + 即時ライブテスト（本体非保存）
+archiver doctor youtube --test-url <URL> --video --profile video_compressed_1080p
+archiver youtube-diagnostics run --url <URL>             # metadata+subtitles 診断ジョブ
+archiver youtube-diagnostics run --url <URL> --video --timeout 180 [--now]  # 任意で小本体DL（一時dir→即削除）
 
 # --- Phase 2B: 再クロール / scheduler ---
 archiver collections refresh COLLECTION_ID [--now] [--max-items N]   # 1件再クロール（removed検出あり）
@@ -992,6 +1060,9 @@ archiver live-chat stats VIDEO_ID
 | GET | `/api/videos/{id}/live-chat` | live chat 一覧（`?include_missing=&superchats_only=&include_raw=&limit=&offset=`） |
 | GET | `/api/videos/{id}/live-chat/stats` | live chat 統計（total/active/missing/superchats/members/状態） |
 | GET | `/api/doctor` | 環境診断（書込可否 / ツール版 / DB / Redis） |
+| GET | `/api/doctor/youtube` | YouTube 取得安定化の静的診断（configured yes/no・secret 非表示）【Phase 7B】 |
+| POST | `/api/doctor/youtube/run` | 診断ジョブ作成（metadata+subtitles、video は任意）【Phase 7B】 |
+| POST | `/api/youtube-diagnostics/run` | 取得安定化ベンチ（`{"url","profile","include_video_download","timeout"}` → `youtube_diagnostic`）【Phase 7B】 |
 | GET | `/api/jobs` | ジョブ一覧（`?status=&type=&limit=&offset=`、`classification` 付き） |
 | GET | `/api/jobs/retryable` | 再試行可能な失敗ジョブ（`?reason=&type=&limit=`）【Phase 7A】 |
 | POST | `/api/jobs/retry-all` | 再試行可能ジョブを一括 re-queue（`{"reason","type","limit"}`）【Phase 7A】 |

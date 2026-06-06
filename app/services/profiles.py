@@ -280,9 +280,12 @@ class BuildContext:
     download_archive: str | None = None
     no_playlist: bool = False
     cookies_file: str | None = None
-    # YouTube fetch stabilization (Phase 7A): browser cookies + PO token (secret).
+    # YouTube fetch stabilization (Phase 7A/7B): browser cookies + PO token +
+    # visitor data (secret) + a raw extractor-args passthrough.
     cookies_from_browser: str | None = None
     po_token: str | None = None
+    visitor_data: str | None = None
+    extractor_args_extra: str | None = None
     ffmpeg_location: str | None = None
     deno_path: str | None = None
     # Remote-components default ON (YouTube JS challenge solver). See requirement 6.
@@ -418,9 +421,18 @@ def build_ytdlp_args(spec: ProfileSpec, ctx: BuildContext) -> list[str]:
     elif ctx.cookies_from_browser:
         # Only when no cookies.txt (the two are mutually exclusive in yt-dlp).
         args += ["--cookies-from-browser", ctx.cookies_from_browser]
+    # YouTube extractor-args: combine po_token + visitor_data into one
+    # ``youtube:`` arg (secret values masked in command.txt by redact_args), and
+    # pass any raw extractor-args through verbatim.
+    yt_parts: list[str] = []
     if ctx.po_token:
-        # Secret value; masked in command.txt by redact_args (po_token=******).
-        args += ["--extractor-args", f"youtube:po_token={ctx.po_token}"]
+        yt_parts.append(f"po_token={ctx.po_token}")
+    if ctx.visitor_data:
+        yt_parts.append(f"visitor_data={ctx.visitor_data}")
+    if yt_parts:
+        args += ["--extractor-args", "youtube:" + ";".join(yt_parts)]
+    if ctx.extractor_args_extra:
+        args += ["--extractor-args", ctx.extractor_args_extra]
 
     # ----- admin-only escape hatch -----
     if ctx.extra_args:

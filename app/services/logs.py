@@ -53,8 +53,9 @@ _TOKEN_RES = (
         r"\s*[=:]\s*)(\S+)",
         re.IGNORECASE,
     ),
-    # yt-dlp PO token in an extractor-arg (po_token=...): mask the value.
+    # yt-dlp PO token / visitor data in extractor-args: mask the values.
     re.compile(r"(po_token=)([^,;\s]+)", re.IGNORECASE),
+    re.compile(r"(visitor_data=)([^,;\s]+)", re.IGNORECASE),
 )
 
 

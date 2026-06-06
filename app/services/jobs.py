@@ -215,6 +215,37 @@ def create_subtitles_refresh_job(
     return job
 
 
+def create_youtube_diagnostic_job(
+    session: Session,
+    url: str,
+    *,
+    profile: str | None = None,
+    include_video_download: bool = False,
+    timeout: int | None = None,
+    priority: int = 0,
+) -> Job:
+    """Create a youtube_diagnostic job (Phase 7B): measures fetch stability.
+
+    The diagnostic runs into a throwaway temp dir, so even the optional video
+    test never persists a media body.
+    """
+    job = Job(
+        type="youtube_diagnostic",
+        status="queued",
+        url=url,
+        priority=priority,
+        meta={
+            "test_url": url,
+            "profile": profile,
+            "include_video_download": bool(include_video_download),
+            "timeout": timeout,
+        },
+    )
+    session.add(job)
+    session.flush()
+    return job
+
+
 # --------------------------------------------------------------------------- #
 # Status transitions
 # --------------------------------------------------------------------------- #

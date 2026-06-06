@@ -51,6 +51,8 @@ subscriptions_app = typer.Typer(help="Takeout subscriptions (channels).")
 liked_videos_app = typer.Typer(help="Takeout liked videos library.")
 library_app = typer.Typer(help="Hybrid library bootstrap (Takeout + API).")
 youtube_api_app = typer.Typer(help="YouTube Data API OAuth (differential liked sync).")
+doctor_app = typer.Typer(help="Environment diagnostics (general + YouTube fetch stability).")
+youtube_diag_app = typer.Typer(help="YouTube fetch-stability diagnostics (benchmark).")
 app.add_typer(source_app, name="source")
 app.add_typer(download_app, name="download")
 app.add_typer(jobs_app, name="jobs")
@@ -67,6 +69,8 @@ app.add_typer(subscriptions_app, name="subscriptions")
 app.add_typer(liked_videos_app, name="liked-videos")
 app.add_typer(library_app, name="library")
 app.add_typer(youtube_api_app, name="youtube-api")
+app.add_typer(doctor_app, name="doctor")
+app.add_typer(youtube_diag_app, name="youtube-diagnostics")
 
 
 # --------------------------------------------------------------------------- #
@@ -107,9 +111,11 @@ def worker() -> None:
     Worker([settings.rq_queue], connection=conn).work(with_scheduler=False)
 
 
-@app.command()
-def doctor() -> None:
+@doctor_app.callback(invoke_without_command=True)
+def doctor_main(ctx: typer.Context) -> None:
     """Diagnose storage writability, tool versions, and DB/Redis connectivity."""
+    if ctx.invoked_subcommand is not None:
+        return
     from app.services.doctor import run_diagnostics
 
     result = run_diagnostics(get_settings())
@@ -119,6 +125,74 @@ def doctor() -> None:
     typer.echo(f"\noverall: {'OK' if result['ok'] else 'PROBLEMS DETECTED'}")
     if not result["ok"]:
         raise typer.Exit(code=1)
+
+
+@doctor_app.command("youtube")
+def doctor_youtube(
+    test_url: str = typer.Option("", "--test-url", help="Run a live test against this URL."),
+    profile: str = typer.Option("", "--profile", help="Video profile for the optional video test."),
+    video: bool = typer.Option(False, "--video", help="Also run a small video download test (default off)."),
+    timeout: int = typer.Option(0, "--timeout"),
+) -> None:
+    """YouTube fetch-stability check (static env) + optional live test (no secrets shown)."""
+    from app.services import youtube_doctor as yd
+
+    s = get_settings()
+    st = yd.static_checks(s)
+    typer.echo("== static checks ==")
+    for c in st["checks"]:
+        mark = {"ok": "OK  ", "warning": "WARN", "failed": "FAIL"}.get(c["status"], "?")
+        typer.echo(f"[{mark}] {c['name']:<26} {c['detail']}")
+    typer.echo(f"\ncookies: configured={st['cookies']['configured']} file_exists={st['cookies']['file_exists']} "
+               f"readable={st['cookies']['readable']}")
+    typer.echo(f"browser_cookies={st['browser_cookies_configured']} po_token={st['po_token_configured']} "
+               f"visitor_data={st['visitor_data_configured']} curl_cffi={st['curl_cffi_installed']} "
+               f"impersonate_targets={st['impersonate_targets']}")
+    typer.echo("recommendations:")
+    for r in st["recommendations"]:
+        typer.echo(f"  - {r}")
+    if test_url:
+        typer.echo("\n== live test (downloads into a temp dir; nothing persisted) ==")
+        report = yd.run_diagnostics(
+            s, test_url, profile=(profile or None), include_video_download=video,
+            timeout=(timeout or None),
+        )
+        typer.echo(f"overall: {report['overall']}")
+        for step in report["steps"]:
+            typer.echo(f"  {step['name']:<16} {step['status']:<8} {step['duration_seconds']}s "
+                       f"reasons={step['classification']['reasons']} media_body_created={step['media_body_created']}")
+        typer.echo("recommendations:")
+        for r in report["recommendations"]:
+            typer.echo(f"  - {r}")
+
+
+@youtube_diag_app.command("run")
+def youtube_diagnostics_run(
+    url: str = typer.Option(..., "--url", help="Video URL to test."),
+    profile: str = typer.Option("", "--profile", help="Video profile for the video test."),
+    video: bool = typer.Option(False, "--video", help="Include a small video download test (default off)."),
+    timeout: int = typer.Option(0, "--timeout"),
+    now: bool = typer.Option(False, "--now"),
+) -> None:
+    """Create a youtube_diagnostic job (metadata + subtitles + optional video)."""
+    with session_scope() as s:
+        job = jobs_svc.create_youtube_diagnostic_job(
+            s, url, profile=(profile or None), include_video_download=video,
+            timeout=(timeout or None),
+        )
+        job_id = job.id
+    typer.echo(f"Created youtube_diagnostic job #{job_id} for {url}")
+    _dispatch(job_id, now)
+    if now:
+        with session_scope() as s:
+            j = s.get(Job, job_id)
+            rep = (j.meta or {}).get("diagnostic") or {}
+            typer.echo(f"overall: {rep.get('overall')}")
+            for step in rep.get("steps", []):
+                typer.echo(f"  {step['name']:<16} {step['status']:<8} reasons={step['classification']['reasons']} "
+                           f"media_body_created={step['media_body_created']}")
+            for r in (j.meta or {}).get("recommendations", []):
+                typer.echo(f"  - {r}")
 
 
 # --------------------------------------------------------------------------- #
