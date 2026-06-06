@@ -1,7 +1,8 @@
-"""Liked-videos library endpoints (Phase 6A).
+"""Liked-videos library + bulk-archive endpoints (Phase 6A / 7C).
 
 Liked videos are personal data: ``raw_json`` is NOT returned unless
-``include_raw=true``. Enqueueing metadata uses ``metadata_only`` (no body DL).
+``include_raw=true``. ``enqueue-metadata`` uses ``metadata_only`` (no body DL);
+``enqueue-archive`` downloads the BODY (callers must opt in explicitly).
 """
 
 from __future__ import annotations
@@ -13,18 +14,39 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.config import get_settings
 from app.logging_setup import get_logger
-from app.models import LikedVideo, Video
+from app.models import Job, LikedVideo, MediaFile, Video
 from app.schemas import (
+    JobOutClassified,
+    LikedArchiveEnqueueOut,
+    LikedArchivePlanOut,
+    LikedArchiveRequest,
+    LikedRetryFailedOut,
+    LikedRetryFailedRequest,
     LikedVideoOut,
     LikedVideosEnqueueOut,
     LikedVideosEnqueueRequest,
     LikedVideoStatsOut,
 )
+from app.schemas import JobClassification
 from app.services import jobs as jobs_svc
-from app.services.profiles import get_profile_spec
+from app.services import liked_archive as la
+from app.services.job_classify import classify_job
+from app.services.urls import canonical_video_url
 
 router = APIRouter(prefix="/api/liked-videos", tags=["liked-videos"])
 logger = get_logger(__name__)
+
+
+def _filters(req: LikedArchiveRequest) -> la.LikedFilters:
+    return la.LikedFilters(
+        source=req.source,
+        channel=req.channel,
+        title=req.title,
+        liked_after=req.liked_after,
+        liked_before=req.liked_before,
+        missing_metadata=req.missing_metadata,
+        missing_body=req.missing_body,
+    )
 
 
 @router.get("", response_model=list[LikedVideoOut])
@@ -32,6 +54,8 @@ def list_liked_videos(
     db: Session = Depends(get_db),
     q: str | None = Query(default=None, description="search title/channel/id"),
     only_missing_metadata: bool = Query(default=False),
+    only_missing_body: bool = Query(default=False),
+    source: str | None = Query(default=None),
     include_raw: bool = Query(default=False),
     limit: int = Query(default=50, le=500),
     offset: int = Query(default=0, ge=0),
@@ -39,6 +63,8 @@ def list_liked_videos(
     stmt = select(LikedVideo, Video).join(
         Video, Video.id == LikedVideo.video_id, isouter=True
     )
+    if source and source != "all":
+        stmt = stmt.where(LikedVideo.source == source)
     if q:
         like = f"%{q}%"
         stmt = stmt.where(
@@ -46,25 +72,63 @@ def list_liked_videos(
             | (LikedVideo.channel_title.ilike(like))
             | (LikedVideo.youtube_video_id.ilike(like))
         )
-    stmt = stmt.order_by(
-        LikedVideo.liked_at.desc().nullslast(), LikedVideo.id.desc()
-    )
-    rows = db.execute(stmt.limit(limit).offset(offset)).all()
-    out: list[LikedVideoOut] = []
+    stmt = stmt.order_by(LikedVideo.liked_at.desc().nullslast(), LikedVideo.id.desc())
+    # Over-fetch so client-side body/metadata filters still fill the page.
+    rows = db.execute(stmt.limit(limit + offset + 200).offset(0)).all()
+
+    video_ids = [v.id for _lv, v in rows if v is not None]
+    body_map = la._body_count_map(db, video_ids)
+    meta_map = la._meta_count_map(db, video_ids)
+
+    # Resolve each liked row to the SAME canonical URL that archive jobs use
+    # (jobs are created with video.url or canonical_video_url(id), i.e. the
+    # /watch?v= form — not the youtu.be short link stored on LikedVideo).
+    def _job_url(lv: LikedVideo, video: Video | None) -> str | None:
+        if video is not None and video.url:
+            return video.url
+        if lv.youtube_video_id:
+            return canonical_video_url(lv.youtube_video_id)
+        return lv.url
+
+    url_for_row = {lv.id: _job_url(lv, v) for lv, v in rows}
+    urls = [u for u in url_for_row.values() if u]
+    latest: dict[str, Job] = {}
+    if urls:
+        for j in db.scalars(
+            select(Job).where(Job.url.in_(urls), Job.type == "download").order_by(Job.id.desc())
+        ):
+            latest.setdefault(j.url, j)
+
+    filtered: list[LikedVideoOut] = []
     for lv, video in rows:
-        fetched = bool(video is not None and video.title)
-        if only_missing_metadata and fetched:
+        bc = body_map.get(video.id, 0) if video is not None else 0
+        mc = meta_map.get(video.id, 0) if video is not None else 0
+        has_meta = bool(video is not None and (video.title or mc > 0))
+        has_body = bc > 0
+        if only_missing_metadata and has_meta:
+            continue
+        if only_missing_body and has_body:
             continue
         o = LikedVideoOut.model_validate(lv)
-        o.metadata_fetched = fetched
-        # prefer the enriched Video title/channel for display when present
+        o.metadata_fetched = has_meta
+        o.has_metadata = has_meta
+        o.has_body = has_body
+        o.body_media_count = bc
+        o.metadata_file_count = mc
         if video is not None:
             o.title = video.title or o.title
             o.channel_title = video.channel_title or o.channel_title
+        ju = url_for_row.get(lv.id)
+        j = latest.get(ju) if ju else None
+        if j is not None:
+            o.latest_archive_job_id = j.id
+            o.latest_archive_job_status = j.status
+            c = classify_job(j)
+            o.latest_archive_classification = c.get("summary")
         if not include_raw:
             o.raw_json = None
-        out.append(o)
-    return out
+        filtered.append(o)
+    return filtered[offset : offset + limit]
 
 
 @router.get("/stats", response_model=LikedVideoStatsOut)
@@ -97,56 +161,99 @@ def liked_videos_stats(db: Session = Depends(get_db)) -> LikedVideoStatsOut:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Phase 7C: plan / enqueue / retry
+# --------------------------------------------------------------------------- #
+@router.post("/archive-plan", response_model=LikedArchivePlanOut)
+def archive_plan(req: LikedArchiveRequest, db: Session = Depends(get_db)) -> LikedArchivePlanOut:
+    """Preview what an archive run would touch — no jobs are created."""
+    plan = la.archive_plan(
+        db, get_settings(), filters=_filters(req), profile=req.profile, limit=req.limit
+    )
+    return LikedArchivePlanOut(**plan.__dict__)
+
+
 @router.post("/enqueue-metadata", response_model=LikedVideosEnqueueOut)
 def enqueue_metadata(
     req: LikedVideosEnqueueRequest, db: Session = Depends(get_db)
 ) -> LikedVideosEnqueueOut:
-    """Enqueue metadata_only jobs for liked videos (default: those missing metadata).
-
-    Uses ``metadata_only`` so the video BODY is never downloaded.
-    """
-    profile = req.profile or "metadata_only"
+    """Enqueue metadata_only jobs (never downloads the body). Backward compatible."""
+    profile = req.profile or la.METADATA_PROFILE
     try:
-        get_profile_spec(db, profile)
+        result = la.enqueue_metadata(
+            db,
+            get_settings(),
+            filters=la.LikedFilters(missing_metadata=req.only_missing_metadata),
+            limit=req.limit,
+            profile=profile,
+        )
     except KeyError:
         raise HTTPException(status_code=400, detail=f"unknown profile: {profile!r}")
-
-    stmt = (
-        select(LikedVideo, Video)
-        .join(Video, Video.id == LikedVideo.video_id, isouter=True)
-        .where(LikedVideo.youtube_video_id.is_not(None))
-        .order_by(LikedVideo.liked_at.desc().nullslast(), LikedVideo.id.desc())
-    )
-    rows = db.execute(stmt).all()
-    job_ids: list[int] = []
-    selected = 0
-    seen: set[str] = set()
-    for lv, video in rows:
-        if req.limit is not None and selected >= req.limit:
-            break
-        if req.only_missing_metadata and video is not None and video.title:
-            continue
-        vid = lv.youtube_video_id
-        if not vid or vid in seen:
-            continue
-        seen.add(vid)
-        selected += 1
-        v = jobs_svc.resolve_or_create_video(db, vid)
-        if v is None:
-            continue
-        job = jobs_svc.create_job_for_url(
-            db, v.url, profile, extra_meta={"enqueued_by": "liked_videos"}
-        )
-        job_ids.append(job.id)
-
-    db.commit()
-    submitted = 0
-    for jid in job_ids:
-        try:
-            jobs_svc.submit_job(jid)
-            submitted += 1
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("liked-videos enqueue: job %s not submitted: %s", jid, exc)
     return LikedVideosEnqueueOut(
-        videos_selected=selected, jobs_created=len(job_ids), job_ids=job_ids
+        videos_selected=result.selected_count,
+        jobs_created=result.jobs_created,
+        job_ids=result.job_ids,
     )
+
+
+@router.post("/enqueue-metadata-v2", response_model=LikedArchiveEnqueueOut)
+def enqueue_metadata_v2(
+    req: LikedArchiveRequest, db: Session = Depends(get_db)
+) -> LikedArchiveEnqueueOut:
+    """Richer metadata enqueue (filters + dry-run). Never downloads the body."""
+    profile = req.profile or la.METADATA_PROFILE
+    try:
+        result = la.enqueue_metadata(
+            db, get_settings(), filters=_filters(req), limit=req.limit,
+            profile=profile, dry_run=req.dry_run,
+        )
+    except KeyError:
+        raise HTTPException(status_code=400, detail=f"unknown profile: {profile!r}")
+    return LikedArchiveEnqueueOut(**result.__dict__)
+
+
+@router.post("/enqueue-archive", response_model=LikedArchiveEnqueueOut)
+def enqueue_archive(
+    req: LikedArchiveRequest, db: Session = Depends(get_db)
+) -> LikedArchiveEnqueueOut:
+    """Enqueue a BODY archive (downloads the video body with the given profile).
+
+    WARNING: this downloads the video BODY. Use a small ``limit`` and check the
+    plan first. ``dry_run=true`` creates no jobs.
+    """
+    settings = get_settings()
+    profile = req.profile or settings.liked_archive_default_profile
+    try:
+        result = la.enqueue_archive(
+            db, settings, filters=_filters(req), limit=req.limit,
+            profile=profile, dry_run=req.dry_run,
+        )
+    except KeyError:
+        raise HTTPException(status_code=400, detail=f"unknown profile: {profile!r}")
+    return LikedArchiveEnqueueOut(**result.__dict__)
+
+
+@router.get("/retryable", response_model=list[JobOutClassified])
+def liked_retryable(
+    db: Session = Depends(get_db),
+    reason: str | None = Query(default=None),
+    limit: int = Query(default=50, le=500),
+) -> list[JobOutClassified]:
+    """Retryable liked-archive jobs (failed/partial, under the attempt cap)."""
+    out: list[JobOutClassified] = []
+    for j, c in la.retryable_liked(db, get_settings(), reason=reason, limit=limit):
+        item = JobOutClassified.model_validate(j)
+        item.classification = JobClassification(**c)
+        out.append(item)
+    return out
+
+
+@router.post("/retry-failed", response_model=LikedRetryFailedOut)
+def liked_retry_failed(
+    req: LikedRetryFailedRequest, db: Session = Depends(get_db)
+) -> LikedRetryFailedOut:
+    """Re-queue retryable liked-archive jobs (respects the attempt cap)."""
+    job_ids = la.retry_failed_liked(
+        db, get_settings(), reason=req.reason, limit=req.limit
+    )
+    return LikedRetryFailedOut(retried=len(job_ids), job_ids=job_ids)

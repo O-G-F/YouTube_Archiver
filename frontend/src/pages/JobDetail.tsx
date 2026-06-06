@@ -61,6 +61,7 @@ export default function JobDetail() {
     | { overall?: string; steps?: Array<Record<string, unknown>>; reasons?: string[] }
     | undefined;
   const recommendations = (meta.recommendations as string[] | undefined) ?? [];
+  const isLikedArchive = meta.source_action === "liked_archive";
 
   return (
     <div>
@@ -88,6 +89,17 @@ export default function JobDetail() {
       <ErrorBox error={actionErr} />
       {flash && <div className="flash">{flash}</div>}
       <JobClassificationNote job={job} />
+
+      {isLikedArchive && (
+        <div className="flash">
+          ❤ From <Link to="/liked-videos">Liked videos</Link> — requested profile{" "}
+          <code>{String(meta.requested_profile ?? job.profile_name ?? "")}</code>
+          {meta.requested_profile && meta.requested_profile !== "metadata_only"
+            ? " (downloads the video body)"
+            : " (metadata only, no body)"}
+          .
+        </div>
+      )}
 
       {job.type === "youtube_diagnostic" && (diag || recommendations.length > 0) && (
         <div className="panel">

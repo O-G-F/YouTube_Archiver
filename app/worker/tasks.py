@@ -91,14 +91,22 @@ def run_job(job_id: int) -> None:
 # --------------------------------------------------------------------------- #
 def _run_download(settings: Settings, job_id: int) -> None:
     # Rate control: space out consecutive download jobs on a single worker so a
-    # large expand does not hammer YouTube (helps avoid HTTP 429).
-    if settings.download_job_delay_seconds and settings.download_job_delay_seconds > 0:
-        time.sleep(settings.download_job_delay_seconds)
-
+    # large expand / liked-archive batch does not hammer YouTube (avoids 429).
     with session_scope() as s:
         job = s.get(Job, job_id)
         url = job.url
         profile_name = job.profile_name or settings.default_profile
+        is_liked = (job.meta or {}).get("source_action") == "liked_archive"
+
+    delay = settings.download_job_delay_seconds or 0.0
+    if is_liked and settings.liked_archive_job_delay_seconds > 0:
+        # liked-archive batches use the (usually larger) liked-archive delay.
+        delay = max(delay, settings.liked_archive_job_delay_seconds)
+    if delay and delay > 0:
+        time.sleep(delay)
+
+    with session_scope() as s:
+        job = s.get(Job, job_id)
         jobs_svc.mark_running(s, job)
 
     parsed = normalize_url(url)

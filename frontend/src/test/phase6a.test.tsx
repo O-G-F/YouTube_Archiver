@@ -18,6 +18,13 @@ vi.mock("../api/endpoints", () => {
       video_id: 10,
       created_at: "2026-01-01T00:00:00",
       metadata_fetched: false,
+      has_metadata: false,
+      has_body: false,
+      body_media_count: 0,
+      metadata_file_count: 0,
+      latest_archive_job_id: null,
+      latest_archive_job_status: null,
+      latest_archive_classification: null,
       raw_json: null,
     },
     {
@@ -31,6 +38,13 @@ vi.mock("../api/endpoints", () => {
       video_id: 11,
       created_at: "2026-01-01T00:00:00",
       metadata_fetched: true,
+      has_metadata: true,
+      has_body: true,
+      body_media_count: 1,
+      metadata_file_count: 2,
+      latest_archive_job_id: 12,
+      latest_archive_job_status: "success",
+      latest_archive_classification: "Success",
       raw_json: null,
     },
   ];
@@ -48,6 +62,10 @@ vi.mock("../api/endpoints", () => {
       likedVideosStats: vi.fn(async () => stats),
       archiveUrl: vi.fn(async () => ({ id: 99 })),
       enqueueLikedMetadata: vi.fn(async () => ({ videos_selected: 1, jobs_created: 1, job_ids: [99] })),
+      enqueueLikedMetadataV2: vi.fn(),
+      enqueueLikedArchive: vi.fn(),
+      likedArchivePlan: vi.fn(),
+      likedRetryFailed: vi.fn(),
     },
     thumbnailUrl: (id: number) => `/api/videos/${id}/thumbnail`,
     mediaUrl: (v: number, m: number) => `/api/videos/${v}/media/${m}`,
@@ -65,9 +83,11 @@ describe("LikedVideos page", () => {
     );
     await waitFor(() => expect(screen.getByText("(metadata not fetched)")).toBeInTheDocument());
     expect(screen.getByText("Fetched One")).toBeInTheDocument();
-    // the unfetched row shows the 未取得 badge + a Fetch metadata button
+    // the unfetched row shows the 未取得 (metadata) + 未保存 (body) badges
     expect(screen.getByText("未取得")).toBeInTheDocument();
     expect(screen.getByText("fetched")).toBeInTheDocument();
-    expect(screen.getAllByText("Fetch metadata").length).toBeGreaterThanOrEqual(1);
+    // bulk archive actions are present in the toolbar
+    expect(screen.getByText(/Enqueue metadata/)).toBeInTheDocument();
+    expect(screen.getByText(/Enqueue archive/)).toBeInTheDocument();
   });
 });

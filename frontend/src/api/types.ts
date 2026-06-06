@@ -351,7 +351,41 @@ export interface LikedVideo {
   video_id: number | null;
   created_at: string;
   metadata_fetched: boolean;
+  // Phase 7C body/metadata state
+  has_metadata: boolean;
+  has_body: boolean;
+  body_media_count: number;
+  metadata_file_count: number;
+  latest_archive_job_id: number | null;
+  latest_archive_job_status: string | null;
+  latest_archive_classification: string | null;
   raw_json: Record<string, unknown> | null;
+}
+
+export interface LikedArchivePlan {
+  total_candidates: number;
+  missing_metadata: number;
+  missing_body: number;
+  has_body: number;
+  existing_active_jobs: number;
+  existing_retryable: number;
+  recommended_limit: number;
+  recommended_delay_seconds: number;
+  recommended_profile: string;
+  profile: string;
+  notes: string[];
+}
+
+export interface LikedArchiveEnqueueResult {
+  selected_count: number;
+  jobs_created: number;
+  skipped_existing_job: number;
+  skipped_already_has_metadata: number;
+  skipped_already_has_body: number;
+  job_ids: number[];
+  profile: string;
+  downloads_body: boolean;
+  dry_run: boolean;
 }
 
 export interface LikedVideoStats {

@@ -147,6 +147,13 @@ pre.json { color: #c9d1d9; }
 .flash { background: rgba(79,156,249,.12); border: 1px solid var(--accent-dim); border-radius: 8px; padding: 8px 12px; margin: 8px 0; color: #cfe3ff; }
 .video-player { width: 100%; max-height: 460px; background: #000; border-radius: 8px; border: 1px solid var(--border); }
 
+/* ---- Phase 7C: liked-archive confirm modal ---- */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 16px; }
+.modal-card { background: var(--panel, #161922); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; width: min(560px, 96vw); max-height: 90vh; overflow: auto; box-shadow: 0 10px 40px rgba(0,0,0,.5); }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0; }
+.form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted, #9aa4b2); }
+.form-grid input, .form-grid select { padding: 6px 8px; }
+
 /* ---- Phase 5B: watch / player layout ---- */
 .watch-layout { display: grid; grid-template-columns: minmax(0,1fr) 340px; gap: 22px; align-items: start; }
 @media (max-width: 1080px) { .watch-layout { grid-template-columns: 1fr; } }

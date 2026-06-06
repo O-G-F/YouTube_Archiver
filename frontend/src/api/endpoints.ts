@@ -33,7 +33,22 @@ import type {
   YouTubeApiStatus,
   YouTubeApiSyncResult,
   YouTubeDoctor,
+  LikedArchivePlan,
+  LikedArchiveEnqueueResult,
 } from "./types";
+
+export interface LikedArchiveBody {
+  source?: string;
+  channel?: string;
+  title?: string;
+  liked_after?: string;
+  liked_before?: string;
+  missing_metadata?: boolean;
+  missing_body?: boolean;
+  profile?: string;
+  limit?: number;
+  dry_run?: boolean;
+}
 
 export function mediaUrl(videoId: number, mediaFileId: number): string {
   const base = (import.meta.env.VITE_API_BASE as string | undefined) ?? "";
@@ -168,8 +183,16 @@ export const api = {
   librarySummary: () => apiGet<LibrarySummary>("/api/library/summary"),
 
   // Liked videos (Phase 6A)
-  likedVideos: (p: { q?: string; only_missing_metadata?: boolean; limit?: number; offset?: number } = {}) =>
-    apiGet<LikedVideo[]>(`/api/liked-videos${qs(p)}`),
+  likedVideos: (
+    p: {
+      q?: string;
+      only_missing_metadata?: boolean;
+      only_missing_body?: boolean;
+      source?: string;
+      limit?: number;
+      offset?: number;
+    } = {}
+  ) => apiGet<LikedVideo[]>(`/api/liked-videos${qs(p)}`),
   likedVideosStats: () => apiGet<LikedVideoStats>("/api/liked-videos/stats"),
   importLikedVideos: (body: { path: string; limit?: number; dry_run?: boolean }) =>
     apiPost<{ imported_count: number; skipped_duplicate_count: number; videos_created: number; dry_run: boolean }>(
@@ -178,6 +201,18 @@ export const api = {
     ),
   enqueueLikedMetadata: (body: { profile?: string; limit?: number; only_missing_metadata?: boolean }) =>
     apiPost<LikedVideosEnqueueResult>("/api/liked-videos/enqueue-metadata", body),
+
+  // Phase 7C: liked-videos bulk archive
+  likedArchivePlan: (body: LikedArchiveBody) =>
+    apiPost<LikedArchivePlan>("/api/liked-videos/archive-plan", body),
+  enqueueLikedMetadataV2: (body: LikedArchiveBody) =>
+    apiPost<LikedArchiveEnqueueResult>("/api/liked-videos/enqueue-metadata-v2", body),
+  enqueueLikedArchive: (body: LikedArchiveBody) =>
+    apiPost<LikedArchiveEnqueueResult>("/api/liked-videos/enqueue-archive", body),
+  likedRetryable: (p: { reason?: string; limit?: number } = {}) =>
+    apiGet<Job[]>(`/api/liked-videos/retryable${qs(p)}`),
+  likedRetryFailed: (body: { reason?: string; limit?: number }) =>
+    apiPost<{ retried: number; job_ids: number[] }>("/api/liked-videos/retry-failed", body),
 
   // YouTube fetch-stability doctor / diagnostics (Phase 7B)
   doctorYoutube: () => apiGet<YouTubeDoctor>("/api/doctor/youtube"),

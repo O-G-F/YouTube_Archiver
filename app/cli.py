@@ -1494,46 +1494,158 @@ def liked_videos_stats() -> None:
     typer.echo(f"metadata fetched  : {fetched}")
 
 
+def _liked_filters(source: str, channel: str, title: str, *, missing_metadata=False, missing_body=False):
+    from app.services.liked_archive import LikedFilters
+
+    return LikedFilters(
+        source=(source or None),
+        channel=(channel or None),
+        title=(title or None),
+        missing_metadata=missing_metadata,
+        missing_body=missing_body,
+    )
+
+
 @liked_videos_app.command("enqueue-metadata")
 def liked_videos_enqueue_metadata(
-    limit: int = typer.Option(20, "--limit", help="Max videos to enqueue (0 = all)."),
+    limit: int = typer.Option(20, "--limit", help="Max videos to enqueue."),
     profile: str = typer.Option("metadata_only", "--profile"),
-    all_: bool = typer.Option(False, "--all", help="Include liked videos that already have metadata."),
+    missing_only: bool = typer.Option(True, "--missing-only/--all", help="Only liked videos missing metadata."),
+    source: str = typer.Option("", "--source", help="takeout_my_activity | youtube_data_api | all"),
+    channel: str = typer.Option("", "--channel"),
+    title: str = typer.Option("", "--title", help="title/channel/id contains"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
     now: bool = typer.Option(False, "--now"),
 ) -> None:
-    """Enqueue metadata_only jobs for liked videos (default: those missing metadata)."""
-    from app.models import LikedVideo, Video
+    """Enqueue metadata_only jobs for liked videos (NEVER downloads the body)."""
+    from app.services import liked_archive as la
 
     _ensure_profile(profile)
-    job_ids: list[int] = []
     with session_scope() as s:
-        rows = s.execute(
-            select(LikedVideo, Video)
-            .join(Video, Video.id == LikedVideo.video_id, isouter=True)
-            .where(LikedVideo.youtube_video_id.is_not(None))
-            .order_by(LikedVideo.liked_at.desc().nulls_last(), LikedVideo.id.desc())
-        ).all()
-        seen: set[str] = set()
-        for lv, video in rows:
-            if limit and len(job_ids) >= limit:
-                break
-            if not all_ and video is not None and video.title:
-                continue
-            vid = lv.youtube_video_id
-            if not vid or vid in seen:
-                continue
-            seen.add(vid)
-            v = jobs_svc.resolve_or_create_video(s, vid)
-            if v is None:
-                continue
-            job_ids.append(
-                jobs_svc.create_job_for_url(
-                    s, v.url, profile, extra_meta={"enqueued_by": "liked_videos"}
-                ).id
+        r = la.enqueue_metadata(
+            s, get_settings(),
+            filters=_liked_filters(source, channel, title, missing_metadata=missing_only),
+            limit=limit, profile=profile, dry_run=dry_run, submit=not now,
+        )
+        job_ids = list(r.job_ids)
+        typer.echo(
+            f"[metadata_only — body NOT downloaded] selected={r.selected_count} created={r.jobs_created} "
+            f"skipped_existing={r.skipped_existing_job} skipped_has_metadata={r.skipped_already_has_metadata}"
+            + ("  (dry-run)" if dry_run else "")
+        )
+    if now and not dry_run:
+        for jid in job_ids:
+            _dispatch(jid, True)
+
+
+@liked_videos_app.command("plan-archive")
+def liked_videos_plan_archive(
+    limit: int = typer.Option(0, "--limit", help="0 = use default limit."),
+    profile: str = typer.Option("", "--profile", help="Body profile (default LIKED_ARCHIVE_DEFAULT_PROFILE)."),
+    source: str = typer.Option("", "--source"),
+    channel: str = typer.Option("", "--channel"),
+    title: str = typer.Option("", "--title"),
+) -> None:
+    """Preview a liked-videos archive run (no jobs are created)."""
+    from app.services import liked_archive as la
+
+    with session_scope() as s:
+        plan = la.archive_plan(
+            s, get_settings(),
+            filters=_liked_filters(source, channel, title),
+            profile=(profile or None), limit=(limit or None),
+        )
+    typer.echo("== liked archive plan ==")
+    typer.echo(f"  candidates:        {plan.total_candidates}")
+    typer.echo(f"  missing metadata:  {plan.missing_metadata}")
+    typer.echo(f"  missing body:      {plan.missing_body}")
+    typer.echo(f"  already have body: {plan.has_body}")
+    typer.echo(f"  active jobs:       {plan.existing_active_jobs}")
+    typer.echo(f"  retryable (liked): {plan.existing_retryable}")
+    typer.echo(f"  recommended limit: {plan.recommended_limit}")
+    typer.echo(f"  recommended delay: {plan.recommended_delay_seconds}s")
+    typer.echo(f"  body profile:      {plan.profile}")
+    for n in plan.notes:
+        typer.echo(f"  - {n}")
+
+
+@liked_videos_app.command("enqueue-archive")
+def liked_videos_enqueue_archive(
+    limit: int = typer.Option(0, "--limit", help="0 = use LIKED_ARCHIVE_DEFAULT_LIMIT."),
+    profile: str = typer.Option("", "--profile", help="Body profile (default LIKED_ARCHIVE_DEFAULT_PROFILE)."),
+    missing_body_only: bool = typer.Option(True, "--missing-body-only/--all", help="Only liked videos without a saved body."),
+    source: str = typer.Option("", "--source"),
+    channel: str = typer.Option("", "--channel"),
+    title: str = typer.Option("", "--title"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    now: bool = typer.Option(False, "--now"),
+) -> None:
+    """Enqueue a BODY archive for liked videos (DOWNLOADS the video body!)."""
+    from app.services import liked_archive as la
+
+    settings = get_settings()
+    prof = profile or settings.liked_archive_default_profile
+    _ensure_profile(prof)
+    with session_scope() as s:
+        r = la.enqueue_archive(
+            s, settings,
+            filters=_liked_filters(source, channel, title, missing_body=missing_body_only),
+            limit=(limit or None), profile=prof, dry_run=dry_run, submit=not now,
+        )
+        job_ids = list(r.job_ids)
+    typer.secho(
+        f"[VIDEO BODY DOWNLOAD — profile {prof}] selected={r.selected_count} created={r.jobs_created} "
+        f"skipped_existing={r.skipped_existing_job} skipped_has_body={r.skipped_already_has_body}"
+        + ("  (dry-run, no jobs created)" if dry_run else ""),
+        fg=typer.colors.YELLOW,
+    )
+    if now and not dry_run:
+        for jid in job_ids:
+            _dispatch(jid, True)
+
+
+@liked_videos_app.command("retryable")
+def liked_videos_retryable(
+    limit: int = typer.Option(50, "--limit"),
+    reason: str = typer.Option("", "--reason", help="filter by classification reason"),
+) -> None:
+    """List retryable liked-archive jobs (failed/partial, under the attempt cap)."""
+    from app.services import liked_archive as la
+
+    with session_scope() as s:
+        rows = la.retryable_liked(s, get_settings(), reason=(reason or None), limit=limit)
+        if not rows:
+            typer.echo("No retryable liked-archive jobs.")
+            return
+        for j, c in rows:
+            typer.echo(
+                f"  job #{j.id}  {j.status:<15} retry={j.retry_count or 0}  "
+                f"reasons={c['reasons']}  {j.url}"
             )
-    typer.echo(f"Created {len(job_ids)} {profile} job(s) for liked videos.")
-    for jid in job_ids:
-        _dispatch(jid, now)
+
+
+@liked_videos_app.command("retry-failed")
+def liked_videos_retry_failed(
+    limit: int = typer.Option(20, "--limit"),
+    reason: str = typer.Option("", "--reason", help="only retry this reason (e.g. rate_limited)"),
+    now: bool = typer.Option(False, "--now"),
+) -> None:
+    """Re-queue retryable liked-archive jobs (respects the attempt cap)."""
+    from app.services import liked_archive as la
+
+    with session_scope() as s:
+        if now:
+            rows = la.retryable_liked(s, get_settings(), reason=(reason or None), limit=limit)
+            job_ids = [j.id for j, _c in rows]
+            for j, _c in rows:
+                jobs_svc.retry_job(s, j)
+            s.commit()
+        else:
+            job_ids = la.retry_failed_liked(s, get_settings(), reason=(reason or None), limit=limit)
+    typer.echo(f"Re-queued {len(job_ids)} liked-archive job(s): {job_ids}")
+    if now:
+        for jid in job_ids:
+            _dispatch(jid, True)
 
 
 # --------------------------------------------------------------------------- #

@@ -119,6 +119,19 @@ class Settings(BaseSettings):
     scheduler_retry_enabled: bool = False
     scheduler_retry_limit_per_run: int = 10
 
+    # ---- Liked-videos bulk archive (Phase 7C) ----
+    # Safe defaults: archive a SMALL number at a time (start with 10-30).
+    liked_archive_default_limit: int = 20
+    # Hard cap on how many jobs a single enqueue call may create (safety brake).
+    liked_archive_max_enqueue_per_run: int = 50
+    # Profile used for a body archive (downloads the video BODY).
+    liked_archive_default_profile: str = "video_compressed_1080p"
+    # Extra per-job sleep applied to liked-archive download jobs (throttling).
+    liked_archive_job_delay_seconds: float = 0.0
+    # Optional scheduler pickup of pending liked archives (default OFF).
+    scheduler_liked_archive_enabled: bool = False
+    scheduler_liked_archive_limit_per_run: int = 5
+
     # ---- YouTube fetch stabilization secrets (Phase 7A / 7B) ----
     # All are SECRETS: never returned by the API / shown in the UI (only a
     # configured yes/no). cookies_file is defined above (Phase 0).

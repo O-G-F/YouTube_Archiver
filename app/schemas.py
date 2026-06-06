@@ -557,7 +557,67 @@ class LikedVideoOut(BaseModel):
     created_at: datetime
     # metadata-fetched = a linked Video has a title (filled later by metadata_only)
     metadata_fetched: bool = False
+    # Phase 7C body/metadata state (distinguishes metadata files from a saved body).
+    has_metadata: bool = False
+    has_body: bool = False
+    body_media_count: int = 0
+    metadata_file_count: int = 0
+    latest_archive_job_id: int | None = None
+    latest_archive_job_status: str | None = None
+    latest_archive_classification: str | None = None
     raw_json: dict | None = None  # only when include_raw=true
+
+
+# ---- Phase 7C: liked-videos bulk archive ----
+class LikedArchiveRequest(BaseModel):
+    """Shared filters + action params for plan / enqueue."""
+
+    source: str | None = None  # takeout_my_activity | youtube_data_api | all
+    channel: str | None = None
+    title: str | None = None
+    liked_after: datetime | None = None
+    liked_before: datetime | None = None
+    missing_metadata: bool = False
+    missing_body: bool = False
+    profile: str | None = None
+    limit: int | None = None
+    dry_run: bool = False
+
+
+class LikedArchivePlanOut(BaseModel):
+    total_candidates: int
+    missing_metadata: int
+    missing_body: int
+    has_body: int
+    existing_active_jobs: int
+    existing_retryable: int
+    recommended_limit: int
+    recommended_delay_seconds: float
+    recommended_profile: str
+    profile: str
+    notes: list[str] = Field(default_factory=list)
+
+
+class LikedArchiveEnqueueOut(BaseModel):
+    selected_count: int
+    jobs_created: int
+    skipped_existing_job: int
+    skipped_already_has_metadata: int
+    skipped_already_has_body: int
+    job_ids: list[int] = Field(default_factory=list)
+    profile: str
+    downloads_body: bool
+    dry_run: bool
+
+
+class LikedRetryFailedRequest(BaseModel):
+    reason: str | None = None
+    limit: int = 20
+
+
+class LikedRetryFailedOut(BaseModel):
+    retried: int
+    job_ids: list[int] = Field(default_factory=list)
 
 
 class LikedVideoStatsOut(BaseModel):

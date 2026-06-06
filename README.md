@@ -656,7 +656,13 @@ archiver takeout import-all takeout.zip --limit-liked 100   # 他セクション
 # 一覧 / 統計 / メタデータ後追い取得（本体は保存しない）
 archiver liked-videos list [--only-missing-metadata]
 archiver liked-videos stats
-archiver liked-videos enqueue-metadata --limit 20 --profile metadata_only [--now]
+archiver liked-videos enqueue-metadata --limit 20 --profile metadata_only [--missing-only|--all] [--now]
+# Phase 7C: 一括アーカイブ（plan → metadata → body archive を少量ずつ）
+archiver liked-videos plan-archive [--profile video_compressed_1080p] [--source ..] [--channel ..]
+archiver liked-videos enqueue-archive --limit 1 --profile video_compressed_1080p --missing-body-only --dry-run
+archiver liked-videos enqueue-archive --limit 1 --profile video_compressed_1080p --now   # 本体 DL（少量）
+archiver liked-videos retryable [--reason rate_limited]
+archiver liked-videos retry-failed --limit 20 [--reason rate_limited] [--now]
 ```
 
 - **video stub 連携**: `youtube_video_id` がある liked entry は `videos` に stub を作成/統合（既存があれば紐付け）。`title`/`channel` は取得できた範囲で補完し、後から `metadata_only` で詳細を埋められます。
@@ -900,6 +906,66 @@ archiver doctor youtube --test-url https://youtu.be/<ID>
 
 - doctor / diagnostics / Settings は **configured yes/no と file_exists/readable のみ**。cookie パス・PO-token・visitor data・OAuth token は **UI/API/log/command に一切出さない**（`redact_args` + `logs.mask_secrets` で `po_token=******` / `visitor_data=******` / `--cookies ***REDACTED***`）。診断の本体 DL は**一時 dir→即削除**で `MediaFile` を作らない。cookies / OAuth secret/token / PO-token / Takeout ZIP は **Git 非管理**。
 
+### Liked videos 一括アーカイブ（Phase 7C）
+
+My Activity Takeout から取り込んだ **liked videos** を、429 / Incomplete data / subtitles_failed を前提に **少量ずつ安全に** metadata 取得・本体保存する運用です。**いきなり大量 DL せず、plan / dry-run → 少量 enqueue → classification 確認 → retryable 再試行** を基本とします。
+
+#### metadata_only と body archive の違い（重要）
+
+| 操作 | profile | 動画本体 | 用途 |
+|---|---|---|---|
+| **enqueue-metadata** | `metadata_only` | **保存しない**（info.json / description / thumbnail / subtitles のみ） | まず軽く取得可否を確認 |
+| **enqueue-archive** | `video_compressed_1080p` 等 | **保存する（body DL）** | 本体を残す。**少量ずつ** |
+
+> body archive は**動画本体をダウンロード**します。UI は確認ダイアログ＋赤い警告、CLI は黄色＋`[VIDEO BODY DOWNLOAD]`、API は `downloads_body=true` で明示します。
+
+#### 状態の区別（body と metadata）
+
+`/api/liked-videos` と一覧 UI は各 liked について `has_metadata` / `has_body` / `body_media_count` / `metadata_file_count` / `latest_archive_job_status` を返します（body = `video`/`audio` の `MediaFile`、metadata = info_json/description/thumbnail 等。**両者は明確に区別**）。
+
+#### plan / dry-run（先に件数を見る）
+
+```bash
+archiver liked-videos plan-archive --profile video_compressed_1080p
+# POST /api/liked-videos/archive-plan
+```
+
+候補数 / metadata 未取得 / body 未保存 / 既存 active job / retryable 件数 / **推奨 limit・delay・profile** を表示（**job は作らない**）。
+
+#### enqueue（少量ずつ）
+
+```bash
+# 1) metadata（本体 DL なし）
+archiver liked-videos enqueue-metadata --limit 3 --missing-only --now
+# 2) 本体 archive（body DL！） dry-run で確認 → 少量実行
+archiver liked-videos enqueue-archive --limit 1 --profile video_compressed_1080p --missing-body-only --dry-run
+archiver liked-videos enqueue-archive --limit 1 --profile video_compressed_1080p --now
+```
+
+- API: `POST /api/liked-videos/enqueue-metadata`（後方互換）/ `enqueue-metadata-v2`（filters+dry-run）/ `enqueue-archive`。
+- enqueue 条件: `--missing-only` / `--missing-body-only`、`--source`（takeout_my_activity / youtube_data_api / all）、`--channel`、`--title`。
+- 結果: `selected_count` / `jobs_created` / `skipped_existing_job` / `skipped_already_has_metadata` / `skipped_already_has_body` / `job_ids`。
+- 各 job は `job.meta` に `source_action=liked_archive` / `liked_video_id` / `liked_at` / `requested_profile` を付与（Job Detail から Liked videos へリンク）。
+
+#### duplicate 防止 / retry
+
+- 同じ video × profile の **queued/running** job があれば**重複 enqueue しない**（`skipped_existing_job`）。profile が違えば別物（metadata_only と video archive は両立）。
+- 失敗は liked だけ抽出して再試行: `archiver liked-videos retryable` / `retry-failed --reason rate_limited`（`GET /api/liked-videos/retryable` / `POST /api/liked-videos/retry-failed`）。**retry 回数上限（`DOWNLOAD_RETRY_MAX_ATTEMPTS`）を守り、無限 retry しない**。
+
+#### throttling（少量・間引き）
+
+- `LIKED_ARCHIVE_DEFAULT_LIMIT`（既定 20）・`LIKED_ARCHIVE_MAX_ENQUEUE_PER_RUN`（安全上限 50）・`LIKED_ARCHIVE_DEFAULT_PROFILE`・`LIKED_ARCHIVE_JOB_DELAY_SECONDS`（liked archive job に追加 sleep）。
+- **最初は 10〜30 件ずつ**。429 が出たら時間を置いて `retry-failed`。cookies / PO-token / `doctor youtube`（Phase 7B）と併用すると安定しやすい。
+- scheduler 連携（`SCHEDULER_LIKED_ARCHIVE_ENABLED`）は**既定 OFF**（手動運用優先）。
+
+#### 推奨運用
+
+1. `plan-archive` で件数確認 → 2. `enqueue-metadata --limit 3` で取得可否確認（本体非保存）→ 3. `enqueue-archive --limit 1 --dry-run` → 少量 `--now` → 4. classification を Jobs / Job Detail で確認 → 5. 429 等は `retry-failed` で時間を置いて再試行。
+
+### セキュリティ（7C）
+
+- liked archive は **limit 必須/安全既定**で大量 DL を回避。raw_json（高評価履歴の個人データ）は既定非表示。body archive は body DL を明示。`metadata_only` の**本体非保存**を維持。secret/cookie/token/PO-token は引き続き UI/API/log に出さない。
+
 ---
 
 ## ストレージ構成
@@ -1086,9 +1152,14 @@ archiver live-chat stats VIDEO_ID
 | GET | `/api/videos/channels` | 動画を持つ channel 一覧（件数付き、フィルタ用）【Phase 5B】 |
 | GET | `/api/search` | 横断検索（`?q=&types=video,comment,live_chat,collection,liked_video&limit=`、raw 非返却）【5B/6A】 |
 | GET | `/api/library/summary` | ライブラリ分類サマリ（liked は実 count）【5B/6A】 |
-| GET | `/api/liked-videos` | 高評価リスト一覧（`?q=&only_missing_metadata=&include_raw=&limit=&offset=`）【Phase 6A】 |
+| GET | `/api/liked-videos` | 高評価リスト一覧（`?q=&source=&only_missing_metadata=&only_missing_body=&include_raw=`、`has_body`/`has_metadata`/`latest_archive_*` 付き）【Phase 6A/7C】 |
 | GET | `/api/liked-videos/stats` | 高評価リスト統計【Phase 6A】 |
-| POST | `/api/liked-videos/enqueue-metadata` | 高評価動画に `metadata_only` ジョブを一括投入（本体保存なし）【Phase 6A】 |
+| POST | `/api/liked-videos/enqueue-metadata` | 高評価動画に `metadata_only` ジョブを一括投入（本体保存なし・後方互換）【Phase 6A】 |
+| POST | `/api/liked-videos/archive-plan` | 一括アーカイブの plan/dry-run（件数・推奨 limit/delay、job 作成なし）【Phase 7C】 |
+| POST | `/api/liked-videos/enqueue-metadata-v2` | metadata 一括（filters+dry-run、本体保存なし）【Phase 7C】 |
+| POST | `/api/liked-videos/enqueue-archive` | **本体 archive** 一括（body DL！ `downloads_body=true`、dry-run 可）【Phase 7C】 |
+| GET | `/api/liked-videos/retryable` | liked 由来の retryable ジョブ一覧（`?reason=&limit=`）【Phase 7C】 |
+| POST | `/api/liked-videos/retry-failed` | liked 由来 retryable を再 queue（`{reason,limit}`、回数上限尊重）【Phase 7C】 |
 | GET | `/api/takeout/files` | `TAKEOUT_IMPORT_ROOT` 配下の ZIP 一覧（root 外は不可）【Phase 5A】 |
 
 `/api/jobs`・`/api/jobs/{id}` は **`classification`**（429/partial/retryable/warnings）を含みます【Phase 5B】。Videos 一覧は `?channel_id=&sort=` を追加。
@@ -1184,6 +1255,7 @@ live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_e
   - `0008` `liked_videos` テーブル追加（`source`/`youtube_video_id`/`title`/`channel_title`/`url`/`liked_at`/`video_id`(FK)/`raw_json`/`created_at`、`(source, youtube_video_id)` ユニーク、各種 index）（Phase 6A・SQLite/PostgreSQL 両対応）
   - Phase 6B は**マイグレーション追加なし**（既存 `liked_videos.source` を `takeout_my_activity`/`takeout_youtube`/`youtube_data_api` で運用、channel_id は `raw_json` + Video stub へ反映）
   - `0009` `jobs` に `retry_count`(server_default 0) / `retry_of_job_id` / `next_retry_at`(index)（Phase 7A・retry/backoff。SQLite 互換のため自己参照 FK はプレーン列で追加）
+  - Phase 7B / 7C は**マイグレーション追加なし**（7B 診断結果は `job.meta.diagnostic`、7C liked archive は既存 `Job`/`MediaFile`/`LikedVideo` を再利用し `job.meta.source_action=liked_archive` でタグ付け）
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
 - 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 
