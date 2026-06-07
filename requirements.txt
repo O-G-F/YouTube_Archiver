@@ -24,3 +24,7 @@ curl_cffi>=0.7
 google-api-python-client>=2.100
 google-auth-oauthlib>=1.2
 google-auth-httplib2>=0.2
+# Streaming JSON parser (Phase 6C). Used to iterate huge My Activity JSON
+# arrays (90k+ watch / 11k+ liked) without loading the whole document into
+# memory. Imported lazily; a missing version falls back to json.loads.
+ijson>=3.2

@@ -487,34 +487,70 @@ def _iter_activity_dicts(value) -> Iterator[dict]:
             yield from _iter_activity_dicts(child)
 
 
+def _myactivity_item_to_liked(item: dict) -> LikedVideoEntry | None:
+    """Convert one My Activity item dict to a LikedVideoEntry (or None)."""
+    title = str(item.get("title") or "")
+    title_url = str(item.get("titleUrl") or item.get("titleURL") or "")
+    vid = extract_video_id(title_url) if title_url else None
+    if not vid or not _is_like_activity(title):
+        return None
+    channel_title = None
+    channel_id = None
+    subs = item.get("subtitles") or []
+    if isinstance(subs, list) and subs and isinstance(subs[0], dict):
+        channel_title = subs[0].get("name") or None
+        channel_id = _extract_channel_id(subs[0].get("url"))
+    return LikedVideoEntry(
+        youtube_video_id=vid,
+        title=_clean_activity_title(title),
+        channel_title=channel_title,
+        url=canonical_video_url(vid),
+        liked_at=_parse_iso_time(item.get("time")),
+        channel_id=channel_id,
+        source="takeout_my_activity",
+        raw={"title": title, "titleUrl": title_url, "time": item.get("time"), "subtitles": subs},
+    )
+
+
 def parse_myactivity_liked_json(text: str) -> Iterator[LikedVideoEntry]:
-    """Extract liked-video events from a My Activity YouTube JSON export."""
+    """Extract liked-video events from a My Activity YouTube JSON export (in-memory)."""
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
         return
     for item in _iter_activity_dicts(data):
-        title = str(item.get("title") or "")
-        title_url = str(item.get("titleUrl") or item.get("titleURL") or "")
-        vid = extract_video_id(title_url) if title_url else None
-        if not vid or not _is_like_activity(title):
-            continue
-        channel_title = None
-        channel_id = None
-        subs = item.get("subtitles") or []
-        if isinstance(subs, list) and subs and isinstance(subs[0], dict):
-            channel_title = subs[0].get("name") or None
-            channel_id = _extract_channel_id(subs[0].get("url"))
-        yield LikedVideoEntry(
-            youtube_video_id=vid,
-            title=_clean_activity_title(title),
-            channel_title=channel_title,
-            url=canonical_video_url(vid),
-            liked_at=_parse_iso_time(item.get("time")),
-            channel_id=channel_id,
-            source="takeout_my_activity",
-            raw={"title": title, "titleUrl": title_url, "time": item.get("time"), "subtitles": subs},
-        )
+        entry = _myactivity_item_to_liked(item)
+        if entry is not None:
+            yield entry
+
+
+def stream_myactivity_liked_json(fileobj) -> Iterator[LikedVideoEntry]:
+    """Stream liked-video events from a My Activity YouTube JSON file object.
+
+    Uses ijson to iterate the top-level array WITHOUT loading the whole document
+    into memory (My Activity exports reach 90k+ activity items). Falls back to
+    the in-memory parser if ijson is unavailable or the layout is unexpected.
+    """
+    try:
+        import ijson
+    except Exception:  # noqa: BLE001 - ijson missing -> fall back
+        yield from parse_myactivity_liked_json(fileobj.read().decode("utf-8-sig", errors="replace"))
+        return
+    try:
+        for item in ijson.items(fileobj, "item"):
+            if isinstance(item, dict):
+                entry = _myactivity_item_to_liked(item)
+                if entry is not None:
+                    yield entry
+            else:
+                yield from (e for e in (_myactivity_item_to_liked(d) for d in _iter_activity_dicts(item)) if e)
+    except Exception as exc:  # noqa: BLE001 - malformed stream -> degrade gracefully
+        logger.warning("my-activity stream parse failed (%s); falling back to in-memory", exc)
+        try:
+            fileobj.seek(0)
+        except Exception:  # noqa: BLE001
+            return
+        yield from parse_myactivity_liked_json(fileobj.read().decode("utf-8-sig", errors="replace"))
 
 
 def parse_watch_history_html(html: str) -> Iterator[WatchEvent]:
@@ -604,6 +640,35 @@ class TakeoutArchive:
     def _read_text(self, name: str) -> str:
         return self._read(name).decode("utf-8-sig", errors="replace")
 
+    def _open(self, name: str):
+        """Open a member as a binary stream (for ijson streaming parsing)."""
+        if _is_unsafe_member(name):
+            raise TakeoutError(f"unsafe member path: {name}")
+        info = self._members.get(name)
+        if info is None:
+            raise TakeoutError(f"member not found: {name}")
+        return self._zip.open(info)
+
+    def _stream_json_array(self, name: str) -> Iterator[dict]:
+        """Yield top-level array dicts from a JSON member, streaming via ijson.
+
+        Falls back to ``json.loads`` when ijson is unavailable / the member is
+        not a top-level array.
+        """
+        try:
+            import ijson
+
+            with self._open(name) as fh:
+                for item in ijson.items(fh, "item"):
+                    if isinstance(item, dict):
+                        yield item
+            return
+        except Exception as exc:  # noqa: BLE001 - degrade to in-memory
+            logger.warning("stream parse of %s failed (%s); using json.loads", name, exc)
+        data = json.loads(self._read_text(name))
+        if isinstance(data, list):
+            yield from (d for d in data if isinstance(d, dict))
+
     def list_files(self) -> list[TakeoutFile]:
         files: list[TakeoutFile] = []
         for name, info in sorted(self._members.items()):
@@ -654,9 +719,8 @@ class TakeoutArchive:
             if f.kind != "watch_history":
                 continue
             if f.format == "json":
-                data = json.loads(self._read_text(f.name))
-                if isinstance(data, list):
-                    yield from parse_watch_history_json(data)
+                # stream the (potentially huge) watch-history.json array
+                yield from parse_watch_history_json(self._stream_json_array(f.name))
             elif f.format == "html":
                 yield from parse_watch_history_html(self._read_text(f.name))
 
@@ -664,9 +728,7 @@ class TakeoutArchive:
         for f in self.list_files():
             if f.kind != "search_history" or f.format != "json":
                 continue
-            data = json.loads(self._read_text(f.name))
-            if isinstance(data, list):
-                yield from parse_search_history_json(data)
+            yield from parse_search_history_json(self._stream_json_array(f.name))
 
     def iter_subscriptions(self) -> Iterator[Subscription]:
         for f in self.list_files():
@@ -734,10 +796,11 @@ class TakeoutArchive:
         return self.archive_kind(), None
 
     def iter_liked_videos(self) -> Iterator[LikedVideoEntry]:
-        # My Activity export: parse the YouTube activity JSON for liked events.
+        # My Activity export: stream the YouTube activity JSON for liked events.
         ma = self.my_activity_youtube_path()
         if ma:
-            yield from parse_myactivity_liked_json(self._read_text(ma))
+            with self._open(ma) as fh:
+                yield from stream_myactivity_liked_json(fh)
             return
         # YouTube Takeout: the "Liked videos" playlist CSV (or json/html).
         for f in self.list_files():
@@ -864,6 +927,38 @@ class TakeoutArchive:
             "liked_source_kind": self.liked_source_path()[0],
             "liked_detected_path": self.liked_source_path()[1],
         }
+
+    def registry(self) -> list[dict]:
+        """Structured list of detected Takeout sources (Phase 6C deep inspect).
+
+        Maps members to canonical source kinds. ``member`` is the in-ZIP path
+        only (no host path); counts are omitted here to keep it cheap.
+        """
+        sources: list[dict] = []
+        ma = self.my_activity_youtube_path()
+        if ma:
+            sources.append({"kind": "my_activity_youtube_json", "member": ma,
+                            "format": "json", "import_kinds": ["liked_videos"]})
+        for f in self.list_files():
+            if f.kind == "watch_history":
+                sources.append({"kind": f"youtube_watch_history_{f.format}", "member": f.name,
+                                "format": f.format, "import_kinds": ["watch_history"]})
+            elif f.kind == "search_history":
+                sources.append({"kind": f"youtube_search_history_{f.format}", "member": f.name,
+                                "format": f.format, "import_kinds": ["search_history"]})
+            elif f.kind == "subscriptions":
+                sources.append({"kind": f"youtube_subscriptions_{f.format}", "member": f.name,
+                                "format": f.format, "import_kinds": ["subscriptions"]})
+            elif f.kind in ("playlist", "playlists_index"):
+                sources.append({"kind": "youtube_playlists", "member": f.name,
+                                "format": f.format, "import_kinds": ["playlists"]})
+            elif f.kind == "likes" and not ma:
+                sources.append({"kind": f"youtube_liked_videos_{f.format}", "member": f.name,
+                                "format": f.format, "import_kinds": ["liked_videos"]})
+        if any(n.endswith("archive_browser.html") for n in self._members):
+            sources.append({"kind": "takeout_index", "member": "archive_browser.html",
+                            "format": "html", "import_kinds": []})
+        return sources
 
 
 def open_archive(path: Path) -> TakeoutArchive:
@@ -1206,7 +1301,7 @@ def import_liked_videos(
         else:
             existing_titlekey.add(((title or "")[:200], (url or "")))
 
-    imported = skipped = failed = scanned = videos_created = 0
+    imported = skipped = failed = scanned = videos_created = updated = 0
     seen_ids: set[str] = set()
     seen_titlekey: set[tuple] = set()
     warnings: list[str] = []
@@ -1216,11 +1311,28 @@ def import_liked_videos(
             break
         scanned += 1
         if scanned % 2000 == 0:
-            logger.info("liked import: scanned=%d imported=%d (%s)", scanned, imported, source_kind)
+            logger.info(
+                "liked import: scanned=%d imported=%d skipped=%d updated=%d (%s)",
+                scanned, imported, skipped, updated, source_kind,
+            )
         vid = lv.youtube_video_id
         if vid:
             if vid in existing_ids or vid in seen_ids:
                 skipped += 1
+                # incremental enrichment: fill empty Video-stub fields from the
+                # re-imported entry (counts as "updated", not a new import).
+                if not dry_run and (lv.title or lv.channel_title or lv.channel_id):
+                    v = session.scalar(select(Video).where(Video.youtube_video_id == vid))
+                    if v is not None:
+                        changed = False
+                        if lv.title and not v.title:
+                            v.title = lv.title; changed = True
+                        if lv.channel_title and not v.channel_title:
+                            v.channel_title = lv.channel_title; changed = True
+                        if lv.channel_id and not v.channel_id:
+                            v.channel_id = lv.channel_id; changed = True
+                        if changed:
+                            updated += 1
                 continue
             seen_ids.add(vid)
         else:
@@ -1272,6 +1384,7 @@ def import_liked_videos(
     return {
         "imported_count": imported,
         "skipped_duplicate_count": skipped,
+        "updated_count": updated,
         "failed_count": failed,
         "scanned": scanned,
         "videos_created": videos_created,
@@ -1284,6 +1397,54 @@ def import_liked_videos(
 # --------------------------------------------------------------------------- #
 # Job-wrapped runners
 # --------------------------------------------------------------------------- #
+def record_import_session(
+    session: Session,
+    *,
+    import_kind: str,
+    path_basename: str | None,
+    source_kind: str | None,
+    result: dict,
+    dry_run: bool,
+    started_at: datetime,
+    status: str = "success",
+) -> str:
+    """Persist a TakeoutImportSession (Phase 6C). Fail-safe; no PII / full path.
+
+    Returns the generated ``session_id`` (also injected into ``result``).
+    """
+    import uuid
+
+    from app.models import TakeoutImportSession
+
+    session_id = uuid.uuid4().hex[:16]
+    try:
+        row = TakeoutImportSession(
+            session_id=session_id,
+            path_basename=(path_basename or "")[:255] or None,
+            source_kind=source_kind,
+            import_kind=import_kind,
+            started_at=started_at,
+            finished_at=utcnow(),
+            status=status,
+            dry_run=dry_run,
+            scanned=int(result.get("scanned", 0) or 0),
+            imported=int(result.get("imported_count", 0) or 0),
+            skipped_duplicate=int(result.get("skipped_duplicate_count", 0) or 0),
+            updated=int(result.get("updated_count", 0) or 0),
+            failed=int(result.get("failed_count", 0) or 0),
+            meta={
+                "videos_created": result.get("videos_created"),
+                "detected_path_present": bool(result.get("detected_path")),
+                "warning_count": len(result.get("warnings", []) or []),
+            },
+        )
+        session.add(row)
+        session.flush()
+    except Exception:  # noqa: BLE001 - session recording must never break import
+        logger.exception("takeout: failed to record import session (%s)", import_kind)
+    return session_id
+
+
 def _run_with_job(
     session: Session,
     settings: Settings,
@@ -1291,8 +1452,11 @@ def _run_with_job(
     kind: str,
     importer: Callable[[TakeoutArchive], dict],
     dry_run: bool,
+    *,
+    record_session: bool = True,
 ) -> dict:
     zip_path = resolve_takeout_path(settings, path)
+    started = utcnow()
     job: Job | None = None
     if not dry_run:
         job = Job(
@@ -1311,8 +1475,14 @@ def _run_with_job(
             job.status = "failed"
             job.finished_at = utcnow()
             session.flush()
+        if record_session:
+            record_import_session(
+                session, import_kind=kind, path_basename=zip_path.name,
+                source_kind=None, result={}, dry_run=dry_run, started_at=started, status="failed",
+            )
         raise
     result["dry_run"] = dry_run
+    result["duration_seconds"] = round((utcnow() - started).total_seconds(), 2)
     if job is not None:
         job.status = "success"
         job.finished_at = utcnow()
@@ -1320,40 +1490,69 @@ def _run_with_job(
         job.meta = {
             **(job.meta or {}),
             # persist scalar result fields (counts + source_kind/detected_path)
-            **{k: v for k, v in result.items() if isinstance(v, (int, str)) or v is None},
+            **{k: v for k, v in result.items() if isinstance(v, (int, float, str)) or v is None},
         }
         session.flush()
         result["job_id"] = job.id
     else:
         result["job_id"] = None
+    if record_session:
+        result["session_id"] = record_import_session(
+            session, import_kind=kind, path_basename=zip_path.name,
+            source_kind=result.get("source_kind"), result=result,
+            dry_run=dry_run, started_at=started,
+        )
     return result
 
 
+def list_import_sessions(session: Session, *, import_kind: str | None = None, limit: int = 50) -> list:
+    from app.models import TakeoutImportSession
+
+    stmt = select(TakeoutImportSession).order_by(TakeoutImportSession.id.desc())
+    if import_kind:
+        stmt = stmt.where(TakeoutImportSession.import_kind == import_kind)
+    return list(session.scalars(stmt.limit(limit)))
+
+
+def get_import_session(session: Session, session_id: str):
+    from app.models import TakeoutImportSession
+
+    return session.scalar(
+        select(TakeoutImportSession).where(TakeoutImportSession.session_id == session_id)
+    )
+
+
 def run_import(
-    session: Session, settings: Settings, path: str, *, limit: int | None = None, dry_run: bool = False
+    session: Session, settings: Settings, path: str, *, limit: int | None = None,
+    dry_run: bool = False, record_session: bool = True,
 ) -> dict:
     """Import watch history (Phase 3A)."""
     return _run_with_job(
         session, settings, path, "watch_history",
         lambda a: import_watch_history(session, a, limit=limit, dry_run=dry_run), dry_run,
+        record_session=record_session,
     )
 
 
 def run_import_search(
-    session: Session, settings: Settings, path: str, *, limit: int | None = None, dry_run: bool = False
+    session: Session, settings: Settings, path: str, *, limit: int | None = None,
+    dry_run: bool = False, record_session: bool = True,
 ) -> dict:
     return _run_with_job(
         session, settings, path, "search_history",
         lambda a: import_search_history(session, a, limit=limit, dry_run=dry_run), dry_run,
+        record_session=record_session,
     )
 
 
 def run_import_subscriptions(
-    session: Session, settings: Settings, path: str, *, limit: int | None = None, dry_run: bool = False
+    session: Session, settings: Settings, path: str, *, limit: int | None = None,
+    dry_run: bool = False, record_session: bool = True,
 ) -> dict:
     return _run_with_job(
         session, settings, path, "subscriptions",
         lambda a: import_subscriptions(session, a, limit=limit, dry_run=dry_run), dry_run,
+        record_session=record_session,
     )
 
 
@@ -1365,6 +1564,7 @@ def run_import_playlists(
     limit_playlists: int | None = None,
     limit_items: int | None = None,
     dry_run: bool = False,
+    record_session: bool = True,
 ) -> dict:
     return _run_with_job(
         session, settings, path, "playlists",
@@ -1372,15 +1572,18 @@ def run_import_playlists(
             session, a, limit_playlists=limit_playlists, limit_items=limit_items, dry_run=dry_run
         ),
         dry_run,
+        record_session=record_session,
     )
 
 
 def run_import_liked_videos(
-    session: Session, settings: Settings, path: str, *, limit: int | None = None, dry_run: bool = False
+    session: Session, settings: Settings, path: str, *, limit: int | None = None,
+    dry_run: bool = False, record_session: bool = True,
 ) -> dict:
     return _run_with_job(
         session, settings, path, "liked_videos",
         lambda a: import_liked_videos(session, a, limit=limit, dry_run=dry_run), dry_run,
+        record_session=record_session,
     )
 
 
@@ -1397,14 +1600,30 @@ def run_import_all(
     limit_liked: int | None = None,
     dry_run: bool = False,
 ) -> dict:
-    """Run all Takeout imports in order, returning per-kind results."""
-    return {
-        "watch_history": run_import(session, settings, path, limit=limit_watch, dry_run=dry_run),
-        "search_history": run_import_search(session, settings, path, limit=limit_search, dry_run=dry_run),
-        "subscriptions": run_import_subscriptions(session, settings, path, limit=limit_subscriptions, dry_run=dry_run),
+    """Run all Takeout imports in order, returning per-kind results + ONE combined session."""
+    started = utcnow()
+    parts = {
+        "watch_history": run_import(session, settings, path, limit=limit_watch, dry_run=dry_run, record_session=False),
+        "search_history": run_import_search(session, settings, path, limit=limit_search, dry_run=dry_run, record_session=False),
+        "subscriptions": run_import_subscriptions(session, settings, path, limit=limit_subscriptions, dry_run=dry_run, record_session=False),
         "playlists": run_import_playlists(
-            session, settings, path, limit_playlists=limit_playlists, limit_items=limit_items, dry_run=dry_run
+            session, settings, path, limit_playlists=limit_playlists, limit_items=limit_items, dry_run=dry_run, record_session=False
         ),
-        "liked_videos": run_import_liked_videos(session, settings, path, limit=limit_liked, dry_run=dry_run),
+        "liked_videos": run_import_liked_videos(session, settings, path, limit=limit_liked, dry_run=dry_run, record_session=False),
         "dry_run": dry_run,
     }
+    # one combined "all" session aggregating the per-kind counts
+    agg = {
+        "scanned": sum(int(p.get("scanned", 0) or 0) for p in parts.values() if isinstance(p, dict)),
+        "imported_count": sum(int(p.get("imported_count", 0) or 0) for p in parts.values() if isinstance(p, dict)),
+        "skipped_duplicate_count": sum(int(p.get("skipped_duplicate_count", 0) or 0) for p in parts.values() if isinstance(p, dict)),
+        "updated_count": sum(int(p.get("updated_count", 0) or 0) for p in parts.values() if isinstance(p, dict)),
+        "failed_count": sum(int(p.get("failed_count", 0) or 0) for p in parts.values() if isinstance(p, dict)),
+    }
+    zip_name = resolve_takeout_path(settings, path).name
+    parts["session_id"] = record_import_session(
+        session, import_kind="all", path_basename=zip_name,
+        source_kind=parts["liked_videos"].get("source_kind") if isinstance(parts.get("liked_videos"), dict) else None,
+        result=agg, dry_run=dry_run, started_at=started,
+    )
+    return parts

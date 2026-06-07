@@ -498,6 +498,38 @@ class SchedulerRun(Base):
     meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
+class TakeoutImportSession(Base):
+    """A Takeout import run record (Phase 6C).
+
+    Tracks incremental imports (scanned/imported/skipped/updated/failed) per
+    source kind so the UI/CLI can show import history. Stores only the ZIP
+    *basename* and aggregate counts — never the full path, raw_json, or any
+    personal history rows.
+    """
+
+    __tablename__ = "takeout_import_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    path_basename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source_kind: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    # import_kind: watch_history | search_history | subscriptions | playlists
+    #              | liked_videos | all
+    import_kind: Mapped[str] = mapped_column(String(32), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="success")
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    scanned: Mapped[int] = mapped_column(Integer, default=0)
+    imported: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_duplicate: Mapped[int] = mapped_column(Integer, default=0)
+    updated: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
 class DiaryEntry(Base):
     __tablename__ = "diary_entries"
 

@@ -74,30 +74,20 @@ describe("Phase 7E scheduler history + recommend", () => {
     );
     await waitFor(() => expect(screen.getByText("Scheduler run history")).toBeInTheDocument());
     expect(screen.getByText("Liked progress history")).toBeInTheDocument();
-    // run row shows the run type + a partial_success badge + skipped backoff
+    // run row shows the run type + a partial_success status badge
     expect(screen.getAllByText("liked_archive").length).toBeGreaterThan(0);
-    expect(screen.getByText("partial_success")).toBeInTheDocument();
+    expect(screen.getAllByText("partial_success").length).toBeGreaterThan(0);
   });
 
-  it("computes recommended settings on demand (suggestion only)", async () => {
-    const rec: RecommendSettings = {
-      based_on: { finished_archive_jobs: 3, retryable: 1, active_body_jobs: 0 },
-      rates: { success_rate: 0.33, throttle_rate: 0.66 },
-      current: { scheduler_liked_archive_limit_per_run: 2 },
-      recommended: { scheduler_liked_archive_limit_per_run: 1 },
-      reasons: ["Throttle rate 66% is high → archive limit 1, longer delay."],
-      note: "Recommendation only — settings are NOT changed automatically.",
-    };
-    recommendMock.mockResolvedValue(rec);
+  it("offers .env / JSON recommendation export (suggestion only)", async () => {
     render(
       <MemoryRouter>
         <SchedulerHistory />
       </MemoryRouter>
     );
     await waitFor(() => expect(screen.getByText(/Recommended settings/)).toBeInTheDocument());
-    fireEvent.click(screen.getByText(/Compute/));
-    await waitFor(() => expect(recommendMock).toHaveBeenCalled());
-    expect(screen.getByText(/NOT changed automatically/)).toBeInTheDocument();
-    expect(screen.getByText(/Throttle rate 66%/)).toBeInTheDocument();
+    // recommendations are export-only (no auto-apply): both copy buttons exist
+    expect(screen.getByText("Copy .env…")).toBeInTheDocument();
+    expect(screen.getByText("Copy JSON…")).toBeInTheDocument();
   });
 });

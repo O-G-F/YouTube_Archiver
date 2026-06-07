@@ -46,6 +46,7 @@ collections_app = typer.Typer(help="Inspect and re-crawl playlist/channel collec
 scheduler_app = typer.Typer(help="Run the collection re-crawl scheduler.")
 scheduler_runs_app = typer.Typer(help="Scheduler run history (Phase 7E).")
 takeout_app = typer.Typer(help="Google Takeout preview / import.")
+takeout_sessions_app = typer.Typer(help="Takeout import session history (Phase 6C).")
 watch_history_app = typer.Typer(help="Inspect imported watch history.")
 search_history_app = typer.Typer(help="Inspect imported search history.")
 subscriptions_app = typer.Typer(help="Takeout subscriptions (channels).")
@@ -66,6 +67,7 @@ app.add_typer(collections_app, name="collections")
 app.add_typer(scheduler_app, name="scheduler")
 scheduler_app.add_typer(scheduler_runs_app, name="runs")
 app.add_typer(takeout_app, name="takeout")
+takeout_app.add_typer(takeout_sessions_app, name="sessions")
 app.add_typer(watch_history_app, name="watch-history")
 app.add_typer(search_history_app, name="search-history")
 app.add_typer(subscriptions_app, name="subscriptions")
@@ -1283,12 +1285,20 @@ def scheduler_stats_cmd(lookback: int = typer.Option(50, "--lookback")) -> None:
 
 
 @scheduler_app.command("recommend-settings")
-def scheduler_recommend_settings_cmd(lookback: int = typer.Option(30, "--lookback")) -> None:
+def scheduler_recommend_settings_cmd(
+    lookback: int = typer.Option(30, "--lookback"),
+    env: bool = typer.Option(False, "--env", help="Output a copy-paste .env snippet (not applied)."),
+    json_: bool = typer.Option(False, "--json", help="Output JSON."),
+) -> None:
     """Suggest safe archive/retry limits from recent results (does NOT apply)."""
     from app.services import scheduler as sch
 
     with session_scope() as s:
         rec = sch.recommend_settings(s, get_settings(), lookback=lookback)
+    if env or json_:
+        # export-only output (no extra chatter so it's clean to copy/redirect)
+        typer.echo(sch.recommend_export(rec, "json" if json_ else "env"))
+        return
     typer.echo("== recommended settings (suggestion only — not applied) ==")
     typer.echo(f"  based on: {rec['based_on']}")
     typer.echo(f"  rates: success={rec['rates'].get('success_rate')} throttle={rec['rates'].get('throttle_rate')}")
@@ -1300,6 +1310,30 @@ def scheduler_recommend_settings_cmd(lookback: int = typer.Option(30, "--lookbac
     for r in rec["reasons"]:
         typer.echo(f"   - {r}")
     typer.echo(f"  {rec['note']}")
+
+
+@scheduler_runs_app.command("cleanup")
+def scheduler_runs_cleanup_cmd(
+    keep_last: int = typer.Option(0, "--keep-last", help="Keep the N most-recent runs."),
+    older_than_days: int = typer.Option(0, "--older-than-days", help="Only delete runs older than D days."),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview (default) vs actually delete."),
+) -> None:
+    """Prune old scheduler_runs. NEVER deletes jobs (job.meta.scheduler_run_id stays)."""
+    from app.services import scheduler as sch
+
+    if not keep_last and not older_than_days:
+        typer.echo("Nothing to do: pass --keep-last N and/or --older-than-days D (safety).")
+        return
+    with session_scope() as s:
+        res = sch.cleanup_runs(s, keep_last=keep_last, older_than_days=older_than_days, dry_run=dry_run)
+        if not dry_run:
+            s.commit()
+    verb = "would delete" if dry_run else "deleted"
+    typer.echo(
+        f"scheduler runs cleanup ({'dry-run' if dry_run else 'applied'}): "
+        f"total={res['total_runs']} {verb}={res['matched'] if dry_run else res['deleted']} kept={res['kept']} "
+        f"(keep_last={keep_last}, older_than_days={older_than_days}). Jobs are NOT deleted."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1337,7 +1371,10 @@ def takeout_discover(
 
 
 @takeout_app.command("inspect")
-def takeout_inspect(path: str = typer.Argument(..., help="ZIP under TAKEOUT_IMPORT_ROOT.")) -> None:
+def takeout_inspect(
+    path: str = typer.Argument(..., help="ZIP under TAKEOUT_IMPORT_ROOT."),
+    deep: bool = typer.Option(False, "--deep", help="Also list the structured source registry."),
+) -> None:
     """Show the structural classification of one Takeout ZIP."""
     from app.services import takeout as tk
 
@@ -1345,6 +1382,7 @@ def takeout_inspect(path: str = typer.Argument(..., help="ZIP under TAKEOUT_IMPO
         zip_path = tk.resolve_takeout_path(get_settings(), path)
         with tk.open_archive(zip_path) as a:
             info = a.inspect()
+            registry = a.registry() if deep else []
     except tk.TakeoutError as exc:
         raise typer.BadParameter(str(exc))
     typer.echo(f"archive_kind        : {info['archive_kind']}")
@@ -1354,6 +1392,12 @@ def takeout_inspect(path: str = typer.Argument(..., help="ZIP under TAKEOUT_IMPO
     typer.echo(f"member_count        : {info['member_count']}")
     typer.echo(f"liked_source_kind   : {info['liked_source_kind']}")
     typer.echo(f"liked_detected_path : {info['liked_detected_path']}")
+    if deep:
+        typer.echo("registry (detected sources):")
+        for r in registry:
+            typer.echo(f"  - {r['kind']:<30} [{r['format']}] {r['member']}")
+        if not registry:
+            typer.echo("  (none)")
 
 
 @takeout_app.command("preview")
@@ -1407,6 +1451,93 @@ def takeout_import(
     )
     if result["warnings"]:
         typer.echo(f"warnings: {result['warnings'][:5]}")
+
+
+def _echo_import_result(result: dict, kind: str) -> None:
+    typer.echo(
+        f"[{kind}] imported={result.get('imported_count')} "
+        f"skipped_duplicate={result.get('skipped_duplicate_count')} "
+        f"updated={result.get('updated_count', 0)} failed={result.get('failed_count')} "
+        f"scanned={result.get('scanned')} dry_run={result.get('dry_run')} "
+        f"duration={result.get('duration_seconds')}s session={result.get('session_id')}"
+    )
+
+
+@takeout_app.command("import-watch-history")
+def takeout_import_watch_history(
+    path: str = typer.Argument(...),
+    limit: int = typer.Option(0, "--limit", help="Max events (0 = all)."),
+    incremental: bool = typer.Option(True, "--incremental/--full", help="Dedup vs existing (always on)."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Import watch history (incremental: dedup vs existing). Streams large JSON."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        try:
+            result = tk.run_import(s, get_settings(), path, limit=(limit or None), dry_run=dry_run)
+        except tk.TakeoutError as exc:
+            raise typer.BadParameter(str(exc))
+    _echo_import_result(result, "watch_history")
+
+
+@takeout_app.command("import-search-history")
+def takeout_import_search_history(
+    path: str = typer.Argument(...),
+    limit: int = typer.Option(0, "--limit", help="Max events (0 = all)."),
+    incremental: bool = typer.Option(True, "--incremental/--full", help="Dedup vs existing (always on)."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Import search history (incremental: dedup vs existing). Streams large JSON."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        try:
+            result = tk.run_import_search(s, get_settings(), path, limit=(limit or None), dry_run=dry_run)
+        except tk.TakeoutError as exc:
+            raise typer.BadParameter(str(exc))
+    _echo_import_result(result, "search_history")
+
+
+@takeout_sessions_app.callback(invoke_without_command=True)
+def takeout_sessions_list(
+    ctx: typer.Context,
+    limit: int = typer.Option(20, "--limit"),
+    import_kind: str = typer.Option("", "--kind", help="filter by import_kind"),
+) -> None:
+    """List recent Takeout import sessions (counts only; no PII)."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        rows = tk.list_import_sessions(s, import_kind=(import_kind or None), limit=limit)
+        if not rows:
+            typer.echo("No import sessions recorded yet.")
+            return
+        for r in rows:
+            typer.echo(
+                f"  {r.session_id}  {r.import_kind:<14} {r.status:<8} "
+                f"imported={r.imported} skipped={r.skipped_duplicate} updated={r.updated} "
+                f"failed={r.failed} scanned={r.scanned} dry_run={r.dry_run}  {r.path_basename}  {r.started_at}"
+            )
+
+
+@takeout_sessions_app.command("show")
+def takeout_sessions_show(session_id: str = typer.Argument(...)) -> None:
+    """Show one Takeout import session."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        r = tk.get_import_session(s, session_id)
+        if r is None:
+            typer.echo(f"session {session_id} not found")
+            raise typer.Exit(code=1)
+        typer.echo(f"== takeout import session {r.session_id} ==")
+        typer.echo(f"  kind={r.import_kind} status={r.status} dry_run={r.dry_run}")
+        typer.echo(f"  file={r.path_basename} source_kind={r.source_kind}")
+        typer.echo(f"  started={r.started_at} finished={r.finished_at}")
+        typer.echo(f"  scanned={r.scanned} imported={r.imported} skipped={r.skipped_duplicate} updated={r.updated} failed={r.failed}")
 
 
 @takeout_app.command("import-subscriptions")

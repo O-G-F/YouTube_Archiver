@@ -26,11 +26,13 @@ from app.schemas import (
     TakeoutImportAllRequest,
     TakeoutImportOut,
     TakeoutImportPlaylistsRequest,
+    TakeoutImportSessionOut,
     TakeoutInspectOut,
     TakeoutImportRequest,
     TakeoutPlaylistsPreviewOut,
     TakeoutPreviewOut,
     TakeoutPreviewRequest,
+    TakeoutRegistrySource,
 )
 from app.services import takeout
 
@@ -85,16 +87,22 @@ def takeout_discover(deep: bool = Query(default=False)) -> TakeoutDiscoverOut:
 
 
 @router.get("/inspect", response_model=TakeoutInspectOut)
-def takeout_inspect(path: str = Query(...)) -> TakeoutInspectOut:
-    """Structural classification of a single ZIP (kind + detected liked source)."""
+def takeout_inspect(
+    path: str = Query(...), deep: bool = Query(default=False)
+) -> TakeoutInspectOut:
+    """Structural classification of a single ZIP (kind + detected liked source).
+
+    ``deep=true`` also returns the structured source registry (Phase 6C).
+    """
     settings = get_settings()
     try:
         zip_path = takeout.resolve_takeout_path(settings, path)
         with takeout.open_archive(zip_path) as a:
             info = a.inspect()
+            registry = [TakeoutRegistrySource(**r) for r in a.registry()] if deep else []
     except takeout.TakeoutError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return TakeoutInspectOut(path=path, **info)
+    return TakeoutInspectOut(path=path, registry=registry, **info)
 
 
 @router.post("/preview", response_model=TakeoutPreviewOut)
@@ -110,13 +118,30 @@ def takeout_preview(req: TakeoutPreviewRequest) -> TakeoutPreviewOut:
 
 
 @router.post("/import", response_model=TakeoutImportOut)
+@router.post("/import-watch-history", response_model=TakeoutImportOut)
 def takeout_import(
     req: TakeoutImportRequest, db: Session = Depends(get_db)
 ) -> TakeoutImportOut:
+    """Import watch history (incremental: dedup vs existing). Also at /import-watch-history."""
     settings = get_settings()
     try:
         result = takeout.run_import(
             db, settings, req.path, limit=req.limit, dry_run=req.dry_run
+        )
+    except takeout.TakeoutError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    db.commit()
+    return TakeoutImportOut(**result)
+
+
+@router.post("/import-search-history", response_model=TakeoutImportOut)
+def takeout_import_search_history(
+    req: TakeoutImportRequest, db: Session = Depends(get_db)
+) -> TakeoutImportOut:
+    """Import search history (incremental: dedup vs existing)."""
+    try:
+        result = takeout.run_import_search(
+            db, get_settings(), req.path, limit=req.limit, dry_run=req.dry_run
         )
     except takeout.TakeoutError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -192,6 +217,27 @@ def takeout_import_all(
         raise HTTPException(status_code=400, detail=str(exc))
     db.commit()
     return TakeoutImportAllOut(**result)
+
+
+@router.get("/import-sessions", response_model=list[TakeoutImportSessionOut])
+def takeout_import_sessions(
+    db: Session = Depends(get_db),
+    import_kind: str | None = Query(default=None),
+    limit: int = Query(default=50, le=500),
+) -> list[TakeoutImportSessionOut]:
+    """Import history (counts only; no full path / raw_json / personal rows)."""
+    rows = takeout.list_import_sessions(db, import_kind=import_kind, limit=limit)
+    return [TakeoutImportSessionOut.model_validate(r) for r in rows]
+
+
+@router.get("/import-sessions/{session_id}", response_model=TakeoutImportSessionOut)
+def takeout_import_session_detail(
+    session_id: str, db: Session = Depends(get_db)
+) -> TakeoutImportSessionOut:
+    row = takeout.get_import_session(db, session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="import session not found")
+    return TakeoutImportSessionOut.model_validate(row)
 
 
 @router.get("/playlists/preview", response_model=TakeoutPlaylistsPreviewOut)

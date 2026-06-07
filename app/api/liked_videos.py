@@ -175,12 +175,31 @@ def liked_progress(db: Session = Depends(get_db)) -> LikedProgressOut:
 
 @router.get("/progress/history", response_model=LikedProgressHistoryOut)
 def liked_progress_history(
-    db: Session = Depends(get_db), limit: int = Query(default=50, le=500)
+    db: Session = Depends(get_db),
+    limit: int = Query(default=100, le=500),
+    run_type: str | None = Query(default=None),
+    date_from: str | None = Query(default=None, alias="from"),
+    date_to: str | None = Query(default=None, alias="to"),
+    downsample: str | None = Query(default=None, description="daily"),
 ) -> LikedProgressHistoryOut:
     """Liked-progress snapshots over time (from scheduler runs; no raw_json)."""
+    from datetime import datetime
+
     from app.services import scheduler as scheduler_svc
 
-    points = [LikedProgressHistoryPoint(**p) for p in scheduler_svc.progress_history(db, limit=limit)]
+    def _dt(v):
+        try:
+            return datetime.fromisoformat(v.replace("Z", "")) if v else None
+        except ValueError:
+            return None
+
+    points = [
+        LikedProgressHistoryPoint(**p)
+        for p in scheduler_svc.progress_history(
+            db, limit=limit, run_type=run_type,
+            date_from=_dt(date_from), date_to=_dt(date_to), downsample=downsample,
+        )
+    ]
     return LikedProgressHistoryOut(points=points)
 
 

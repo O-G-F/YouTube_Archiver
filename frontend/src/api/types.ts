@@ -338,6 +338,43 @@ export interface TakeoutImportAll {
   playlists: PlaylistsImportResult;
   liked_videos: LikedImportResult;
   dry_run: boolean;
+  session_id?: string | null;
+}
+
+export interface TakeoutRegistrySource {
+  kind: string;
+  member: string;
+  format: string;
+  import_kinds: string[];
+}
+
+export interface TakeoutInspect {
+  path: string;
+  archive_kind: string;
+  has_youtube_takeout: boolean;
+  my_activity_youtube_path: string | null;
+  has_index: boolean;
+  member_count: number;
+  liked_source_kind: string | null;
+  liked_detected_path: string | null;
+  registry: TakeoutRegistrySource[];
+}
+
+export interface TakeoutImportSession {
+  id: number;
+  session_id: string;
+  path_basename: string | null;
+  source_kind: string | null;
+  import_kind: string;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  dry_run: boolean;
+  scanned: number;
+  imported: number;
+  skipped_duplicate: number;
+  updated: number;
+  failed: number;
 }
 
 export interface LikedVideo {
@@ -610,4 +647,25 @@ export interface RecommendSettings {
   recommended: Record<string, number | boolean>;
   reasons: string[];
   note: string;
+}
+
+export interface RecommendExport {
+  format: string;
+  content: string;
+  recommended: Record<string, number | boolean>;
+  current: Record<string, number | boolean>;
+  reasons: string[];
+  note: string;
+}
+
+export interface SchedulerRunCleanup {
+  total_runs: number;
+  matched: number;
+  deleted: number;
+  kept: number;
+  dry_run: boolean;
+  keep_last: number;
+  older_than_days: number;
+  deleted_run_ids: string[];
+  matched_run_ids: string[];
 }

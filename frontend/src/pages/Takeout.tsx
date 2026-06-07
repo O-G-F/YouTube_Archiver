@@ -4,7 +4,8 @@ import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
 import { fmtBytes } from "../lib/format";
 import { ErrorBox, Loading } from "../components/ui";
-import type { TakeoutImportAll, TakeoutPreview } from "../api/types";
+import { TakeoutSessions } from "../components/TakeoutSessions";
+import type { TakeoutImportAll, TakeoutInspect, TakeoutPreview } from "../api/types";
 
 const KIND_LABEL: Record<string, string> = {
   youtube_takeout: "YouTube Takeout",
@@ -28,6 +29,8 @@ export default function Takeout() {
   const [limit, setLimit] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [registry, setRegistry] = useState<TakeoutInspect | null>(null);
+  const [sessionsKey, setSessionsKey] = useState(0);
 
   async function doPreview(p?: string) {
     const target = p ?? path;
@@ -37,9 +40,37 @@ export default function Takeout() {
     setPreview(null);
     setImportResult(null);
     setLikedResult(null);
+    setRegistry(null);
     setPath(target);
     try {
-      setPreview(await api.takeoutPreview(target));
+      const [pv, ins] = await Promise.all([
+        api.takeoutPreview(target),
+        api.takeoutInspect(target, true).catch(() => null),
+      ]);
+      setPreview(pv);
+      setRegistry(ins);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function doImportKind(kind: "watch" | "search") {
+    if (!path) return;
+    setBusy(kind);
+    setErr(null);
+    const n = limit ? Number(limit) : undefined;
+    try {
+      const r = kind === "watch"
+        ? await api.takeoutImportWatch({ path, limit: n, dry_run: dryRun })
+        : await api.takeoutImportSearch({ path, limit: n, dry_run: dryRun });
+      setLikedResult(
+        `${kind === "watch" ? "Watch" : "Search"} history: imported ${r.imported_count}, ` +
+          `skipped ${r.skipped_duplicate_count}, failed ${r.failed_count} (scanned ${r.scanned})` +
+          (r.dry_run ? " [dry-run]" : "")
+      );
+      setSessionsKey((k) => k + 1);
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -58,9 +89,10 @@ export default function Takeout() {
     try {
       const r = await api.takeoutImportLiked({ path: target, limit: n });
       setLikedResult(
-        `Imported ${r.imported_count} liked (skipped ${r.skipped_duplicate_count}, video stubs ${r.videos_created}) from ${r.source_kind}.`
+        `Imported ${r.imported_count} liked (skipped ${r.skipped_duplicate_count}, updated ${r.updated_count ?? 0}, video stubs ${r.videos_created}) from ${r.source_kind}.`
       );
       discover.reload();
+      setSessionsKey((k) => k + 1);
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -87,6 +119,7 @@ export default function Takeout() {
           limit_liked: n,
         })
       );
+      setSessionsKey((k) => k + 1);
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -184,7 +217,25 @@ export default function Takeout() {
           <button disabled={!path || busy === "liked"} onClick={() => doImportLiked()}>
             {busy === "liked" ? <span className="spin" /> : "⤓"} Import liked
           </button>
+          <button disabled={!path || busy === "watch"} onClick={() => doImportKind("watch")}>
+            {busy === "watch" ? <span className="spin" /> : "⤓"} Import watch
+          </button>
+          <button disabled={!path || busy === "search"} onClick={() => doImportKind("search")}>
+            {busy === "search" ? <span className="spin" /> : "⤓"} Import search
+          </button>
+          <label className="checkbox" style={{ alignSelf: "center" }}>
+            <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} /> dry-run
+          </label>
         </div>
+
+        {registry && registry.registry.length > 0 && (
+          <div style={{ marginTop: 8 }}>
+            <span className="muted small">detected sources (deep):</span>{" "}
+            {registry.registry.map((r, i) => (
+              <span key={i} className="badge muted" title={r.member}>{r.kind}</span>
+            ))}
+          </div>
+        )}
 
         {preview && (
           <>
@@ -273,6 +324,8 @@ export default function Takeout() {
           </>
         )}
       </div>
+
+      <TakeoutSessions reloadKey={sessionsKey} />
     </div>
   );
 }

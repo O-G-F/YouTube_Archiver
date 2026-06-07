@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
@@ -12,8 +14,12 @@ from app.schemas import (
     JobClassification,
     LikedProgressHistoryOut,
     LikedProgressHistoryPoint,
+    RecommendExportOut,
+    RecommendExportRequest,
     RecommendSettingsOut,
     RecommendSettingsRequest,
+    SchedulerRunCleanupOut,
+    SchedulerRunCleanupRequest,
     SchedulerRunDetailOut,
     SchedulerRunOnceOut,
     SchedulerRunOnceRequest,
@@ -23,6 +29,15 @@ from app.schemas import (
 )
 from app.services import scheduler as scheduler_svc
 from app.services.job_classify import classify_job
+
+
+def _parse_dt(v: str | None) -> datetime | None:
+    if not v:
+        return None
+    try:
+        return datetime.fromisoformat(v.replace("Z", ""))
+    except ValueError:
+        return None
 
 router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
 
@@ -36,9 +51,16 @@ def scheduler_status() -> SchedulerStatusOut:
 def scheduler_runs(
     db: Session = Depends(get_db),
     run_type: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    date_from: str | None = Query(default=None, alias="from"),
+    date_to: str | None = Query(default=None, alias="to"),
     limit: int = Query(default=50, le=500),
 ) -> list[SchedulerRunOut]:
-    return [SchedulerRunOut.model_validate(r) for r in scheduler_svc.list_runs(db, run_type=run_type, limit=limit)]
+    runs = scheduler_svc.list_runs(
+        db, run_type=run_type, status=status,
+        date_from=_parse_dt(date_from), date_to=_parse_dt(date_to), limit=limit,
+    )
+    return [SchedulerRunOut.model_validate(r) for r in runs]
 
 
 @router.get("/runs/{run_id}", response_model=SchedulerRunDetailOut)
@@ -71,6 +93,41 @@ def scheduler_recommend_settings(
     """Suggest safe archive/retry limits from recent results (does NOT apply them)."""
     req = req or RecommendSettingsRequest()
     return RecommendSettingsOut(**scheduler_svc.recommend_settings(db, get_settings(), lookback=req.lookback))
+
+
+@router.post("/recommend-settings/export", response_model=RecommendExportOut)
+def scheduler_recommend_export(
+    req: RecommendExportRequest | None = None, db: Session = Depends(get_db)
+) -> RecommendExportOut:
+    """Render the recommendation as a copy-paste .env / JSON / human snippet.
+
+    NEVER writes any file and contains no secrets — for the user to apply manually.
+    """
+    req = req or RecommendExportRequest()
+    fmt = req.format if req.format in ("env", "json", "human") else "env"
+    rec = scheduler_svc.recommend_settings(db, get_settings(), lookback=req.lookback)
+    return RecommendExportOut(
+        format=fmt,
+        content=scheduler_svc.recommend_export(rec, fmt),
+        recommended=rec["recommended"],
+        current=rec["current"],
+        reasons=rec["reasons"],
+        note=rec["note"],
+    )
+
+
+@router.post("/runs/cleanup", response_model=SchedulerRunCleanupOut)
+def scheduler_runs_cleanup(
+    req: SchedulerRunCleanupRequest | None = None, db: Session = Depends(get_db)
+) -> SchedulerRunCleanupOut:
+    """Prune old scheduler_runs (NEVER deletes jobs). dry_run defaults to true."""
+    req = req or SchedulerRunCleanupRequest()
+    res = scheduler_svc.cleanup_runs(
+        db, keep_last=req.keep_last, older_than_days=req.older_than_days, dry_run=req.dry_run
+    )
+    if not req.dry_run:
+        db.commit()
+    return SchedulerRunCleanupOut(**res)
 
 
 @router.post("/run-once", response_model=SchedulerRunOnceOut)

@@ -477,6 +477,39 @@ class RecommendSettingsOut(BaseModel):
     note: str
 
 
+# ---- Phase 7F: recommendation export + run retention ----
+class RecommendExportRequest(BaseModel):
+    lookback: int = 30
+    format: str = "env"  # env | json | human
+
+
+class RecommendExportOut(BaseModel):
+    format: str
+    content: str  # copy-paste snippet (no secrets); NOT written to any file
+    recommended: dict = Field(default_factory=dict)
+    current: dict = Field(default_factory=dict)
+    reasons: list[str] = Field(default_factory=list)
+    note: str
+
+
+class SchedulerRunCleanupRequest(BaseModel):
+    keep_last: int = 0
+    older_than_days: int = 0
+    dry_run: bool = True
+
+
+class SchedulerRunCleanupOut(BaseModel):
+    total_runs: int
+    matched: int
+    deleted: int
+    kept: int
+    dry_run: bool
+    keep_last: int
+    older_than_days: int
+    deleted_run_ids: list[str] = Field(default_factory=list)
+    matched_run_ids: list[str] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------------- #
 # Takeout (Phase 3A)
 # --------------------------------------------------------------------------- #
@@ -539,15 +572,20 @@ class TakeoutImportRequest(BaseModel):
     path: str
     limit: int | None = None
     dry_run: bool = False
+    # Phase 6C: documentary flag — imports are always incremental (dedup vs DB).
+    incremental: bool = True
 
 
 class TakeoutImportOut(BaseModel):
     imported_count: int
     skipped_duplicate_count: int
+    updated_count: int = 0
     failed_count: int
     scanned: int
     dry_run: bool
+    duration_seconds: float | None = None
     job_id: int | None = None
+    session_id: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -639,13 +677,16 @@ class LikedVideosImportRequest(BaseModel):
 class LikedVideosImportOut(BaseModel):
     imported_count: int
     skipped_duplicate_count: int
+    updated_count: int = 0
     failed_count: int
     scanned: int
     videos_created: int = 0
     source_kind: str | None = None  # takeout_my_activity | takeout_youtube | …
     detected_path: str | None = None  # the member parsed (no traversal vector)
     dry_run: bool
+    duration_seconds: float | None = None
     job_id: int | None = None
+    session_id: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -667,6 +708,7 @@ class TakeoutImportAllOut(BaseModel):
     playlists: PlaylistsImportOut
     liked_videos: LikedVideosImportOut
     dry_run: bool
+    session_id: str | None = None  # Phase 6C: the combined import session
 
 
 class LikedVideoOut(BaseModel):
@@ -1024,6 +1066,13 @@ class TakeoutDiscoverOut(BaseModel):
     archives: list[TakeoutDiscoverEntry] = Field(default_factory=list)
 
 
+class TakeoutRegistrySource(BaseModel):
+    kind: str
+    member: str
+    format: str
+    import_kinds: list[str] = Field(default_factory=list)
+
+
 class TakeoutInspectOut(BaseModel):
     path: str
     archive_kind: str
@@ -1033,6 +1082,29 @@ class TakeoutInspectOut(BaseModel):
     member_count: int = 0
     liked_source_kind: str | None = None
     liked_detected_path: str | None = None
+    # Phase 6C: structured source registry (only when ?deep=true)
+    registry: list[TakeoutRegistrySource] = Field(default_factory=list)
+
+
+# ---- Phase 6C: import sessions ----
+class TakeoutImportSessionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    session_id: str
+    path_basename: str | None = None
+    source_kind: str | None = None
+    import_kind: str
+    started_at: datetime
+    finished_at: datetime | None = None
+    status: str
+    dry_run: bool
+    scanned: int = 0
+    imported: int = 0
+    skipped_duplicate: int = 0
+    updated: int = 0
+    failed: int = 0
+    meta: dict | None = None
 
 
 class SettingsItem(BaseModel):

@@ -147,6 +147,13 @@ class Settings(BaseSettings):
     # queued/running (avoid piling up while a batch is in flight).
     scheduler_liked_suppress_when_active: bool = True
 
+    # ---- Scheduler run retention (Phase 7F) — default OFF (no auto-delete) ----
+    # When > 0, the scheduler loop prunes scheduler_runs older than N days /
+    # beyond the most-recent KEEP_LAST. 0 disables that bound. Jobs are NEVER
+    # deleted by retention. Manual `scheduler runs cleanup` always works.
+    scheduler_run_retention_days: int = 0
+    scheduler_run_keep_last: int = 0
+
     @property
     def effective_scheduler_liked_archive_profile(self) -> str:
         return (self.scheduler_liked_archive_profile or "").strip() or self.liked_archive_default_profile

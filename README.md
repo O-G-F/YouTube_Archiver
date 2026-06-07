@@ -487,6 +487,10 @@ archiver scheduler runs --limit 20             # 実行履歴一覧【Phase 7E�
 archiver scheduler runs show RUN_ID            # run 詳細 + jobs【Phase 7E】
 archiver scheduler stats                       # 実行集計【Phase 7E】
 archiver scheduler recommend-settings          # 安全寄り推奨値（自動変更なし）【Phase 7E】
+archiver scheduler recommend-settings --env    # .env 貼り付け用 / --json【Phase 7F】
+archiver scheduler runs cleanup --keep-last 50 --dry-run   # 既定 dry-run（ジョブ非削除）【Phase 7F】
+archiver scheduler runs cleanup --keep-last 50 --apply     # 実削除【Phase 7F】
+archiver liked-videos progress --history       # progress 時系列（グラフは UI）【Phase 7E/7F】
 # API:
 curl -s -XPOST localhost:8000/api/scheduler/run-once -H 'content-type: application/json' \
   -d '{"collections":true,"comments":true}'
@@ -1085,6 +1089,108 @@ archiver scheduler recommend-settings      # POST /api/scheduler/recommend-setti
 
 - run history / progress history / stats / recommend は**件数・集計のみ**で raw_json/secret を返さない。adaptive throttle は**提案だけで設定を自動変更しない**。run 記録は fail-safe（失敗してもジョブ処理継続）。`metadata_only` の**本体非保存**・body DL の明示を維持。
 
+### progress グラフ / run retention / recommendation export（Phase 7F）
+
+Phase 7E の履歴を**見やすく可視化**し、**肥大化を防ぐ retention**と、推奨値を**安全に `.env` へ反映するための export**を追加した層です。
+
+#### progress グラフ
+
+Liked Videos の **History タブ**に、progress 時系列の**軽量 SVG 折れ線グラフ**（metadata_fetched / body_saved / retryable / total_liked、依存ライブラリなし）＋表を表示。`GET /api/liked-videos/progress/history?run_type=&from=&to=&downsample=daily&limit=` でフィルタ/間引き可能（`downsample=daily` は同日内の最新点のみ）。raw_json は返しません。
+
+#### scheduler run history 強化
+
+run history に **run_type / status フィルタ**、run 行クリックで**詳細ドロワー**（selected/created/submitted/skipped・body before→after・progress/queue スナップショット・関連ジョブ）。`GET /api/scheduler/runs?run_type=&status=&from=&to=&limit=`。各 run から `/jobs?scheduler_run_id=...` へ。
+
+#### recommendation export（提案のみ・自動変更なし）
+
+```bash
+archiver scheduler recommend-settings --env    # .env 貼り付け用 KEY=VALUE
+archiver scheduler recommend-settings --json   # JSON
+# API: POST /api/scheduler/recommend-settings/export {"format":"env|json|human"}
+```
+
+UI（History → Recommended settings）に **Copy .env… / Copy JSON…** ボタンと現在値→推奨値の diff、`Copy to clipboard`。出力例：
+
+```
+SCHEDULER_LIKED_ARCHIVE_LIMIT_PER_RUN=1   # was 2
+LIKED_ARCHIVE_JOB_DELAY_SECONDS=300   # was 0
+```
+
+> **設定ファイルは自動で書き換えません。** secret は含めません。内容を確認 → 手動で `.env` に反映 → `docker compose up -d` で再起動、が推奨フローです。
+
+#### scheduler run retention / cleanup（ジョブは消さない）
+
+```bash
+archiver scheduler runs cleanup --keep-last 50 --dry-run            # 既定 dry-run
+archiver scheduler runs cleanup --keep-last 50 --older-than-days 30 --apply
+# API: POST /api/scheduler/runs/cleanup {"keep_last","older_than_days","dry_run"}
+```
+
+- 削除対象は **`scheduler_runs` 行のみ**。**ジョブ（`jobs`）は絶対に削除しません**。`job.meta.scheduler_run_id` は残り、run が消えても `/jobs?scheduler_run_id=...` でジョブは辿れます（UI は「run history deleted」相当＝run 詳細 404）。
+- **両方 0（bound 無し）なら何も削除しない**安全既定。`--keep-last N`（最新 N 件保持）/ `--older-than-days D`（D 日より古いもの）。
+- 自動 retention は `SCHEDULER_RUN_RETENTION_DAYS` / `SCHEDULER_RUN_KEEP_LAST`（**既定 0＝OFF**）。設定時のみ scheduler ループが各周期末に prune。
+- **推奨運用**: まず `--dry-run` で削除件数を確認 → 必要なら `--apply`。export された env snippet は確認 → 手動で `.env` 反映 → compose 再起動。
+
+#### optional aggregation
+
+日次集計（`scheduler_run_daily_stats` 等）は将来拡張余地として設計のみ（**今回はテーブル追加なし**、retention 優先）。`downsample=daily` で当面の時系列圧縮は可能。
+
+### セキュリティ（7F）
+
+- recommendation export は**ファイルを自動変更せず**コピー用文字列のみ（secret 非包含）。cleanup は **scheduler_runs のみ**削除し**ジョブは保持**。progress graph / history は集計のみで raw_json/secret 非返却。`metadata_only` 本体非保存・body DL 明示を維持。
+
+### Takeout 差分再取り込み + 省メモリ + import history（Phase 6C）
+
+Takeout / My Activity の再取り込みを**差分（incremental）**で安全に行い、大容量でもメモリを使いすぎず、**import 履歴**を残せるようにした層です。
+
+#### incremental import（差分）
+
+全 import（watch / search / subscriptions / playlists / liked）は**既存 DB と重複する行を skip**し、新規のみ取り込みます。liked は既存 stub の空フィールドを再取り込みで**enrich（updated）**します。結果に `scanned` / `imported_count` / `skipped_duplicate_count` / `updated_count` / `failed_count` / `source_kind` / `detected_path` / `duration_seconds` / `session_id` を含み、**dry-run でも同じ集計**を返します（DB には書きません）。
+
+#### 大容量 My Activity の省メモリ（streaming）
+
+90k+ の watch / 11k+ の liked を含む巨大 JSON を、**ijson でストリーム解析**（top-level 配列を 1 件ずつ）し、全体をメモリに載せません。ijson 不在時は `json.loads` にフォールバック。2000 件ごとに進捗ログ（scanned/imported/skipped/updated）。
+
+#### source registry（deep inspect）
+
+```bash
+archiver takeout inspect PATH --deep        # GET /api/takeout/inspect?path=...&deep=true
+```
+
+ZIP 内の検出結果を**構造化**して返します：`my_activity_youtube_json` / `youtube_watch_history_json|html` / `youtube_search_history_*` / `youtube_subscriptions_*` / `youtube_playlists` / `youtube_liked_videos_*` / `takeout_index`（`member` は ZIP 内パスのみ）。
+
+#### import session history
+
+```bash
+archiver takeout sessions --limit 20        # GET /api/takeout/import-sessions
+archiver takeout sessions show SESSION_ID   # GET /api/takeout/import-sessions/{id}
+```
+
+`run_once` 1 回ごとに `takeout_import_sessions` に 1 行（import-all は**1 件の combined session**）。保存は **ZIP の basename + 集計件数のみ**（**フルパス・raw_json・履歴行は保存しない**）。UI（Takeout 画面下部）に履歴テーブル、preview 時に registry バッジ、`Import liked / watch / search` ボタン + dry-run。
+
+#### CLI / API（追加・拡張）
+
+```bash
+archiver takeout import-watch-history PATH --incremental --limit N --dry-run
+archiver takeout import-search-history PATH --incremental --limit N --dry-run
+archiver takeout import-all PATH --dry-run     # combined session
+# API: POST /api/takeout/import-watch-history・import-search-history、GET import-sessions[/{id}]
+```
+
+#### My Activity と YouTube Takeout の違い（重要）
+
+- **liked の全履歴は「マイ アクティビティ（My Activity）」Takeout** に入っています。**YouTube Takeout には通常 liked=0**（playlists の "Liked videos" は API 制限で 0 件のことが多い）。
+- **index-only**（`archive_browser.html` のみ）の ZIP は取り込み対象なし（registry に `takeout_index` のみ）。
+
+#### privacy / 注意
+
+- 履歴・raw_json は個人情報として扱い、**既定 API/UI に出しません**（liked の raw_json は `include_raw=true` 明示時のみ）。import session には**フルパス・raw_json を保存しません**。
+- Takeout ZIP は **Git 管理しない**。大容量再取り込みは `--limit` で少量ずつ・`--dry-run` で件数確認してから本実行を推奨。
+
+### セキュリティ（6C）
+
+- incremental import の dry-run は**DB 非書き込み**。import session は **basename + 件数のみ**（フルパス・raw_json・履歴行なし）。registry の `member` は ZIP 内パスのみ。ストリーム解析で大容量でも省メモリ。secret/cookie/token/PO-token は引き続き非表示。
+
 ---
 
 ## ストレージ構成
@@ -1165,6 +1271,12 @@ archiver takeout import-subscriptions PATH [--limit N] [--dry-run]
 archiver takeout import-playlists PATH [--limit-playlists N] [--limit-items N] [--dry-run]
 archiver takeout import-all PATH [--limit-watch N --limit-search N --limit-subscriptions N --limit-playlists N --limit-items N] [--dry-run]
 archiver takeout playlists PATH                    # 再生リスト一覧（title + 件数、保存なし）
+# --- Phase 6C: 差分再取り込み / registry / import 履歴 ---
+archiver takeout inspect PATH --deep               # source registry 付き
+archiver takeout import-watch-history PATH [--limit N] [--incremental] [--dry-run]   # streaming
+archiver takeout import-search-history PATH [--limit N] [--incremental] [--dry-run]
+archiver takeout sessions [--limit N] [--kind liked_videos]   # import 履歴（件数のみ）
+archiver takeout sessions show SESSION_ID
 archiver search-history list [--limit N] / stats
 archiver subscriptions list
 archiver subscriptions enqueue --videos --shorts --streams --profile metadata_only --max-items 3 [--limit N] [--now]
@@ -1220,7 +1332,9 @@ archiver live-chat stats VIDEO_ID
 | GET | `/api/scheduler/runs/{run_id}/jobs` | その run が作成したジョブ一覧【Phase 7E】 |
 | GET | `/api/scheduler/stats` | 直近 run の集計（status/type 別・skip 合計）【Phase 7E】 |
 | POST | `/api/scheduler/recommend-settings` | 安全寄り推奨値（`{lookback}`、**自動変更なし**）【Phase 7E】 |
-| GET | `/api/liked-videos/progress/history` | progress 時系列スナップショット（raw_json 非返却）【Phase 7E】 |
+| POST | `/api/scheduler/recommend-settings/export` | 推奨値を `.env`/JSON/human で出力（`{format}`、ファイル非変更・secret 非包含）【Phase 7F】 |
+| POST | `/api/scheduler/runs/cleanup` | 古い run を削除（`{keep_last,older_than_days,dry_run}`、**ジョブは消さない**）【Phase 7F】 |
+| GET | `/api/liked-videos/progress/history` | progress 時系列（`?run_type=&from=&to=&downsample=daily&limit=`、raw_json 非返却）【Phase 7E/7F】 |
 | GET | `/api/jobs?scheduler_run_id=` | scheduler run 単位でジョブ絞り込み【Phase 7E】 |
 | POST | `/api/takeout/preview` | Takeout ZIP の preview（`{"path"}`、保存なし） |
 | POST | `/api/takeout/import` | 視聴履歴 import（`{"path","limit","dry_run"}`） |
@@ -1229,7 +1343,11 @@ archiver live-chat stats VIDEO_ID
 | POST | `/api/takeout/import-all` | 5種（watch/search/subs/playlists/liked）を順に import（各 limit 指定可）【6A 拡張】 |
 | POST | `/api/takeout/import-liked-videos` | 高評価リスト import（My Activity / YouTube 自動判定、`source_kind`/`detected_path` 返却）【6A/6B】 |
 | GET | `/api/takeout/discover` | ZIP 種別自動判定一覧（`?deep=`）【Phase 6B】 |
-| GET | `/api/takeout/inspect` | 1 ZIP の構造判定（`?path=`）【Phase 6B】 |
+| GET | `/api/takeout/inspect` | 1 ZIP の構造判定（`?path=&deep=` で source registry 付き）【Phase 6B/6C】 |
+| POST | `/api/takeout/import-watch-history` | 視聴履歴 import（差分・streaming・session 記録）【Phase 6C】 |
+| POST | `/api/takeout/import-search-history` | 検索履歴 import（差分・streaming・session 記録）【Phase 6C】 |
+| GET | `/api/takeout/import-sessions` | import 履歴一覧（件数のみ・パス/raw_json 非保存）【Phase 6C】 |
+| GET | `/api/takeout/import-sessions/{session_id}` | import 履歴詳細【Phase 6C】 |
 | POST | `/api/library/bootstrap` | Hybrid 初回構築（YouTube + My Activity + 任意 API）【Phase 6B】 |
 | GET | `/api/youtube-api/status` | OAuth 状態（secret/token・パス非表示）【Phase 6B】 |
 | POST | `/api/youtube-api/sync-liked` | API 差分同期（未設定でも 200 + `ok=false` + classification）【Phase 6B】 |
@@ -1386,6 +1504,8 @@ live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_e
   - `0009` `jobs` に `retry_count`(server_default 0) / `retry_of_job_id` / `next_retry_at`(index)（Phase 7A・retry/backoff。SQLite 互換のため自己参照 FK はプレーン列で追加）
   - Phase 7B / 7C / 7D は**マイグレーション追加なし**（7B 診断結果は `job.meta.diagnostic`、7C/7D liked archive は既存 `Job`/`MediaFile`/`LikedVideo` を再利用し `job.meta.source_action`/`scheduled_by`/`selected_by` でタグ付け）
   - `a1b2c3d4e5f6` `scheduler_runs` テーブル新規（Phase 7E・実行履歴 + progress/queue スナップショット。整数カウント列は `server_default '0'` で PostgreSQL/SQLite 両対応）
+  - Phase 7F は**マイグレーション追加なし**（retention は `scheduler_runs` の delete のみ・ジョブ非削除。日次集計テーブルは将来拡張）
+  - `b2c3d4e5f6a7` `takeout_import_sessions` テーブル新規（Phase 6C・import 履歴。basename + 集計件数のみ保存。整数列 `server_default '0'` で PostgreSQL/SQLite 両対応）
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
 - 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 

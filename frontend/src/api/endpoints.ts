@@ -27,6 +27,9 @@ import type {
   TakeoutDiscover,
   TakeoutFiles,
   TakeoutImportAll,
+  TakeoutImportResult,
+  TakeoutImportSession,
+  TakeoutInspect,
   TakeoutPreview,
   VideoDetail,
   VideoListItem,
@@ -41,6 +44,8 @@ import type {
   SchedulerRun,
   SchedulerStats,
   RecommendSettings,
+  RecommendExport,
+  SchedulerRunCleanup,
 } from "./types";
 
 export interface LikedArchiveBody {
@@ -179,6 +184,14 @@ export const api = {
   takeoutPreview: (path: string) => apiPost<TakeoutPreview>("/api/takeout/preview", { path }),
   takeoutImportAll: (body: Record<string, unknown>) =>
     apiPost<TakeoutImportAll>("/api/takeout/import-all", body),
+  takeoutInspect: (path: string, deep = false) =>
+    apiGet<TakeoutInspect>(`/api/takeout/inspect${qs({ path, deep: deep || undefined })}`),
+  takeoutImportSearch: (body: { path: string; limit?: number; dry_run?: boolean }) =>
+    apiPost<TakeoutImportResult>("/api/takeout/import-search-history", body),
+  takeoutImportWatch: (body: { path: string; limit?: number; dry_run?: boolean }) =>
+    apiPost<TakeoutImportResult>("/api/takeout/import-watch-history", body),
+  takeoutImportSessions: (p: { import_kind?: string; limit?: number } = {}) =>
+    apiGet<TakeoutImportSession[]>(`/api/takeout/import-sessions${qs(p)}`),
   takeoutImportLiked: (body: { path: string; limit?: number; dry_run?: boolean }) =>
     apiPost<{ imported_count: number; videos_created: number; skipped_duplicate_count: number; scanned: number; source_kind: string | null; detected_path: string | null }>(
       "/api/takeout/import-liked-videos",
@@ -237,13 +250,19 @@ export const api = {
   queueStatus: () => apiGet<QueueStatus>("/api/queue/status"),
 
   // Phase 7E: scheduler run history / stats / recommendations
-  schedulerRuns: (p: { run_type?: string; limit?: number } = {}) =>
+  schedulerRuns: (p: { run_type?: string; status?: string; from?: string; to?: string; limit?: number } = {}) =>
     apiGet<SchedulerRun[]>(`/api/scheduler/runs${qs(p)}`),
   schedulerRun: (runId: string) => apiGet<SchedulerRun>(`/api/scheduler/runs/${runId}`),
   schedulerRunJobs: (runId: string) => apiGet<Job[]>(`/api/scheduler/runs/${runId}/jobs`),
   schedulerStats: () => apiGet<SchedulerStats>("/api/scheduler/stats"),
   schedulerRecommend: (lookback = 30) =>
     apiPost<RecommendSettings>("/api/scheduler/recommend-settings", { lookback }),
+  schedulerRecommendExport: (format: "env" | "json" | "human", lookback = 30) =>
+    apiPost<RecommendExport>("/api/scheduler/recommend-settings/export", { format, lookback }),
+  schedulerRunsCleanup: (body: { keep_last?: number; older_than_days?: number; dry_run?: boolean }) =>
+    apiPost<SchedulerRunCleanup>("/api/scheduler/runs/cleanup", body),
+  likedProgressHistoryFiltered: (p: { run_type?: string; downsample?: string; limit?: number } = {}) =>
+    apiGet<{ points: LikedProgressHistoryPoint[] }>(`/api/liked-videos/progress/history${qs(p)}`),
 
   // YouTube fetch-stability doctor / diagnostics (Phase 7B)
   doctorYoutube: () => apiGet<YouTubeDoctor>("/api/doctor/youtube"),

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import func, or_, select
@@ -464,17 +464,44 @@ def run_once(
         logger.exception("scheduler: run recording failed (run_id=%s)", run_id)
 
     summary["skipped_backoff"] = lretry.get("skipped_backoff", 0)
+
+    # Optional auto-retention (scheduler loop only; default OFF). Fail-safe.
+    if is_scheduler and (settings.scheduler_run_retention_days or settings.scheduler_run_keep_last):
+        try:
+            with session_scope() as s:
+                res = cleanup_runs(
+                    s,
+                    keep_last=settings.scheduler_run_keep_last,
+                    older_than_days=settings.scheduler_run_retention_days,
+                    dry_run=False,
+                    now=now,
+                )
+                s.commit()
+            if res["deleted"]:
+                logger.info("scheduler: retention pruned %s old run(s)", res["deleted"])
+        except Exception:  # noqa: BLE001
+            logger.exception("scheduler: retention cleanup failed")
+
     _scheduler_log(settings, f"run_once {summary}")
     logger.info("scheduler run_once: %s", summary)
     return summary
 
 
-def list_runs(s, *, run_type: str | None = None, limit: int = 50) -> list:
+def list_runs(
+    s, *, run_type: str | None = None, status: str | None = None,
+    date_from: datetime | None = None, date_to: datetime | None = None, limit: int = 50,
+) -> list:
     from app.models import SchedulerRun
 
     stmt = select(SchedulerRun).order_by(SchedulerRun.id.desc())
     if run_type:
         stmt = stmt.where(SchedulerRun.run_type == run_type)
+    if status:
+        stmt = stmt.where(SchedulerRun.status == status)
+    if date_from:
+        stmt = stmt.where(SchedulerRun.started_at >= date_from)
+    if date_to:
+        stmt = stmt.where(SchedulerRun.started_at <= date_to)
     return list(s.scalars(stmt.limit(limit)))
 
 
@@ -497,20 +524,37 @@ def run_jobs(s, run_id: str, *, limit: int = 500) -> list:
     return out
 
 
-def progress_history(s, *, limit: int = 50) -> list[dict]:
-    """Liked-progress snapshots over time (from scheduler runs that captured one)."""
+def progress_history(
+    s, *, limit: int = 100, run_type: str | None = None,
+    date_from: datetime | None = None, date_to: datetime | None = None,
+    downsample: str | None = None,
+) -> list[dict]:
+    """Liked-progress snapshots over time (from scheduler runs that captured one).
+
+    ``downsample="daily"`` keeps only the last snapshot per calendar day.
+    """
     from app.models import SchedulerRun
 
-    runs = list(s.scalars(select(SchedulerRun).order_by(SchedulerRun.id.desc()).limit(limit)))
+    stmt = select(SchedulerRun).order_by(SchedulerRun.id.desc())
+    if run_type:
+        stmt = stmt.where(SchedulerRun.run_type == run_type)
+    if date_from:
+        stmt = stmt.where(SchedulerRun.started_at >= date_from)
+    if date_to:
+        stmt = stmt.where(SchedulerRun.started_at <= date_to)
+    # over-fetch a bit when downsampling so we still return ~limit points
+    scan = limit * 5 if downsample else limit
+    runs = list(s.scalars(stmt.limit(scan)))
     points: list[dict] = []
     for r in reversed(runs):  # chronological
         prog = ((r.meta or {}).get("progress_after")) or {}
         if not prog:
             continue
+        ts = r.finished_at or r.started_at
         points.append({
             "run_id": r.run_id,
             "run_type": r.run_type,
-            "at": (r.finished_at or r.started_at).isoformat() if (r.finished_at or r.started_at) else None,
+            "at": ts.isoformat() if ts else None,
             "total_liked": prog.get("total_liked", 0),
             "metadata_fetched": prog.get("metadata_fetched", 0),
             "metadata_missing": prog.get("metadata_missing", 0),
@@ -521,7 +565,113 @@ def progress_history(s, *, limit: int = 50) -> list[dict]:
             "partial_liked_jobs": prog.get("partial_liked_jobs", 0),
             "active_archive_jobs": prog.get("active_archive_jobs", 0),
         })
-    return points
+    if downsample == "daily":
+        by_day: dict[str, dict] = {}
+        for p in points:  # points are chronological -> last per day wins
+            day = (p["at"] or "")[:10]
+            by_day[day] = p
+        points = list(by_day.values())
+    return points[-limit:]
+
+
+def cleanup_runs(
+    s, *, keep_last: int = 0, older_than_days: int = 0, dry_run: bool = True, now: datetime | None = None,
+) -> dict:
+    """Prune old scheduler_runs. NEVER deletes jobs (job.meta.scheduler_run_id stays).
+
+    A run is deletable when it is OLDER than ``older_than_days`` (if > 0) AND not
+    among the most-recent ``keep_last`` (if > 0). With both 0, nothing is deleted.
+    """
+    from app.models import SchedulerRun
+
+    now = now or _now()
+    all_runs = list(s.scalars(select(SchedulerRun).order_by(SchedulerRun.id.desc())))
+    total = len(all_runs)
+    keep_ids: set[int] = set()
+    if keep_last and keep_last > 0:
+        keep_ids = {r.id for r in all_runs[:keep_last]}
+
+    cutoff = None
+    if older_than_days and older_than_days > 0:
+        cutoff = now - timedelta(days=older_than_days)
+
+    deletable = []
+    for r in all_runs:
+        if r.id in keep_ids:
+            continue
+        # if an age bound is set, only delete rows older than the cutoff
+        if cutoff is not None and (r.started_at or now) >= cutoff:
+            continue
+        # with NO bounds at all, delete nothing (safety)
+        if not keep_last and not older_than_days:
+            continue
+        deletable.append(r)
+
+    deleted_run_ids = [r.run_id for r in deletable]
+    if not dry_run:
+        for r in deletable:
+            s.delete(r)  # only the run row; jobs are untouched
+        s.flush()
+    return {
+        "total_runs": total,
+        "matched": len(deletable),
+        "deleted": 0 if dry_run else len(deletable),
+        "kept": total - len(deletable),
+        "dry_run": dry_run,
+        "keep_last": keep_last,
+        "older_than_days": older_than_days,
+        "deleted_run_ids": deleted_run_ids if not dry_run else [],
+        "matched_run_ids": deleted_run_ids,
+    }
+
+
+_ENV_KEYS = {
+    "scheduler_liked_archive_limit_per_run": "SCHEDULER_LIKED_ARCHIVE_LIMIT_PER_RUN",
+    "scheduler_liked_retry_limit_per_run": "SCHEDULER_LIKED_RETRY_LIMIT_PER_RUN",
+    "liked_archive_job_delay_seconds": "LIKED_ARCHIVE_JOB_DELAY_SECONDS",
+    "scheduler_liked_suppress_when_active": "SCHEDULER_LIKED_SUPPRESS_WHEN_ACTIVE",
+}
+
+
+def recommend_export(rec: dict, fmt: str = "env") -> str:
+    """Render a recommendation as a copy-paste .env snippet / JSON / human text.
+
+    NEVER writes any file. Contains no secrets. Only the recommended tuning keys.
+    """
+    recommended = rec.get("recommended", {})
+    current = rec.get("current", {})
+    if fmt == "json":
+        import json
+
+        return json.dumps(
+            {"recommended": recommended, "current": current, "reasons": rec.get("reasons", [])},
+            indent=2,
+        )
+
+    lines: list[str] = []
+    if fmt == "human":
+        lines.append("# Recommended scheduler settings (suggestion only — NOT applied)")
+        for key, env in _ENV_KEYS.items():
+            cur = current.get(key)
+            new = recommended.get(key)
+            mark = "  <= CHANGE" if str(new) != str(cur) else ""
+            lines.append(f"  {env}: {cur} -> {new}{mark}")
+        lines.append("# reasons:")
+        for r in rec.get("reasons", []):
+            lines.append(f"#  - {r}")
+        return "\n".join(lines)
+
+    # fmt == "env": copy-paste-able .env block (changes commented with current)
+    lines.append("# --- recommended (paste into .env, then `docker compose up -d`) ---")
+    lines.append("# Suggestion only; review before applying. No secrets included.")
+    for key, env in _ENV_KEYS.items():
+        cur = current.get(key)
+        new = recommended.get(key)
+        val = "true" if new is True else "false" if new is False else new
+        changed = str(new) != str(cur)
+        suffix = f"   # was {cur}" if changed else "   # unchanged"
+        lines.append(f"{env}={val}{suffix}")
+    return "\n".join(lines)
 
 
 def scheduler_stats(s, *, lookback: int = 50) -> dict:
