@@ -1104,7 +1104,60 @@ class TakeoutImportSessionOut(BaseModel):
     skipped_duplicate: int = 0
     updated: int = 0
     failed: int = 0
+    # Phase 6D
+    job_id: int | None = None
+    rq_job_id: str | None = None
+    parser_backend: str | None = None
+    entries_per_second: float | None = None
+    peak_memory_mb: float | None = None
+    cancel_requested: bool = False
+    current_phase: str | None = None
+    last_update_at: datetime | None = None
     meta: dict | None = None
+
+
+# ---- Phase 6D: benchmark + progress ----
+class TakeoutBenchmarkRequest(BaseModel):
+    path: str
+    kind: str = "liked_videos"  # liked_videos | watch_history | search_history | all
+    limit: int | None = None
+    dry_run: bool = True
+
+
+class TakeoutBenchmarkOut(BaseModel):
+    kind: str
+    scanned: int
+    imported: int
+    skipped_duplicate: int
+    updated: int
+    failed: int
+    duration_seconds: float
+    entries_per_second: float | None = None
+    peak_memory_mb: float | None = None
+    parser_backend: str
+    dry_run: bool
+    source_kind: str | None = None
+
+
+class TakeoutImportJobRequest(BaseModel):
+    path: str
+    limit: int | None = None
+    dry_run: bool = False
+
+
+class TakeoutImportProgressOut(BaseModel):
+    session_id: str
+    status: str
+    current_phase: str | None = None
+    scanned: int = 0
+    imported: int = 0
+    skipped_duplicate: int = 0
+    updated: int = 0
+    failed: int = 0
+    entries_per_second: float | None = None
+    cancel_requested: bool = False
+    job_id: int | None = None
+    last_update_at: datetime | None = None
 
 
 class SettingsItem(BaseModel):

@@ -5,7 +5,7 @@ import { useFetch } from "../lib/useFetch";
 import { fmtBytes } from "../lib/format";
 import { ErrorBox, Loading } from "../components/ui";
 import { TakeoutSessions } from "../components/TakeoutSessions";
-import type { TakeoutImportAll, TakeoutInspect, TakeoutPreview } from "../api/types";
+import type { TakeoutBenchmark, TakeoutImportAll, TakeoutInspect, TakeoutPreview } from "../api/types";
 
 const KIND_LABEL: Record<string, string> = {
   youtube_takeout: "YouTube Takeout",
@@ -31,6 +31,23 @@ export default function Takeout() {
   const [err, setErr] = useState<string | null>(null);
   const [registry, setRegistry] = useState<TakeoutInspect | null>(null);
   const [sessionsKey, setSessionsKey] = useState(0);
+  const [jobMode, setJobMode] = useState(false);
+  const [bench, setBench] = useState<TakeoutBenchmark | null>(null);
+
+  async function doBenchmark(kind: string) {
+    if (!path) return;
+    setBusy("bench");
+    setErr(null);
+    setBench(null);
+    const n = limit ? Number(limit) : undefined;
+    try {
+      setBench(await api.takeoutBenchmark({ path, kind, limit: n, dry_run: true }));
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  }
 
   async function doPreview(p?: string) {
     const target = p ?? path;
@@ -62,14 +79,19 @@ export default function Takeout() {
     setErr(null);
     const n = limit ? Number(limit) : undefined;
     try {
-      const r = kind === "watch"
-        ? await api.takeoutImportWatch({ path, limit: n, dry_run: dryRun })
-        : await api.takeoutImportSearch({ path, limit: n, dry_run: dryRun });
-      setLikedResult(
-        `${kind === "watch" ? "Watch" : "Search"} history: imported ${r.imported_count}, ` +
-          `skipped ${r.skipped_duplicate_count}, failed ${r.failed_count} (scanned ${r.scanned})` +
-          (r.dry_run ? " [dry-run]" : "")
-      );
+      if (jobMode) {
+        const j = await api.takeoutImportJob(kind === "watch" ? "watch-history" : "search-history", { path, limit: n, dry_run: dryRun });
+        setLikedResult(`${kind} history import queued as background job #${j.id}` + (dryRun ? " [dry-run]" : "") + ".");
+      } else {
+        const r = kind === "watch"
+          ? await api.takeoutImportWatch({ path, limit: n, dry_run: dryRun })
+          : await api.takeoutImportSearch({ path, limit: n, dry_run: dryRun });
+        setLikedResult(
+          `${kind === "watch" ? "Watch" : "Search"} history: imported ${r.imported_count}, ` +
+            `skipped ${r.skipped_duplicate_count}, failed ${r.failed_count} (scanned ${r.scanned})` +
+            (r.dry_run ? " [dry-run]" : "")
+        );
+      }
       setSessionsKey((k) => k + 1);
     } catch (e) {
       setErr((e as Error).message);
@@ -87,11 +109,16 @@ export default function Takeout() {
     setPath(target);
     const n = limit ? Number(limit) : undefined;
     try {
-      const r = await api.takeoutImportLiked({ path: target, limit: n });
-      setLikedResult(
-        `Imported ${r.imported_count} liked (skipped ${r.skipped_duplicate_count}, updated ${r.updated_count ?? 0}, video stubs ${r.videos_created}) from ${r.source_kind}.`
-      );
-      discover.reload();
+      if (jobMode) {
+        const j = await api.takeoutImportJob("liked-videos", { path: target, limit: n, dry_run: dryRun });
+        setLikedResult(`Liked import queued as background job #${j.id}` + (dryRun ? " [dry-run]" : "") + ".");
+      } else {
+        const r = await api.takeoutImportLiked({ path: target, limit: n });
+        setLikedResult(
+          `Imported ${r.imported_count} liked (skipped ${r.skipped_duplicate_count}, updated ${r.updated_count ?? 0}, video stubs ${r.videos_created}) from ${r.source_kind}.`
+        );
+        discover.reload();
+      }
       setSessionsKey((k) => k + 1);
     } catch (e) {
       setErr((e as Error).message);
@@ -223,10 +250,28 @@ export default function Takeout() {
           <button disabled={!path || busy === "search"} onClick={() => doImportKind("search")}>
             {busy === "search" ? <span className="spin" /> : "⤓"} Import search
           </button>
+          <button disabled={!path || busy === "bench"} onClick={() => doBenchmark("liked_videos")}>
+            {busy === "bench" ? <span className="spin" /> : "⏱"} Benchmark
+          </button>
           <label className="checkbox" style={{ alignSelf: "center" }}>
             <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} /> dry-run
           </label>
+          <label className="checkbox" style={{ alignSelf: "center" }} title="Run import on the worker (large imports)">
+            <input type="checkbox" checked={jobMode} onChange={(e) => setJobMode(e.target.checked)} /> background job
+          </label>
         </div>
+
+        <p className="muted small">
+          大容量（liked ~11k / watch ~90k）は <strong>dry-run / limit / background job</strong> を推奨。
+          ストリーム解析（ijson）で省メモリ。raw_json/絶対パスは保存しません。
+        </p>
+        {bench && (
+          <div className="flash">
+            <strong>Benchmark ({bench.kind})</strong>: scanned {bench.scanned}, {bench.entries_per_second ?? "—"} entries/s,
+            peak {bench.peak_memory_mb ?? "—"} MB, parser <code>{bench.parser_backend}</code>, source {bench.source_kind ?? "—"}
+            {bench.dry_run ? " (dry-run)" : ""}.
+          </div>
+        )}
 
         {registry && registry.registry.length > 0 && (
           <div style={{ marginTop: 8 }}>

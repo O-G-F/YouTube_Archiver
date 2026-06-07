@@ -27,6 +27,8 @@ import type {
   TakeoutDiscover,
   TakeoutFiles,
   TakeoutImportAll,
+  TakeoutBenchmark,
+  TakeoutImportProgress,
   TakeoutImportResult,
   TakeoutImportSession,
   TakeoutInspect,
@@ -192,6 +194,14 @@ export const api = {
     apiPost<TakeoutImportResult>("/api/takeout/import-watch-history", body),
   takeoutImportSessions: (p: { import_kind?: string; limit?: number } = {}) =>
     apiGet<TakeoutImportSession[]>(`/api/takeout/import-sessions${qs(p)}`),
+  takeoutBenchmark: (body: { path: string; kind?: string; limit?: number; dry_run?: boolean }) =>
+    apiPost<TakeoutBenchmark>("/api/takeout/benchmark", body),
+  takeoutImportJob: (kind: "liked-videos" | "watch-history" | "search-history", body: { path: string; limit?: number; dry_run?: boolean }) =>
+    apiPost<Job>(`/api/takeout/import-${kind}-job`, body),
+  takeoutImportProgress: (sessionId: string) =>
+    apiGet<TakeoutImportProgress>(`/api/takeout/import-sessions/${sessionId}/progress`),
+  takeoutImportCancel: (sessionId: string) =>
+    apiPost<TakeoutImportProgress>(`/api/takeout/import-sessions/${sessionId}/cancel`, {}),
   takeoutImportLiked: (body: { path: string; limit?: number; dry_run?: boolean }) =>
     apiPost<{ imported_count: number; videos_created: number; skipped_duplicate_count: number; scanned: number; source_kind: string | null; detected_path: string | null }>(
       "/api/takeout/import-liked-videos",

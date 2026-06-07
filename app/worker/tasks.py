@@ -76,6 +76,8 @@ def run_job(job_id: int) -> None:
             _run_subtitles_refresh(settings, job_id)
         elif jtype == "youtube_diagnostic":
             _run_youtube_diagnostic(settings, job_id)
+        elif jtype == "takeout_import":
+            _run_takeout_import(settings, job_id)
         else:
             raise ValueError(f"unknown job type: {jtype!r}")
     except Exception as exc:  # noqa: BLE001 - we want to record every failure
@@ -709,6 +711,19 @@ def _run_subtitles_refresh(settings: Settings, job_id: int) -> None:
             jobs_svc.mark_failed(s, job, f"yt-dlp exited {run.returncode}\n{err_tail}")
 
         jobs_svc.apply_classification(s, job, settings, err_tail)
+
+
+# --------------------------------------------------------------------------- #
+# takeout_import (Phase 6D: background large-import job with progress)
+# --------------------------------------------------------------------------- #
+def _run_takeout_import(settings: Settings, job_id: int) -> None:
+    """Run a Takeout import as a background job (progress -> import session)."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        jobs_svc.mark_running(s, s.get(Job, job_id))
+    with session_scope() as s:
+        tk.run_takeout_import_job(s, settings, job_id)
 
 
 # --------------------------------------------------------------------------- #

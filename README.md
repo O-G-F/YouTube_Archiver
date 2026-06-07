@@ -1191,6 +1191,51 @@ archiver takeout import-all PATH --dry-run     # combined session
 
 - incremental import の dry-run は**DB 非書き込み**。import session は **basename + 件数のみ**（フルパス・raw_json・履歴行なし）。registry の `member` は ZIP 内パスのみ。ストリーム解析で大容量でも省メモリ。secret/cookie/token/PO-token は引き続き非表示。
 
+### 大容量 import benchmark + import job 化 + progress（Phase 6D）
+
+実 My Activity（liked ~11k / watch ~90k）を**安全に・進捗を見ながら**取り込めるようにした層です。**dry-run / limit / background job が安全な既定**です。
+
+#### benchmark（throughput / peak memory）
+
+```bash
+archiver takeout benchmark PATH --kind liked_videos|watch_history|search_history|all [--limit N] [--dry-run]
+# POST /api/takeout/benchmark {"path","kind","limit","dry_run"}
+```
+
+`scanned` / `imported` / `skipped_duplicate` / `updated` / `failed` / `duration_seconds` / **`entries_per_second`** / **`peak_memory_mb`**（tracemalloc）/ **`parser_backend`**(ijson/json) / `source_kind` を返します（**dry-run 既定**・**個人情報本文は返さない**）。ijson ストリームのため巨大ファイルでも peak memory は小さく保たれます。
+
+#### import の background job 化
+
+```bash
+archiver takeout import-liked-videos PATH --limit N --job [--dry-run] [--now]
+archiver takeout import-watch-history PATH --limit N --job
+archiver takeout import-search-history PATH --limit N --job
+# API: POST /api/takeout/import-liked-videos-job / import-watch-history-job / import-search-history-job
+```
+
+`job.type=takeout_import`（既存と非衝突。同期 import は RQ に出さないため worker は job 化分のみ処理）。`job.meta` に `import_kind`/`path_basename`/`source_kind`/`limit`/`dry_run`/`session_id`/`scanned/imported/skipped/updated/failed`/`duration_seconds`/`entries_per_second`（**ホスト絶対パスは保存しない**）。worker は `ProgressTracker` で進捗を import session に書き、partial import は残ります。
+
+#### progress / cancel
+
+```bash
+archiver takeout sessions progress SESSION_ID     # GET /api/takeout/import-sessions/{id}/progress
+archiver takeout sessions cancel SESSION_ID        # POST /api/takeout/import-sessions/{id}/cancel
+```
+
+実行中は `status=running` + `current_phase` + 件数 + `entries_per_second` を返却（DB 更新は throttle：N 件 or 数秒間隔）。cancel は `cancel_requested` を立て、**parser loop が checkpoint で停止**（`status=cancelled`、**部分 import 済みデータは残る**）。完了済み session の cancel は 409。
+
+#### session ↔ job 連携
+
+`takeout_import_sessions` に `job_id`/`rq_job_id`/`parser_backend`/`entries_per_second`/`peak_memory_mb`/`cancel_requested`/`current_phase`/`last_update_at` を追加（migration 0012）。session show / 一覧 / UI に job link、Job Detail から session を辿れます。**6C で null だった watch/search の `source_kind`** は archive_kind（my_activity_takeout/youtube_takeout/takeout_index）で補完。
+
+#### 大容量 import の推奨手順
+
+1. `benchmark --kind ... --dry-run` で eps / peak memory を確認 → 2. `--dry-run --limit 1000` で件数確認 → 3. `--job --limit N` で background 実行（progress を `sessions progress` で監視）→ 4. 問題なければ limit を上げて本 import。**Docker のディスク空き容量に注意**（11k/90k の raw_json は DB を肥大化させ得る）。
+
+### セキュリティ（6D）
+
+- benchmark / job / progress は**件数・集計・eps/peak_mem のみ**で raw_json/secret/絶対パスを返さない。job.meta は basename 中心。dry-run（既定）は **DB 非書き込み**。大容量は dry-run/limit/job を安全既定に。`metadata_only` 本体非保存・body DL 明示を維持。
+
 ---
 
 ## ストレージ構成
@@ -1277,6 +1322,13 @@ archiver takeout import-watch-history PATH [--limit N] [--incremental] [--dry-ru
 archiver takeout import-search-history PATH [--limit N] [--incremental] [--dry-run]
 archiver takeout sessions [--limit N] [--kind liked_videos]   # import 履歴（件数のみ）
 archiver takeout sessions show SESSION_ID
+# --- Phase 6D: 大容量 benchmark / job 化 / progress / cancel ---
+archiver takeout benchmark PATH --kind liked_videos|watch_history|search_history|all [--limit N] [--dry-run]
+archiver takeout import-liked-videos PATH --limit N --job [--dry-run] [--now]   # background job
+archiver takeout import-watch-history PATH --limit N --job
+archiver takeout import-search-history PATH --limit N --job
+archiver takeout sessions progress SESSION_ID
+archiver takeout sessions cancel SESSION_ID
 archiver search-history list [--limit N] / stats
 archiver subscriptions list
 archiver subscriptions enqueue --videos --shorts --streams --profile metadata_only --max-items 3 [--limit N] [--now]
@@ -1346,8 +1398,14 @@ archiver live-chat stats VIDEO_ID
 | GET | `/api/takeout/inspect` | 1 ZIP の構造判定（`?path=&deep=` で source registry 付き）【Phase 6B/6C】 |
 | POST | `/api/takeout/import-watch-history` | 視聴履歴 import（差分・streaming・session 記録）【Phase 6C】 |
 | POST | `/api/takeout/import-search-history` | 検索履歴 import（差分・streaming・session 記録）【Phase 6C】 |
-| GET | `/api/takeout/import-sessions` | import 履歴一覧（件数のみ・パス/raw_json 非保存）【Phase 6C】 |
+| GET | `/api/takeout/import-sessions` | import 履歴一覧（件数のみ・パス/raw_json 非保存。6D で job_id/parser/eps 付き）【Phase 6C/6D】 |
 | GET | `/api/takeout/import-sessions/{session_id}` | import 履歴詳細【Phase 6C】 |
+| POST | `/api/takeout/benchmark` | 取り込み throughput / peak memory 測定（dry-run 既定・本文非返却）【Phase 6D】 |
+| POST | `/api/takeout/import-liked-videos-job` | liked import を background job 化（`{path,limit,dry_run}`）【Phase 6D】 |
+| POST | `/api/takeout/import-watch-history-job` | watch import を background job 化【Phase 6D】 |
+| POST | `/api/takeout/import-search-history-job` | search import を background job 化【Phase 6D】 |
+| GET | `/api/takeout/import-sessions/{session_id}/progress` | 実行中 import の進捗（status/phase/件数/eps）【Phase 6D】 |
+| POST | `/api/takeout/import-sessions/{session_id}/cancel` | 実行中 import の cancel 要求（checkpoint で停止）【Phase 6D】 |
 | POST | `/api/library/bootstrap` | Hybrid 初回構築（YouTube + My Activity + 任意 API）【Phase 6B】 |
 | GET | `/api/youtube-api/status` | OAuth 状態（secret/token・パス非表示）【Phase 6B】 |
 | POST | `/api/youtube-api/sync-liked` | API 差分同期（未設定でも 200 + `ok=false` + classification）【Phase 6B】 |
@@ -1506,6 +1564,7 @@ live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_e
   - `a1b2c3d4e5f6` `scheduler_runs` テーブル新規（Phase 7E・実行履歴 + progress/queue スナップショット。整数カウント列は `server_default '0'` で PostgreSQL/SQLite 両対応）
   - Phase 7F は**マイグレーション追加なし**（retention は `scheduler_runs` の delete のみ・ジョブ非削除。日次集計テーブルは将来拡張）
   - `b2c3d4e5f6a7` `takeout_import_sessions` テーブル新規（Phase 6C・import 履歴。basename + 集計件数のみ保存。整数列 `server_default '0'` で PostgreSQL/SQLite 両対応）
+  - `c3d4e5f6a7b8` `takeout_import_sessions` に `job_id`/`rq_job_id`/`parser_backend`/`entries_per_second`/`peak_memory_mb`/`cancel_requested`/`current_phase`/`last_update_at` を追加（Phase 6D・job 化/benchmark/progress。bool は `server_default false`）
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
 - 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 

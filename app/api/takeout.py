@@ -26,6 +26,11 @@ from app.schemas import (
     TakeoutImportAllRequest,
     TakeoutImportOut,
     TakeoutImportPlaylistsRequest,
+    JobOut,
+    TakeoutBenchmarkOut,
+    TakeoutBenchmarkRequest,
+    TakeoutImportJobRequest,
+    TakeoutImportProgressOut,
     TakeoutImportSessionOut,
     TakeoutInspectOut,
     TakeoutImportRequest,
@@ -34,6 +39,7 @@ from app.schemas import (
     TakeoutPreviewRequest,
     TakeoutRegistrySource,
 )
+from app.services import jobs as jobs_svc
 from app.services import takeout
 
 router = APIRouter(prefix="/api/takeout", tags=["takeout"])
@@ -217,6 +223,83 @@ def takeout_import_all(
         raise HTTPException(status_code=400, detail=str(exc))
     db.commit()
     return TakeoutImportAllOut(**result)
+
+
+@router.post("/benchmark", response_model=TakeoutBenchmarkOut)
+def takeout_benchmark(
+    req: TakeoutBenchmarkRequest, db: Session = Depends(get_db)
+) -> TakeoutBenchmarkOut:
+    """Measure parse/import throughput + peak memory (dry_run default). No content returned."""
+    try:
+        result = takeout.benchmark(
+            db, get_settings(), req.path, kind=req.kind, limit=req.limit, dry_run=req.dry_run
+        )
+    except takeout.TakeoutError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not req.dry_run:
+        db.commit()
+    return TakeoutBenchmarkOut(**result)
+
+
+def _create_import_job(db: Session, import_kind: str, req: TakeoutImportJobRequest) -> JobOut:
+    try:
+        job, _row = takeout.create_import_job(
+            db, get_settings(), import_kind=import_kind, path=req.path,
+            limit=req.limit, dry_run=req.dry_run,
+        )
+    except takeout.TakeoutError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    db.commit()
+    try:
+        rq_id = jobs_svc.submit_job(job.id)
+        if rq_id:
+            job.rq_job_id = rq_id
+            db.commit()
+    except Exception:  # noqa: BLE001 - Redis down; job stays queued
+        pass
+    return JobOut.model_validate(db.get(type(job), job.id))
+
+
+@router.post("/import-liked-videos-job", response_model=JobOut, status_code=201)
+def takeout_import_liked_job(req: TakeoutImportJobRequest, db: Session = Depends(get_db)) -> JobOut:
+    """Run a liked-videos import as a background job (large imports). No body DL."""
+    return _create_import_job(db, "liked_videos", req)
+
+
+@router.post("/import-watch-history-job", response_model=JobOut, status_code=201)
+def takeout_import_watch_job(req: TakeoutImportJobRequest, db: Session = Depends(get_db)) -> JobOut:
+    return _create_import_job(db, "watch_history", req)
+
+
+@router.post("/import-search-history-job", response_model=JobOut, status_code=201)
+def takeout_import_search_job(req: TakeoutImportJobRequest, db: Session = Depends(get_db)) -> JobOut:
+    return _create_import_job(db, "search_history", req)
+
+
+@router.get("/import-sessions/{session_id}/progress", response_model=TakeoutImportProgressOut)
+def takeout_import_progress(session_id: str, db: Session = Depends(get_db)) -> TakeoutImportProgressOut:
+    row = takeout.get_import_session(db, session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="import session not found")
+    return TakeoutImportProgressOut(
+        session_id=row.session_id, status=row.status, current_phase=row.current_phase,
+        scanned=row.scanned, imported=row.imported, skipped_duplicate=row.skipped_duplicate,
+        updated=row.updated, failed=row.failed, entries_per_second=row.entries_per_second,
+        cancel_requested=row.cancel_requested, job_id=row.job_id, last_update_at=row.last_update_at,
+    )
+
+
+@router.post("/import-sessions/{session_id}/cancel", response_model=TakeoutImportProgressOut)
+def takeout_import_cancel(session_id: str, db: Session = Depends(get_db)) -> TakeoutImportProgressOut:
+    """Request cancellation of a running import (the worker stops at the next checkpoint)."""
+    ok = takeout.request_cancel(db, session_id)
+    if not ok:
+        row = takeout.get_import_session(db, session_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="import session not found")
+        raise HTTPException(status_code=409, detail=f"cannot cancel a {row.status} session")
+    db.commit()
+    return takeout_import_progress(session_id, db)
 
 
 @router.get("/import-sessions", response_model=list[TakeoutImportSessionOut])

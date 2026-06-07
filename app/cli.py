@@ -1463,16 +1463,36 @@ def _echo_import_result(result: dict, kind: str) -> None:
     )
 
 
+def _maybe_import_job(import_kind: str, path: str, limit: int, dry_run: bool, job: bool, now: bool) -> bool:
+    """If --job, create a background takeout_import job. Returns True if handled."""
+    if not job:
+        return False
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        j, row = tk.create_import_job(s, get_settings(), import_kind=import_kind,
+                                      path=path, limit=(limit or None), dry_run=dry_run)
+        s.commit()
+        jid, sid = j.id, row.session_id
+    typer.echo(f"Created takeout_import job #{jid} (session {sid}, kind={import_kind}, dry_run={dry_run}).")
+    _dispatch(jid, now)
+    return True
+
+
 @takeout_app.command("import-watch-history")
 def takeout_import_watch_history(
     path: str = typer.Argument(...),
     limit: int = typer.Option(0, "--limit", help="Max events (0 = all)."),
     incremental: bool = typer.Option(True, "--incremental/--full", help="Dedup vs existing (always on)."),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    job: bool = typer.Option(False, "--job", help="Run as a background job (large imports)."),
+    now: bool = typer.Option(False, "--now", help="With --job: run inline instead of via RQ."),
 ) -> None:
     """Import watch history (incremental: dedup vs existing). Streams large JSON."""
     from app.services import takeout as tk
 
+    if _maybe_import_job("watch_history", path, limit, dry_run, job, now):
+        return
     with session_scope() as s:
         try:
             result = tk.run_import(s, get_settings(), path, limit=(limit or None), dry_run=dry_run)
@@ -1487,10 +1507,14 @@ def takeout_import_search_history(
     limit: int = typer.Option(0, "--limit", help="Max events (0 = all)."),
     incremental: bool = typer.Option(True, "--incremental/--full", help="Dedup vs existing (always on)."),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    job: bool = typer.Option(False, "--job", help="Run as a background job (large imports)."),
+    now: bool = typer.Option(False, "--now"),
 ) -> None:
     """Import search history (incremental: dedup vs existing). Streams large JSON."""
     from app.services import takeout as tk
 
+    if _maybe_import_job("search_history", path, limit, dry_run, job, now):
+        return
     with session_scope() as s:
         try:
             result = tk.run_import_search(s, get_settings(), path, limit=(limit or None), dry_run=dry_run)
@@ -1521,6 +1545,61 @@ def takeout_sessions_list(
                 f"imported={r.imported} skipped={r.skipped_duplicate} updated={r.updated} "
                 f"failed={r.failed} scanned={r.scanned} dry_run={r.dry_run}  {r.path_basename}  {r.started_at}"
             )
+
+
+@takeout_sessions_app.command("progress")
+def takeout_sessions_progress(session_id: str = typer.Argument(...)) -> None:
+    """Show live progress for a (running) import session."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        r = tk.get_import_session(s, session_id)
+        if r is None:
+            typer.echo(f"session {session_id} not found")
+            raise typer.Exit(code=1)
+        typer.echo(
+            f"{r.session_id}  {r.import_kind}  status={r.status} phase={r.current_phase} "
+            f"scanned={r.scanned} imported={r.imported} skipped={r.skipped_duplicate} "
+            f"updated={r.updated} failed={r.failed} eps={r.entries_per_second} "
+            f"cancel_requested={r.cancel_requested} job_id={r.job_id} last_update={r.last_update_at}"
+        )
+
+
+@takeout_sessions_app.command("cancel")
+def takeout_sessions_cancel(session_id: str = typer.Argument(...)) -> None:
+    """Request cancellation of a running import (stops at the next checkpoint)."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        ok = tk.request_cancel(s, session_id)
+        s.commit()
+    typer.echo("cancel requested" if ok else "session not found or not running")
+
+
+@takeout_app.command("benchmark")
+def takeout_benchmark(
+    path: str = typer.Argument(...),
+    kind: str = typer.Option("liked_videos", "--kind", help="liked_videos | watch_history | search_history | all"),
+    limit: int = typer.Option(0, "--limit", help="0 = all (caution on huge files)."),
+    dry_run: bool = typer.Option(True, "--dry-run/--write", help="Measure without writing (default)."),
+) -> None:
+    """Benchmark parse/import throughput + peak memory for a Takeout source."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        try:
+            b = tk.benchmark(s, get_settings(), path, kind=kind, limit=(limit or None), dry_run=dry_run)
+        except tk.TakeoutError as exc:
+            raise typer.BadParameter(str(exc))
+        if not dry_run:
+            s.commit()
+    typer.echo(
+        f"[benchmark {b['kind']}] scanned={b['scanned']} imported={b['imported']} "
+        f"skipped={b['skipped_duplicate']} updated={b['updated']} failed={b['failed']} "
+        f"duration={b['duration_seconds']}s eps={b['entries_per_second']} "
+        f"peak_mem={b['peak_memory_mb']}MB parser={b['parser_backend']} "
+        f"dry_run={b['dry_run']} source_kind={b['source_kind']}"
+    )
 
 
 @takeout_sessions_app.command("show")
@@ -1613,10 +1692,14 @@ def takeout_import_liked_videos(
     path: str = typer.Argument(...),
     limit: int = typer.Option(0, "--limit", help="Max liked videos to scan (0 = all)."),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    job: bool = typer.Option(False, "--job", help="Run as a background job (large imports)."),
+    now: bool = typer.Option(False, "--now", help="With --job: run inline instead of via RQ."),
 ) -> None:
     """Import liked videos (Takeout 'Liked videos' playlist) into liked_videos."""
     from app.services import takeout as tk
 
+    if _maybe_import_job("liked_videos", path, limit, dry_run, job, now):
+        return
     with session_scope() as s:
         try:
             r = tk.run_import_liked_videos(
@@ -1626,8 +1709,8 @@ def takeout_import_liked_videos(
             raise typer.BadParameter(str(exc))
     typer.echo(
         f"liked_videos: imported={r['imported_count']} skipped={r['skipped_duplicate_count']} "
-        f"failed={r['failed_count']} scanned={r['scanned']} videos_created={r['videos_created']} "
-        f"dry_run={r['dry_run']}"
+        f"updated={r.get('updated_count', 0)} failed={r['failed_count']} scanned={r['scanned']} "
+        f"videos_created={r['videos_created']} dry_run={r['dry_run']}"
     )
 
 

@@ -22,6 +22,7 @@ import html as _html
 import io
 import json
 import re
+import time
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1002,12 +1003,62 @@ def _dedup_key(vid: str | None, title: str | None, watched_at: datetime | None) 
     return ("t", (title or "")[:200], wa)
 
 
+def parser_backend() -> str:
+    """Which JSON backend the streaming importers will use."""
+    try:
+        import ijson  # noqa: F401
+
+        return "ijson"
+    except Exception:  # noqa: BLE001
+        return "json"
+
+
+class ProgressTracker:
+    """Throttled progress writer for a long-running (job) import (Phase 6D).
+
+    Periodically writes scanned/imported/... into the linked
+    ``TakeoutImportSession`` row (committing so the progress API can read it),
+    and re-checks the session's ``cancel_requested`` flag. Used ONLY by job
+    imports — synchronous imports pass ``tracker=None`` (no mid-commit).
+    """
+
+    def __init__(self, session, row, *, every: int = 1000, min_interval: float = 2.0):
+        self.session = session
+        self.row = row
+        self.every = max(1, every)
+        self.min_interval = min_interval
+        self._last = 0.0
+        self.cancelled = False
+
+    def update(self, *, scanned, imported, skipped, updated, failed, phase=None, force=False) -> bool:
+        now = time.monotonic()
+        if not force and scanned % self.every != 0 and (now - self._last) < self.min_interval:
+            return self.cancelled
+        try:
+            self.row.scanned = scanned
+            self.row.imported = imported
+            self.row.skipped_duplicate = skipped
+            self.row.updated = updated
+            self.row.failed = failed
+            if phase:
+                self.row.current_phase = phase
+            self.row.last_update_at = utcnow()
+            self.session.commit()  # persist partial progress (so it survives + is readable)
+            self.session.refresh(self.row)
+            self.cancelled = bool(self.row.cancel_requested)
+        except Exception:  # noqa: BLE001 - never let progress writing break the import
+            logger.exception("takeout: progress update failed")
+        self._last = now
+        return self.cancelled
+
+
 def import_watch_history(
     session: Session,
     archive: TakeoutArchive,
     *,
     limit: int | None = None,
     dry_run: bool = False,
+    tracker: "ProgressTracker | None" = None,
 ) -> dict:
     """Import watch events into ``watch_history_events`` with dedup.
 
@@ -1026,6 +1077,7 @@ def import_watch_history(
     imported = skipped = failed = scanned = 0
     seen: set[tuple] = set()
     warnings: list[str] = []
+    cancelled = False
 
     for ev in archive.iter_watch_events():
         if limit is not None and scanned >= limit:
@@ -1040,20 +1092,26 @@ def import_watch_history(
             continue
         if key in existing or key in seen:
             skipped += 1
-            continue
-        seen.add(key)
-        if not dry_run:
-            session.add(
-                WatchHistoryEvent(
-                    source="takeout",
-                    youtube_video_id=ev.youtube_video_id,
-                    title=ev.title,
-                    channel_title=ev.channel_title,
-                    watched_at=ev.watched_at,
-                    raw_json=ev.raw,
+        else:
+            seen.add(key)
+            if not dry_run:
+                session.add(
+                    WatchHistoryEvent(
+                        source="takeout",
+                        youtube_video_id=ev.youtube_video_id,
+                        title=ev.title,
+                        channel_title=ev.channel_title,
+                        watched_at=ev.watched_at,
+                        raw_json=ev.raw,
+                    )
                 )
-            )
-        imported += 1
+            imported += 1
+        if tracker is not None and tracker.update(
+            scanned=scanned, imported=imported, skipped=skipped, updated=0,
+            failed=failed, phase="watch_history",
+        ):
+            cancelled = True
+            break
 
     if not dry_run:
         session.flush()
@@ -1061,14 +1119,17 @@ def import_watch_history(
     return {
         "imported_count": imported,
         "skipped_duplicate_count": skipped,
+        "updated_count": 0,
         "failed_count": failed,
         "scanned": scanned,
+        "cancelled": cancelled,
         "warnings": warnings,
     }
 
 
 def import_search_history(
-    session: Session, archive: TakeoutArchive, *, limit: int | None = None, dry_run: bool = False
+    session: Session, archive: TakeoutArchive, *, limit: int | None = None, dry_run: bool = False,
+    tracker: "ProgressTracker | None" = None,
 ) -> dict:
     """Import search events into ``search_history_events`` with dedup."""
     existing: set[tuple] = set()
@@ -1081,35 +1142,44 @@ def import_search_history(
 
     imported = skipped = failed = scanned = 0
     seen: set[tuple] = set()
+    cancelled = False
     for ev in archive.iter_search_events():
         if limit is not None and scanned >= limit:
             break
         scanned += 1
         if not ev.query:
             failed += 1
-            continue
-        key = (ev.query[:512], ev.searched_at.isoformat() if ev.searched_at else "")
-        if key in existing or key in seen:
-            skipped += 1
-            continue
-        seen.add(key)
-        if not dry_run:
-            session.add(
-                SearchHistoryEvent(
-                    source="takeout",
-                    query=ev.query,
-                    searched_at=ev.searched_at,
-                    raw_json=ev.raw,
-                )
-            )
-        imported += 1
+        else:
+            key = (ev.query[:512], ev.searched_at.isoformat() if ev.searched_at else "")
+            if key in existing or key in seen:
+                skipped += 1
+            else:
+                seen.add(key)
+                if not dry_run:
+                    session.add(
+                        SearchHistoryEvent(
+                            source="takeout",
+                            query=ev.query,
+                            searched_at=ev.searched_at,
+                            raw_json=ev.raw,
+                        )
+                    )
+                imported += 1
+        if tracker is not None and tracker.update(
+            scanned=scanned, imported=imported, skipped=skipped, updated=0,
+            failed=failed, phase="search_history",
+        ):
+            cancelled = True
+            break
     if not dry_run:
         session.flush()
     return {
         "imported_count": imported,
         "skipped_duplicate_count": skipped,
+        "updated_count": 0,
         "failed_count": failed,
         "scanned": scanned,
+        "cancelled": cancelled,
         "warnings": [],
     }
 
@@ -1279,6 +1349,7 @@ def import_liked_videos(
     *,
     limit: int | None = None,
     dry_run: bool = False,
+    tracker: "ProgressTracker | None" = None,
 ) -> dict:
     """Import liked videos into ``liked_videos`` (+ Video stubs) with dedup.
 
@@ -1315,6 +1386,11 @@ def import_liked_videos(
                 "liked import: scanned=%d imported=%d skipped=%d updated=%d (%s)",
                 scanned, imported, skipped, updated, source_kind,
             )
+        if tracker is not None and tracker.update(
+            scanned=scanned, imported=imported, skipped=skipped, updated=updated,
+            failed=failed, phase="liked_videos",
+        ):
+            break  # cancel_requested -> stop (partial import persists)
         vid = lv.youtube_video_id
         if vid:
             if vid in existing_ids or vid in seen_ids:
@@ -1445,6 +1521,180 @@ def record_import_session(
     return session_id
 
 
+def create_running_session(
+    session: Session, *, import_kind: str, path_basename: str, source_kind: str | None,
+    dry_run: bool, limit: int | None, job_id: int | None = None, rq_job_id: str | None = None,
+):
+    """Create a TakeoutImportSession in the 'running' state (for job imports)."""
+    import uuid
+
+    from app.models import TakeoutImportSession
+
+    row = TakeoutImportSession(
+        session_id=uuid.uuid4().hex[:16],
+        path_basename=(path_basename or "")[:255] or None,
+        source_kind=source_kind,
+        import_kind=import_kind,
+        started_at=utcnow(),
+        status="running",
+        dry_run=dry_run,
+        parser_backend=parser_backend(),
+        current_phase="starting",
+        last_update_at=utcnow(),
+        job_id=job_id,
+        rq_job_id=rq_job_id,
+        meta={"limit": limit},
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def request_cancel(session: Session, session_id: str) -> bool:
+    """Flag a running import session for cancellation. Returns True if found+running."""
+    row = get_import_session(session, session_id)
+    if row is None or row.status not in ("running",):
+        return False
+    row.cancel_requested = True
+    session.flush()
+    return True
+
+
+def run_takeout_import_job(session: Session, settings: Settings, job_id: int) -> dict:
+    """Worker entrypoint: run a Takeout import as a background job (Phase 6D).
+
+    Reads ``job.meta`` (import_kind / path / limit / dry_run / session_id), runs
+    the import with a ProgressTracker writing into the session row, and finalizes
+    both the session and the job. NEVER stores the host path or raw_json.
+    """
+    from app.models import Job
+
+    job = session.get(Job, job_id)
+    meta = job.meta or {}
+    import_kind = meta.get("import_kind", "liked_videos")
+    path = meta.get("path") or meta.get("path_basename") or ""
+    limit = meta.get("limit")
+    dry_run = bool(meta.get("dry_run"))
+    session_id = meta.get("session_id")
+
+    zip_path = resolve_takeout_path(settings, path)
+    row = get_import_session(session, session_id) if session_id else None
+    started = utcnow()
+    t0 = time.monotonic()
+
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        with open_archive(zip_path) as archive:
+            archive_kind = archive.archive_kind()
+            if row is not None and not row.source_kind:
+                row.source_kind = archive_kind
+                session.flush()
+            tracker = ProgressTracker(session, row) if row is not None else None
+            if import_kind == "watch_history":
+                result = import_watch_history(session, archive, limit=limit, dry_run=dry_run, tracker=tracker)
+            elif import_kind == "search_history":
+                result = import_search_history(session, archive, limit=limit, dry_run=dry_run, tracker=tracker)
+            elif import_kind == "liked_videos":
+                result = import_liked_videos(session, archive, limit=limit, dry_run=dry_run, tracker=tracker)
+            else:
+                raise TakeoutError(f"unknown job import_kind: {import_kind!r}")
+    except Exception as exc:  # noqa: BLE001
+        tracemalloc.stop()
+        if row is not None:
+            row.status = "failed"
+            row.finished_at = utcnow()
+            row.current_phase = "failed"
+            session.flush()
+        job.status = "failed"
+        job.error_message = f"takeout import: {exc}"
+        job.finished_at = utcnow()
+        session.flush()
+        raise
+    _cur, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    dur = time.monotonic() - t0
+    scanned = int(result.get("scanned", 0) or 0)
+    cancelled = bool(result.get("cancelled")) or (row is not None and row.cancel_requested)
+
+    if row is not None:
+        row.scanned = scanned
+        row.imported = int(result.get("imported_count", 0) or 0)
+        row.skipped_duplicate = int(result.get("skipped_duplicate_count", 0) or 0)
+        row.updated = int(result.get("updated_count", 0) or 0)
+        row.failed = int(result.get("failed_count", 0) or 0)
+        row.entries_per_second = round(scanned / dur, 1) if dur > 0 else None
+        row.peak_memory_mb = round(peak / 1024 / 1024, 2)
+        row.source_kind = result.get("source_kind") or row.source_kind or archive_kind
+        row.current_phase = "cancelled" if cancelled else "done"
+        row.status = "cancelled" if cancelled else "success"
+        row.finished_at = utcnow()
+        session.flush()
+
+    job.status = "success"
+    job.progress = 100.0
+    job.finished_at = utcnow()
+    job.meta = {
+        **(job.meta or {}),
+        "scanned": scanned,
+        "imported": int(result.get("imported_count", 0) or 0),
+        "skipped_duplicate": int(result.get("skipped_duplicate_count", 0) or 0),
+        "updated": int(result.get("updated_count", 0) or 0),
+        "failed": int(result.get("failed_count", 0) or 0),
+        "duration_seconds": round(dur, 2),
+        "entries_per_second": round(scanned / dur, 1) if dur > 0 else None,
+        "source_kind": result.get("source_kind") or archive_kind,
+        "cancelled": cancelled,
+    }
+    session.flush()
+    return {**result, "session_id": session_id, "duration_seconds": round(dur, 2),
+            "peak_memory_mb": round(peak / 1024 / 1024, 2), "cancelled": cancelled}
+
+
+def create_import_job(
+    session: Session, settings: Settings, *,
+    import_kind: str, path: str, limit: int | None = None, dry_run: bool = False,
+):
+    """Create a queued takeout_import Job + a running import session (Phase 6D).
+
+    Returns (job, session_row). The caller commits and submits the job to RQ.
+    Stores only the ZIP basename in job.meta (never the host path).
+    """
+    from app.models import Job
+
+    zip_path = resolve_takeout_path(settings, path)  # validates / path-traversal guard
+    source_kind = None
+    try:
+        with open_archive(zip_path) as a:
+            source_kind = a.archive_kind()
+    except TakeoutError:
+        source_kind = None
+    row = create_running_session(
+        session, import_kind=import_kind, path_basename=zip_path.name,
+        source_kind=source_kind, dry_run=dry_run, limit=limit,
+    )
+    job = Job(
+        type="takeout_import",
+        status="queued",
+        meta={
+            "import_kind": import_kind,
+            "path": path,
+            "path_basename": zip_path.name,
+            "source_kind": source_kind,
+            "limit": limit,
+            "dry_run": dry_run,
+            "session_id": row.session_id,
+            "enqueued_by": "takeout_import_job",
+        },
+    )
+    session.add(job)
+    session.flush()
+    row.job_id = job.id
+    session.flush()
+    return job, row
+
+
 def _run_with_job(
     session: Session,
     settings: Settings,
@@ -1467,8 +1717,10 @@ def _run_with_job(
         )
         session.add(job)
         session.flush()
+    archive_kind = None
     try:
         with open_archive(zip_path) as archive:
+            archive_kind = archive.archive_kind()
             result = importer(archive)
     except TakeoutError:
         if job is not None:
@@ -1478,11 +1730,14 @@ def _run_with_job(
         if record_session:
             record_import_session(
                 session, import_kind=kind, path_basename=zip_path.name,
-                source_kind=None, result={}, dry_run=dry_run, started_at=started, status="failed",
+                source_kind=archive_kind, result={}, dry_run=dry_run, started_at=started, status="failed",
             )
         raise
     result["dry_run"] = dry_run
     result["duration_seconds"] = round((utcnow() - started).total_seconds(), 2)
+    # source_kind: liked imports report a precise source; others fall back to the
+    # archive kind (my_activity_takeout / youtube_takeout / takeout_index).
+    result.setdefault("source_kind", archive_kind)
     if job is not None:
         job.status = "success"
         job.finished_at = utcnow()
@@ -1503,6 +1758,64 @@ def _run_with_job(
             dry_run=dry_run, started_at=started,
         )
     return result
+
+
+_BENCH_KINDS = {
+    "liked_videos": import_liked_videos,
+    "watch_history": import_watch_history,
+    "search_history": import_search_history,
+}
+
+
+def benchmark(
+    session: Session, settings: Settings, path: str, *,
+    kind: str = "liked_videos", limit: int | None = None, dry_run: bool = True,
+) -> dict:
+    """Measure parse/import throughput + peak memory for a Takeout source.
+
+    dry_run defaults to True (safe). Returns counts + duration + entries_per_second
+    + peak_memory_mb + parser_backend. No raw_json / personal content is returned.
+    """
+    import time as _time
+    import tracemalloc
+
+    zip_path = resolve_takeout_path(settings, path)
+    backend = parser_backend()
+    tracemalloc.start()
+    t0 = _time.monotonic()
+    with open_archive(zip_path) as archive:
+        archive_kind = archive.archive_kind()
+        if kind == "all":
+            agg = {"scanned": 0, "imported_count": 0, "skipped_duplicate_count": 0,
+                   "updated_count": 0, "failed_count": 0}
+            for fn in (import_watch_history, import_search_history, import_liked_videos):
+                r = fn(session, archive, limit=limit, dry_run=dry_run)
+                for k in agg:
+                    agg[k] += int(r.get(k, 0) or 0)
+            result = agg
+        else:
+            fn = _BENCH_KINDS.get(kind)
+            if fn is None:
+                raise TakeoutError(f"unknown benchmark kind: {kind!r}")
+            result = fn(session, archive, limit=limit, dry_run=dry_run)
+    dur = _time.monotonic() - t0
+    _cur, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    scanned = int(result.get("scanned", 0) or 0)
+    return {
+        "kind": kind,
+        "scanned": scanned,
+        "imported": int(result.get("imported_count", 0) or 0),
+        "skipped_duplicate": int(result.get("skipped_duplicate_count", 0) or 0),
+        "updated": int(result.get("updated_count", 0) or 0),
+        "failed": int(result.get("failed_count", 0) or 0),
+        "duration_seconds": round(dur, 3),
+        "entries_per_second": round(scanned / dur, 1) if dur > 0 else None,
+        "peak_memory_mb": round(peak / 1024 / 1024, 2),
+        "parser_backend": backend,
+        "dry_run": dry_run,
+        "source_kind": result.get("source_kind") or archive_kind,
+    }
 
 
 def list_import_sessions(session: Session, *, import_kind: str | None = None, limit: int = 50) -> list:

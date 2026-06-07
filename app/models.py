@@ -527,6 +527,16 @@ class TakeoutImportSession(Base):
     updated: Mapped[int] = mapped_column(Integer, default=0)
     failed: Mapped[int] = mapped_column(Integer, default=0)
 
+    # Phase 6D: job-ization + benchmark + progress.
+    job_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    rq_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    parser_backend: Mapped[str | None] = mapped_column(String(16), nullable=True)  # ijson | json
+    entries_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)
+    peak_memory_mb: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    current_phase: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_update_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 

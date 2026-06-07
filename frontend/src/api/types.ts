@@ -375,6 +375,43 @@ export interface TakeoutImportSession {
   skipped_duplicate: number;
   updated: number;
   failed: number;
+  job_id?: number | null;
+  parser_backend?: string | null;
+  entries_per_second?: number | null;
+  peak_memory_mb?: number | null;
+  cancel_requested?: boolean;
+  current_phase?: string | null;
+  last_update_at?: string | null;
+}
+
+export interface TakeoutBenchmark {
+  kind: string;
+  scanned: number;
+  imported: number;
+  skipped_duplicate: number;
+  updated: number;
+  failed: number;
+  duration_seconds: number;
+  entries_per_second: number | null;
+  peak_memory_mb: number | null;
+  parser_backend: string;
+  dry_run: boolean;
+  source_kind: string | null;
+}
+
+export interface TakeoutImportProgress {
+  session_id: string;
+  status: string;
+  current_phase: string | null;
+  scanned: number;
+  imported: number;
+  skipped_duplicate: number;
+  updated: number;
+  failed: number;
+  entries_per_second: number | null;
+  cancel_requested: boolean;
+  job_id: number | null;
+  last_update_at: string | null;
 }
 
 export interface LikedVideo {
