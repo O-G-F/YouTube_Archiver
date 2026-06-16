@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     takeout_import_root: Path = Path("/takeout_imports")
     obsidian_export_root: Path = Path("/obsidian_export")
 
+    # ---- Takeout import session retention (Phase 6E) — default OFF ----
+    # When > 0, `takeout sessions cleanup` (and any future auto-prune) deletes
+    # sessions older than N days and/or beyond the most-recent KEEP_LAST. Jobs
+    # and imported data are NEVER deleted by session cleanup.
+    takeout_import_session_retention_days: int = 0
+    takeout_import_session_keep_last: int = 0
+
     # ---- Database ----
     database_url: str = "sqlite:///./data/archiver.sqlite3"
 

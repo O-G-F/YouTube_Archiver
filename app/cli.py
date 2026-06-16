@@ -56,6 +56,7 @@ youtube_api_app = typer.Typer(help="YouTube Data API OAuth (differential liked s
 doctor_app = typer.Typer(help="Environment diagnostics (general + YouTube fetch stability).")
 youtube_diag_app = typer.Typer(help="YouTube fetch-stability diagnostics (benchmark).")
 queue_app = typer.Typer(help="Job queue health (Phase 7D).")
+storage_app = typer.Typer(help="Storage / database stats (Phase 6E).")
 app.add_typer(source_app, name="source")
 app.add_typer(download_app, name="download")
 app.add_typer(jobs_app, name="jobs")
@@ -77,6 +78,7 @@ app.add_typer(youtube_api_app, name="youtube-api")
 app.add_typer(doctor_app, name="doctor")
 app.add_typer(youtube_diag_app, name="youtube-diagnostics")
 app.add_typer(queue_app, name="queue")
+app.add_typer(storage_app, name="storage")
 
 
 # --------------------------------------------------------------------------- #
@@ -1463,7 +1465,8 @@ def _echo_import_result(result: dict, kind: str) -> None:
     )
 
 
-def _maybe_import_job(import_kind: str, path: str, limit: int, dry_run: bool, job: bool, now: bool) -> bool:
+def _maybe_import_job(import_kind: str, path: str, limit: int, dry_run: bool, job: bool, now: bool,
+                      store_raw_json: bool = True) -> bool:
     """If --job, create a background takeout_import job. Returns True if handled."""
     if not job:
         return False
@@ -1471,12 +1474,44 @@ def _maybe_import_job(import_kind: str, path: str, limit: int, dry_run: bool, jo
 
     with session_scope() as s:
         j, row = tk.create_import_job(s, get_settings(), import_kind=import_kind,
-                                      path=path, limit=(limit or None), dry_run=dry_run)
+                                      path=path, limit=(limit or None), dry_run=dry_run,
+                                      store_raw_json=store_raw_json)
         s.commit()
         jid, sid = j.id, row.session_id
-    typer.echo(f"Created takeout_import job #{jid} (session {sid}, kind={import_kind}, dry_run={dry_run}).")
+    typer.echo(f"Created takeout_import job #{jid} (session {sid}, kind={import_kind}, "
+               f"dry_run={dry_run}, store_raw_json={store_raw_json}).")
     _dispatch(jid, now)
     return True
+
+
+def _safe_large_defaults(safe_large: bool, limit: int, apply: bool, job: bool, dry_run: bool,
+                         no_raw_json: bool) -> tuple[bool, bool, bool, bool]:
+    """Resolve --safe-large preset: job=True, dry_run unless --apply, no_raw_json=True.
+
+    Returns (job, dry_run, store_raw_json, benchmark_only). benchmark_only is True
+    when --safe-large is set without an explicit --limit (run benchmark first).
+    """
+    if not safe_large:
+        return job, dry_run, (not no_raw_json), False
+    benchmark_only = not limit
+    return True, (not apply), False, benchmark_only
+
+
+def _safe_large_or_job(import_kind: str, path: str, limit: int, dry_run: bool, job: bool, now: bool,
+                       no_raw_json: bool, safe_large: bool, apply: bool) -> bool:
+    """Handle --safe-large / --job. Returns True if the import was handled here."""
+    job2, dry2, store_raw, bench_only = _safe_large_defaults(safe_large, limit, apply, job, dry_run, no_raw_json)
+    if safe_large and bench_only:
+        from app.services import takeout as tk
+        with session_scope() as s:
+            b = tk.benchmark(s, get_settings(), path, kind=import_kind, limit=None, dry_run=True)
+        typer.echo(
+            f"[safe-large benchmark] {import_kind}: scanned={b['scanned']} eps={b['entries_per_second']} "
+            f"peak_mem={b['peak_memory_mb']}MB parser={b['parser_backend']}. "
+            f"Re-run with --safe-large --limit N (then --apply) to import as a no-raw-json job."
+        )
+        return True
+    return _maybe_import_job(import_kind, path, limit, dry2, job2, now, store_raw_json=store_raw)
 
 
 @takeout_app.command("import-watch-history")
@@ -1487,15 +1522,18 @@ def takeout_import_watch_history(
     dry_run: bool = typer.Option(False, "--dry-run"),
     job: bool = typer.Option(False, "--job", help="Run as a background job (large imports)."),
     now: bool = typer.Option(False, "--now", help="With --job: run inline instead of via RQ."),
+    no_raw_json: bool = typer.Option(False, "--no-raw-json", help="Do not persist raw activity blobs (DB size)."),
+    safe_large: bool = typer.Option(False, "--safe-large", help="Preset: job + no-raw-json + dry-run unless --apply."),
+    apply: bool = typer.Option(False, "--apply", help="With --safe-large: actually write (not dry-run)."),
 ) -> None:
     """Import watch history (incremental: dedup vs existing). Streams large JSON."""
     from app.services import takeout as tk
 
-    if _maybe_import_job("watch_history", path, limit, dry_run, job, now):
+    if _safe_large_or_job("watch_history", path, limit, dry_run, job, now, no_raw_json, safe_large, apply):
         return
     with session_scope() as s:
         try:
-            result = tk.run_import(s, get_settings(), path, limit=(limit or None), dry_run=dry_run)
+            result = tk.run_import(s, get_settings(), path, limit=(limit or None), dry_run=dry_run, store_raw_json=not no_raw_json)
         except tk.TakeoutError as exc:
             raise typer.BadParameter(str(exc))
     _echo_import_result(result, "watch_history")
@@ -1509,15 +1547,18 @@ def takeout_import_search_history(
     dry_run: bool = typer.Option(False, "--dry-run"),
     job: bool = typer.Option(False, "--job", help="Run as a background job (large imports)."),
     now: bool = typer.Option(False, "--now"),
+    no_raw_json: bool = typer.Option(False, "--no-raw-json", help="Do not persist raw activity blobs (DB size)."),
+    safe_large: bool = typer.Option(False, "--safe-large"),
+    apply: bool = typer.Option(False, "--apply"),
 ) -> None:
     """Import search history (incremental: dedup vs existing). Streams large JSON."""
     from app.services import takeout as tk
 
-    if _maybe_import_job("search_history", path, limit, dry_run, job, now):
+    if _safe_large_or_job("search_history", path, limit, dry_run, job, now, no_raw_json, safe_large, apply):
         return
     with session_scope() as s:
         try:
-            result = tk.run_import_search(s, get_settings(), path, limit=(limit or None), dry_run=dry_run)
+            result = tk.run_import_search(s, get_settings(), path, limit=(limit or None), dry_run=dry_run, store_raw_json=not no_raw_json)
         except tk.TakeoutError as exc:
             raise typer.BadParameter(str(exc))
     _echo_import_result(result, "search_history")
@@ -1600,6 +1641,70 @@ def takeout_benchmark(
         f"peak_mem={b['peak_memory_mb']}MB parser={b['parser_backend']} "
         f"dry_run={b['dry_run']} source_kind={b['source_kind']}"
     )
+
+
+@takeout_sessions_app.command("cleanup")
+def takeout_sessions_cleanup(
+    keep_last: int = typer.Option(0, "--keep-last"),
+    older_than_days: int = typer.Option(0, "--older-than-days"),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview (default) vs delete."),
+) -> None:
+    """Prune old import sessions. Deletes ONLY session rows — never jobs / imported data."""
+    from app.services import takeout as tk
+
+    if not keep_last and not older_than_days:
+        typer.echo("Nothing to do: pass --keep-last N and/or --older-than-days D (safety).")
+        return
+    with session_scope() as s:
+        res = tk.cleanup_import_sessions(s, keep_last=keep_last, older_than_days=older_than_days, dry_run=dry_run)
+        if not dry_run:
+            s.commit()
+    verb = "would delete" if dry_run else "deleted"
+    typer.echo(
+        f"sessions cleanup ({'dry-run' if dry_run else 'applied'}): total={res['total']} "
+        f"{verb}={res['matched'] if dry_run else res['deleted']} kept={res['kept']} "
+        f"jobs_preserved={res['jobs_preserved']}. Jobs and imported data are NOT deleted."
+    )
+
+
+@takeout_app.command("benchmark-large")
+def takeout_benchmark_large(
+    path: str = typer.Argument(...),
+    include_search: bool = typer.Option(False, "--include-search"),
+) -> None:
+    """Full-scan dry-run benchmark for liked + watch (+ optional search)."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        try:
+            bl = tk.benchmark_large(s, get_settings(), path, include_search=include_search)
+        except tk.TakeoutError as exc:
+            raise typer.BadParameter(str(exc))
+    typer.echo("== benchmark-large (dry-run, full scan) ==")
+    for kind, b in bl["results"].items():
+        typer.echo(
+            f"  {kind:<14} scanned={b['scanned']} eps={b['entries_per_second']} "
+            f"peak_mem={b['peak_memory_mb']}MB est_full_import={b['estimated_full_import_time_seconds']}s "
+            f"batch={b['recommended_batch_size']} parser={b['parser_backend']}"
+        )
+    typer.echo(f"  recommended_batch_size: {bl['recommended_batch_size']}")
+
+
+@storage_app.command("db-stats")
+def storage_db_stats() -> None:
+    """Show DB row counts + approximate sizes (raw_json growth)."""
+    from app.services import db_stats as dbs
+
+    with session_scope() as s:
+        st = dbs.db_stats(s)
+    typer.echo("== db stats ==")
+    typer.echo(f"  dialect: {st['dialect']}  total size: {st['total_size_mb']} MB")
+    typer.echo(f"  videos={st['videos']} liked={st['liked_videos']} watch={st['watch_history_events']} "
+               f"search={st['search_history_events']} sessions={st['takeout_import_sessions']}")
+    typer.echo(f"  raw_json stored: {st['raw_json_stored']} (total {st['raw_json_stored_total']})")
+    if st["table_sizes_bytes"]:
+        top = sorted(st["table_sizes_bytes"].items(), key=lambda kv: kv[1], reverse=True)[:5]
+        typer.echo("  largest tables: " + ", ".join(f"{n}={round(b/1024/1024,2)}MB" for n, b in top))
 
 
 @takeout_sessions_app.command("show")
@@ -1694,23 +1799,26 @@ def takeout_import_liked_videos(
     dry_run: bool = typer.Option(False, "--dry-run"),
     job: bool = typer.Option(False, "--job", help="Run as a background job (large imports)."),
     now: bool = typer.Option(False, "--now", help="With --job: run inline instead of via RQ."),
+    no_raw_json: bool = typer.Option(False, "--no-raw-json", help="Do not persist raw activity blobs (DB size)."),
+    safe_large: bool = typer.Option(False, "--safe-large", help="Preset: job + no-raw-json + dry-run unless --apply."),
+    apply: bool = typer.Option(False, "--apply", help="With --safe-large: actually write (not dry-run)."),
 ) -> None:
     """Import liked videos (Takeout 'Liked videos' playlist) into liked_videos."""
     from app.services import takeout as tk
 
-    if _maybe_import_job("liked_videos", path, limit, dry_run, job, now):
+    if _safe_large_or_job("liked_videos", path, limit, dry_run, job, now, no_raw_json, safe_large, apply):
         return
     with session_scope() as s:
         try:
             r = tk.run_import_liked_videos(
-                s, get_settings(), path, limit=(limit or None), dry_run=dry_run
+                s, get_settings(), path, limit=(limit or None), dry_run=dry_run, store_raw_json=not no_raw_json
             )
         except tk.TakeoutError as exc:
             raise typer.BadParameter(str(exc))
     typer.echo(
         f"liked_videos: imported={r['imported_count']} skipped={r['skipped_duplicate_count']} "
         f"updated={r.get('updated_count', 0)} failed={r['failed_count']} scanned={r['scanned']} "
-        f"videos_created={r['videos_created']} dry_run={r['dry_run']}"
+        f"videos_created={r['videos_created']} store_raw_json={r.get('store_raw_json', True)} dry_run={r['dry_run']}"
     )
 
 
@@ -1724,6 +1832,7 @@ def takeout_import_all(
     limit_items: int = typer.Option(0, "--limit-items"),
     limit_liked: int = typer.Option(0, "--limit-liked"),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    no_raw_json: bool = typer.Option(False, "--no-raw-json", help="Do not persist raw activity blobs (DB size)."),
 ) -> None:
     """Import watch/search history, subscriptions, playlists and liked videos in order."""
     from app.services import takeout as tk
@@ -1739,6 +1848,7 @@ def takeout_import_all(
                 limit_items=(limit_items or None),
                 limit_liked=(limit_liked or None),
                 dry_run=dry_run,
+                store_raw_json=not no_raw_json,
             )
         except tk.TakeoutError as exc:
             raise typer.BadParameter(str(exc))

@@ -25,7 +25,7 @@ import re
 import time
 import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 from urllib.parse import parse_qs, unquote, urlparse
@@ -42,6 +42,7 @@ from app.models import (
     LikedVideo,
     SearchHistoryEvent,
     Source,
+    TakeoutImportSession,
     Video,
     WatchHistoryEvent,
     utcnow,
@@ -1059,10 +1060,13 @@ def import_watch_history(
     limit: int | None = None,
     dry_run: bool = False,
     tracker: "ProgressTracker | None" = None,
+    store_raw_json: bool = True,
 ) -> dict:
     """Import watch events into ``watch_history_events`` with dedup.
 
-    ``limit`` caps the number of events scanned from the archive. Returns counts.
+    ``limit`` caps the number of events scanned. When ``store_raw_json`` is
+    False the raw activity blob is NOT persisted (normalized fields — video id /
+    title / channel / watched_at — are always kept), to limit DB growth.
     """
     existing: set[tuple] = set()
     for vid, title, wa in session.execute(
@@ -1074,7 +1078,7 @@ def import_watch_history(
     ):
         existing.add(_dedup_key(vid, title, wa))
 
-    imported = skipped = failed = scanned = 0
+    imported = skipped = failed = scanned = raw_stored = raw_skipped = 0
     seen: set[tuple] = set()
     warnings: list[str] = []
     cancelled = False
@@ -1102,9 +1106,11 @@ def import_watch_history(
                         title=ev.title,
                         channel_title=ev.channel_title,
                         watched_at=ev.watched_at,
-                        raw_json=ev.raw,
+                        raw_json=ev.raw if store_raw_json else None,
                     )
                 )
+            raw_stored += 1 if store_raw_json else 0
+            raw_skipped += 0 if store_raw_json else 1
             imported += 1
         if tracker is not None and tracker.update(
             scanned=scanned, imported=imported, skipped=skipped, updated=0,
@@ -1123,13 +1129,16 @@ def import_watch_history(
         "failed_count": failed,
         "scanned": scanned,
         "cancelled": cancelled,
+        "raw_json_stored_count": raw_stored,
+        "raw_json_skipped_count": raw_skipped,
+        "store_raw_json": store_raw_json,
         "warnings": warnings,
     }
 
 
 def import_search_history(
     session: Session, archive: TakeoutArchive, *, limit: int | None = None, dry_run: bool = False,
-    tracker: "ProgressTracker | None" = None,
+    tracker: "ProgressTracker | None" = None, store_raw_json: bool = True,
 ) -> dict:
     """Import search events into ``search_history_events`` with dedup."""
     existing: set[tuple] = set()
@@ -1140,7 +1149,7 @@ def import_search_history(
     ):
         existing.add(((q or "")[:512], sa.isoformat() if sa else ""))
 
-    imported = skipped = failed = scanned = 0
+    imported = skipped = failed = scanned = raw_stored = raw_skipped = 0
     seen: set[tuple] = set()
     cancelled = False
     for ev in archive.iter_search_events():
@@ -1161,9 +1170,11 @@ def import_search_history(
                             source="takeout",
                             query=ev.query,
                             searched_at=ev.searched_at,
-                            raw_json=ev.raw,
+                            raw_json=ev.raw if store_raw_json else None,
                         )
                     )
+                raw_stored += 1 if store_raw_json else 0
+                raw_skipped += 0 if store_raw_json else 1
                 imported += 1
         if tracker is not None and tracker.update(
             scanned=scanned, imported=imported, skipped=skipped, updated=0,
@@ -1180,6 +1191,9 @@ def import_search_history(
         "failed_count": failed,
         "scanned": scanned,
         "cancelled": cancelled,
+        "raw_json_stored_count": raw_stored,
+        "raw_json_skipped_count": raw_skipped,
+        "store_raw_json": store_raw_json,
         "warnings": [],
     }
 
@@ -1350,6 +1364,7 @@ def import_liked_videos(
     limit: int | None = None,
     dry_run: bool = False,
     tracker: "ProgressTracker | None" = None,
+    store_raw_json: bool = True,
 ) -> dict:
     """Import liked videos into ``liked_videos`` (+ Video stubs) with dedup.
 
@@ -1373,6 +1388,7 @@ def import_liked_videos(
             existing_titlekey.add(((title or "")[:200], (url or "")))
 
     imported = skipped = failed = scanned = videos_created = updated = 0
+    raw_stored = raw_skipped = 0
     seen_ids: set[str] = set()
     seen_titlekey: set[tuple] = set()
     warnings: list[str] = []
@@ -1447,9 +1463,11 @@ def import_liked_videos(
                 url=lv.url,
                 liked_at=lv.liked_at,
                 video_id=video_pk,
-                raw_json=lv.raw,
+                raw_json=lv.raw if store_raw_json else None,
             )
         )
+        raw_stored += 1 if store_raw_json else 0
+        raw_skipped += 0 if store_raw_json else 1
 
     if not dry_run:
         session.flush()
@@ -1466,6 +1484,9 @@ def import_liked_videos(
         "videos_created": videos_created,
         "source_kind": source_kind,
         "detected_path": detected_path,
+        "raw_json_stored_count": raw_stored,
+        "raw_json_skipped_count": raw_skipped,
+        "store_raw_json": store_raw_json,
         "warnings": warnings,
     }
 
@@ -1512,6 +1533,10 @@ def record_import_session(
                 "videos_created": result.get("videos_created"),
                 "detected_path_present": bool(result.get("detected_path")),
                 "warning_count": len(result.get("warnings", []) or []),
+                "store_raw_json": result.get("store_raw_json", True),
+                "raw_json_stored_count": result.get("raw_json_stored_count", 0),
+                "raw_json_skipped_count": result.get("raw_json_skipped_count", 0),
+                "duration_seconds": result.get("duration_seconds"),
             },
         )
         session.add(row)
@@ -1524,6 +1549,7 @@ def record_import_session(
 def create_running_session(
     session: Session, *, import_kind: str, path_basename: str, source_kind: str | None,
     dry_run: bool, limit: int | None, job_id: int | None = None, rq_job_id: str | None = None,
+    store_raw_json: bool = True,
 ):
     """Create a TakeoutImportSession in the 'running' state (for job imports)."""
     import uuid
@@ -1543,7 +1569,7 @@ def create_running_session(
         last_update_at=utcnow(),
         job_id=job_id,
         rq_job_id=rq_job_id,
-        meta={"limit": limit},
+        meta={"limit": limit, "store_raw_json": store_raw_json},
     )
     session.add(row)
     session.flush()
@@ -1575,6 +1601,7 @@ def run_takeout_import_job(session: Session, settings: Settings, job_id: int) ->
     path = meta.get("path") or meta.get("path_basename") or ""
     limit = meta.get("limit")
     dry_run = bool(meta.get("dry_run"))
+    store_raw_json = bool(meta.get("store_raw_json", True))
     session_id = meta.get("session_id")
 
     zip_path = resolve_takeout_path(settings, path)
@@ -1593,11 +1620,11 @@ def run_takeout_import_job(session: Session, settings: Settings, job_id: int) ->
                 session.flush()
             tracker = ProgressTracker(session, row) if row is not None else None
             if import_kind == "watch_history":
-                result = import_watch_history(session, archive, limit=limit, dry_run=dry_run, tracker=tracker)
+                result = import_watch_history(session, archive, limit=limit, dry_run=dry_run, tracker=tracker, store_raw_json=store_raw_json)
             elif import_kind == "search_history":
-                result = import_search_history(session, archive, limit=limit, dry_run=dry_run, tracker=tracker)
+                result = import_search_history(session, archive, limit=limit, dry_run=dry_run, tracker=tracker, store_raw_json=store_raw_json)
             elif import_kind == "liked_videos":
-                result = import_liked_videos(session, archive, limit=limit, dry_run=dry_run, tracker=tracker)
+                result = import_liked_videos(session, archive, limit=limit, dry_run=dry_run, tracker=tracker, store_raw_json=store_raw_json)
             else:
                 raise TakeoutError(f"unknown job import_kind: {import_kind!r}")
     except Exception as exc:  # noqa: BLE001
@@ -1630,6 +1657,13 @@ def run_takeout_import_job(session: Session, settings: Settings, job_id: int) ->
         row.current_phase = "cancelled" if cancelled else "done"
         row.status = "cancelled" if cancelled else "success"
         row.finished_at = utcnow()
+        row.meta = {
+            **(row.meta or {}),
+            "store_raw_json": store_raw_json,
+            "raw_json_stored_count": int(result.get("raw_json_stored_count", 0) or 0),
+            "raw_json_skipped_count": int(result.get("raw_json_skipped_count", 0) or 0),
+            "duration_seconds": round(dur, 2),
+        }
         session.flush()
 
     job.status = "success"
@@ -1655,6 +1689,7 @@ def run_takeout_import_job(session: Session, settings: Settings, job_id: int) ->
 def create_import_job(
     session: Session, settings: Settings, *,
     import_kind: str, path: str, limit: int | None = None, dry_run: bool = False,
+    store_raw_json: bool = True,
 ):
     """Create a queued takeout_import Job + a running import session (Phase 6D).
 
@@ -1672,7 +1707,7 @@ def create_import_job(
         source_kind = None
     row = create_running_session(
         session, import_kind=import_kind, path_basename=zip_path.name,
-        source_kind=source_kind, dry_run=dry_run, limit=limit,
+        source_kind=source_kind, dry_run=dry_run, limit=limit, store_raw_json=store_raw_json,
     )
     job = Job(
         type="takeout_import",
@@ -1684,6 +1719,7 @@ def create_import_job(
             "source_kind": source_kind,
             "limit": limit,
             "dry_run": dry_run,
+            "store_raw_json": store_raw_json,
             "session_id": row.session_id,
             "enqueued_by": "takeout_import_job",
         },
@@ -1818,6 +1854,79 @@ def benchmark(
     }
 
 
+def benchmark_large(
+    session: Session, settings: Settings, path: str, *, include_search: bool = False,
+) -> dict:
+    """Full-scan dry-run benchmark for liked + watch (+ optional search).
+
+    Returns per-kind throughput + a recommended batch size and an estimated
+    full-import time (the dry-run scan time + a write-overhead factor). Safe:
+    always dry-run; no raw_json / personal content returned.
+    """
+    kinds = ["liked_videos", "watch_history"] + (["search_history"] if include_search else [])
+    results: dict[str, dict] = {}
+    for kind in kinds:
+        b = benchmark(session, settings, path, kind=kind, limit=None, dry_run=True)
+        eps = b.get("entries_per_second") or 0
+        # full import does DB writes too -> estimate scan time * 1.6 as a rough upper bound
+        b["estimated_full_import_time_seconds"] = round(b["duration_seconds"] * 1.6, 1)
+        # ~5s of work per batch, clamped to a safe range
+        b["recommended_batch_size"] = int(min(5000, max(500, round(eps * 5)))) if eps else 1000
+        results[kind] = b
+    return {
+        "results": results,
+        "parser_backend": parser_backend(),
+        "recommended_batch_size": max((r["recommended_batch_size"] for r in results.values()), default=1000),
+        "dry_run": True,
+    }
+
+
+def cleanup_import_sessions(
+    session: Session, *, keep_last: int = 0, older_than_days: int = 0, dry_run: bool = True,
+    now: datetime | None = None,
+) -> dict:
+    """Prune old takeout_import_sessions. Deletes ONLY session rows — never jobs
+    and never imported liked/watch/search data. Running sessions are kept.
+
+    With both bounds 0, nothing is deleted (safety). A session is deletable when
+    it is OLDER than ``older_than_days`` (if > 0) AND not among the most-recent
+    ``keep_last`` (if > 0).
+    """
+    now = now or utcnow()
+    all_rows = list(session.scalars(select(TakeoutImportSession).order_by(TakeoutImportSession.id.desc())))
+    total = len(all_rows)
+    keep_ids = {r.id for r in all_rows[:keep_last]} if keep_last and keep_last > 0 else set()
+    cutoff = now - timedelta(days=older_than_days) if older_than_days and older_than_days > 0 else None
+
+    deletable = []
+    for r in all_rows:
+        if r.id in keep_ids:
+            continue
+        if r.status == "running":  # never delete an in-flight session
+            continue
+        if cutoff is not None and (r.started_at or now) >= cutoff:
+            continue
+        if not keep_last and not older_than_days:
+            continue  # no bounds -> delete nothing
+        deletable.append(r)
+
+    jobs_referenced = {r.job_id for r in deletable if r.job_id is not None}
+    if not dry_run:
+        for r in deletable:
+            session.delete(r)  # ONLY the session row
+        session.flush()
+    return {
+        "total": total,
+        "matched": len(deletable),
+        "deleted": 0 if dry_run else len(deletable),
+        "kept": total - len(deletable),
+        "jobs_preserved": len(jobs_referenced),
+        "dry_run": dry_run,
+        "keep_last": keep_last,
+        "older_than_days": older_than_days,
+    }
+
+
 def list_import_sessions(session: Session, *, import_kind: str | None = None, limit: int = 50) -> list:
     from app.models import TakeoutImportSession
 
@@ -1837,24 +1946,24 @@ def get_import_session(session: Session, session_id: str):
 
 def run_import(
     session: Session, settings: Settings, path: str, *, limit: int | None = None,
-    dry_run: bool = False, record_session: bool = True,
+    dry_run: bool = False, record_session: bool = True, store_raw_json: bool = True,
 ) -> dict:
     """Import watch history (Phase 3A)."""
     return _run_with_job(
         session, settings, path, "watch_history",
-        lambda a: import_watch_history(session, a, limit=limit, dry_run=dry_run), dry_run,
-        record_session=record_session,
+        lambda a: import_watch_history(session, a, limit=limit, dry_run=dry_run, store_raw_json=store_raw_json),
+        dry_run, record_session=record_session,
     )
 
 
 def run_import_search(
     session: Session, settings: Settings, path: str, *, limit: int | None = None,
-    dry_run: bool = False, record_session: bool = True,
+    dry_run: bool = False, record_session: bool = True, store_raw_json: bool = True,
 ) -> dict:
     return _run_with_job(
         session, settings, path, "search_history",
-        lambda a: import_search_history(session, a, limit=limit, dry_run=dry_run), dry_run,
-        record_session=record_session,
+        lambda a: import_search_history(session, a, limit=limit, dry_run=dry_run, store_raw_json=store_raw_json),
+        dry_run, record_session=record_session,
     )
 
 
@@ -1891,12 +2000,12 @@ def run_import_playlists(
 
 def run_import_liked_videos(
     session: Session, settings: Settings, path: str, *, limit: int | None = None,
-    dry_run: bool = False, record_session: bool = True,
+    dry_run: bool = False, record_session: bool = True, store_raw_json: bool = True,
 ) -> dict:
     return _run_with_job(
         session, settings, path, "liked_videos",
-        lambda a: import_liked_videos(session, a, limit=limit, dry_run=dry_run), dry_run,
-        record_session=record_session,
+        lambda a: import_liked_videos(session, a, limit=limit, dry_run=dry_run, store_raw_json=store_raw_json),
+        dry_run, record_session=record_session,
     )
 
 
@@ -1912,17 +2021,18 @@ def run_import_all(
     limit_items: int | None = None,
     limit_liked: int | None = None,
     dry_run: bool = False,
+    store_raw_json: bool = True,
 ) -> dict:
     """Run all Takeout imports in order, returning per-kind results + ONE combined session."""
     started = utcnow()
     parts = {
-        "watch_history": run_import(session, settings, path, limit=limit_watch, dry_run=dry_run, record_session=False),
-        "search_history": run_import_search(session, settings, path, limit=limit_search, dry_run=dry_run, record_session=False),
+        "watch_history": run_import(session, settings, path, limit=limit_watch, dry_run=dry_run, record_session=False, store_raw_json=store_raw_json),
+        "search_history": run_import_search(session, settings, path, limit=limit_search, dry_run=dry_run, record_session=False, store_raw_json=store_raw_json),
         "subscriptions": run_import_subscriptions(session, settings, path, limit=limit_subscriptions, dry_run=dry_run, record_session=False),
         "playlists": run_import_playlists(
             session, settings, path, limit_playlists=limit_playlists, limit_items=limit_items, dry_run=dry_run, record_session=False
         ),
-        "liked_videos": run_import_liked_videos(session, settings, path, limit=limit_liked, dry_run=dry_run, record_session=False),
+        "liked_videos": run_import_liked_videos(session, settings, path, limit=limit_liked, dry_run=dry_run, record_session=False, store_raw_json=store_raw_json),
         "dry_run": dry_run,
     }
     # one combined "all" session aggregating the per-kind counts
@@ -1932,6 +2042,9 @@ def run_import_all(
         "skipped_duplicate_count": sum(int(p.get("skipped_duplicate_count", 0) or 0) for p in parts.values() if isinstance(p, dict)),
         "updated_count": sum(int(p.get("updated_count", 0) or 0) for p in parts.values() if isinstance(p, dict)),
         "failed_count": sum(int(p.get("failed_count", 0) or 0) for p in parts.values() if isinstance(p, dict)),
+        "raw_json_stored_count": sum(int(p.get("raw_json_stored_count", 0) or 0) for p in parts.values() if isinstance(p, dict)),
+        "raw_json_skipped_count": sum(int(p.get("raw_json_skipped_count", 0) or 0) for p in parts.values() if isinstance(p, dict)),
+        "store_raw_json": store_raw_json,
     }
     zip_name = resolve_takeout_path(settings, path).name
     parts["session_id"] = record_import_session(

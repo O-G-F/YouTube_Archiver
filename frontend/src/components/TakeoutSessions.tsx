@@ -57,6 +57,8 @@ export function TakeoutSessions({ reloadKey }: { reloadKey?: number }) {
                 <th>Updated</th>
                 <th>Scanned</th>
                 <th>eps</th>
+                <th>peak MB</th>
+                <th>raw_json</th>
                 <th>Job</th>
                 <th></th>
               </tr>
@@ -73,6 +75,14 @@ export function TakeoutSessions({ reloadKey }: { reloadKey?: number }) {
                   <td className="small">{s.updated}</td>
                   <td className="small">{s.scanned}</td>
                   <td className="small">{s.entries_per_second ?? "—"}</td>
+                  <td className="small">{s.peak_memory_mb ?? "—"}</td>
+                  <td className="small">
+                    {(s as { meta?: { store_raw_json?: boolean } }).meta?.store_raw_json === false ? (
+                      <span className="badge muted">off</span>
+                    ) : (
+                      <span className="badge muted">on</span>
+                    )}
+                  </td>
                   <td className="small">{s.job_id ? <Link to={`/jobs/${s.job_id}`}>#{s.job_id}</Link> : "—"}</td>
                   <td>
                     {s.status === "running" ? (

@@ -27,9 +27,12 @@ import type {
   TakeoutDiscover,
   TakeoutFiles,
   TakeoutImportAll,
+  DbStats,
   TakeoutBenchmark,
+  TakeoutBenchmarkLarge,
   TakeoutImportProgress,
   TakeoutImportResult,
+  TakeoutSessionCleanup,
   TakeoutImportSession,
   TakeoutInspect,
   TakeoutPreview,
@@ -202,6 +205,11 @@ export const api = {
     apiGet<TakeoutImportProgress>(`/api/takeout/import-sessions/${sessionId}/progress`),
   takeoutImportCancel: (sessionId: string) =>
     apiPost<TakeoutImportProgress>(`/api/takeout/import-sessions/${sessionId}/cancel`, {}),
+  takeoutBenchmarkLarge: (body: { path: string; include_search?: boolean }) =>
+    apiPost<TakeoutBenchmarkLarge>("/api/takeout/benchmark-large", body),
+  takeoutSessionsCleanup: (body: { keep_last?: number; older_than_days?: number; dry_run?: boolean }) =>
+    apiPost<TakeoutSessionCleanup>("/api/takeout/import-sessions/cleanup", body),
+  dbStats: () => apiGet<DbStats>("/api/storage/db-stats"),
   takeoutImportLiked: (body: { path: string; limit?: number; dry_run?: boolean }) =>
     apiPost<{ imported_count: number; videos_created: number; skipped_duplicate_count: number; scanned: number; source_kind: string | null; detected_path: string | null }>(
       "/api/takeout/import-liked-videos",

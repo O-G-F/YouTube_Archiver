@@ -397,6 +397,41 @@ export interface TakeoutBenchmark {
   parser_backend: string;
   dry_run: boolean;
   source_kind: string | null;
+  estimated_full_import_time_seconds?: number | null;
+  recommended_batch_size?: number | null;
+}
+
+export interface DbStats {
+  dialect: string;
+  total_size_bytes: number | null;
+  total_size_mb: number | null;
+  table_counts: Record<string, number | null>;
+  table_sizes_bytes: Record<string, number>;
+  raw_json_stored: Record<string, number>;
+  raw_json_stored_total: number;
+  videos: number;
+  liked_videos: number;
+  watch_history_events: number;
+  search_history_events: number;
+  takeout_import_sessions: number;
+}
+
+export interface TakeoutBenchmarkLarge {
+  results: Record<string, TakeoutBenchmark>;
+  parser_backend: string;
+  recommended_batch_size: number;
+  dry_run: boolean;
+}
+
+export interface TakeoutSessionCleanup {
+  total: number;
+  matched: number;
+  deleted: number;
+  kept: number;
+  jobs_preserved: number;
+  dry_run: boolean;
+  keep_last: number;
+  older_than_days: number;
 }
 
 export interface TakeoutImportProgress {

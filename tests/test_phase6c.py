@@ -114,9 +114,10 @@ def test_incremental_dup_skip_and_session(settings):
         latest = sessions[0]
         assert latest.import_kind == "liked_videos" and latest.skipped_duplicate == 5
         assert latest.path_basename == "inc.zip"
-        # no full path / raw_json in the stored row
+        # no full path / raw_json BLOB in the stored row (count fields like
+        # raw_json_stored_count are fine; the personal blob key "raw_json" is not)
         assert "/" not in (latest.path_basename or "")
-        assert "raw_json" not in json.dumps(latest.meta or {})
+        assert '"raw_json":' not in json.dumps(latest.meta or {})
 
 
 def test_updated_count_enriches_stub(settings):
@@ -192,9 +193,9 @@ def test_import_sessions_api(client, settings):
     sid = rows[0]["session_id"]
     assert client.get(f"/api/takeout/import-sessions/{sid}").json()["session_id"] == sid
     assert client.get("/api/takeout/import-sessions/nope").status_code == 404
-    # no raw_json / absolute path leaked
+    # no raw_json BLOB / absolute path leaked (count fields are allowed)
     blob = client.get("/api/takeout/import-sessions").text
-    assert "raw_json" not in blob and "/takeout" not in blob.replace("import-sessions", "")
+    assert '"raw_json":' not in blob and "/takeout" not in blob.replace("import-sessions", "")
 
 
 def test_import_search_history_api(client, settings):

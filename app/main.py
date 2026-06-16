@@ -36,6 +36,7 @@ from app.api import (
     search_history,
     settings as settings_api,
     sources,
+    storage as storage_api,
     subscriptions,
     subtitles,
     takeout,
@@ -100,6 +101,7 @@ app.include_router(liked_videos.router)
 app.include_router(youtube_api.router)
 app.include_router(youtube_doctor.router)
 app.include_router(queue_api.router)
+app.include_router(storage_api.router)
 
 
 # --------------------------------------------------------------------------- #

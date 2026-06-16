@@ -27,10 +27,14 @@ from app.schemas import (
     TakeoutImportOut,
     TakeoutImportPlaylistsRequest,
     JobOut,
+    TakeoutBenchmarkLargeOut,
+    TakeoutBenchmarkLargeRequest,
     TakeoutBenchmarkOut,
     TakeoutBenchmarkRequest,
     TakeoutImportJobRequest,
     TakeoutImportProgressOut,
+    TakeoutSessionCleanupOut,
+    TakeoutSessionCleanupRequest,
     TakeoutImportSessionOut,
     TakeoutInspectOut,
     TakeoutImportRequest,
@@ -132,7 +136,7 @@ def takeout_import(
     settings = get_settings()
     try:
         result = takeout.run_import(
-            db, settings, req.path, limit=req.limit, dry_run=req.dry_run
+            db, settings, req.path, limit=req.limit, dry_run=req.dry_run, store_raw_json=req.store_raw_json
         )
     except takeout.TakeoutError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -147,7 +151,7 @@ def takeout_import_search_history(
     """Import search history (incremental: dedup vs existing)."""
     try:
         result = takeout.run_import_search(
-            db, get_settings(), req.path, limit=req.limit, dry_run=req.dry_run
+            db, get_settings(), req.path, limit=req.limit, dry_run=req.dry_run, store_raw_json=req.store_raw_json
         )
     except takeout.TakeoutError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -194,7 +198,7 @@ def takeout_import_liked_videos(
 ) -> LikedVideosImportOut:
     try:
         result = takeout.run_import_liked_videos(
-            db, get_settings(), req.path, limit=req.limit, dry_run=req.dry_run
+            db, get_settings(), req.path, limit=req.limit, dry_run=req.dry_run, store_raw_json=req.store_raw_json
         )
     except takeout.TakeoutError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -218,6 +222,7 @@ def takeout_import_all(
             limit_items=req.limit_items,
             limit_liked=req.limit_liked,
             dry_run=req.dry_run,
+            store_raw_json=req.store_raw_json,
         )
     except takeout.TakeoutError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -245,7 +250,7 @@ def _create_import_job(db: Session, import_kind: str, req: TakeoutImportJobReque
     try:
         job, _row = takeout.create_import_job(
             db, get_settings(), import_kind=import_kind, path=req.path,
-            limit=req.limit, dry_run=req.dry_run,
+            limit=req.limit, dry_run=req.dry_run, store_raw_json=req.store_raw_json,
         )
     except takeout.TakeoutError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -274,6 +279,31 @@ def takeout_import_watch_job(req: TakeoutImportJobRequest, db: Session = Depends
 @router.post("/import-search-history-job", response_model=JobOut, status_code=201)
 def takeout_import_search_job(req: TakeoutImportJobRequest, db: Session = Depends(get_db)) -> JobOut:
     return _create_import_job(db, "search_history", req)
+
+
+@router.post("/benchmark-large", response_model=TakeoutBenchmarkLargeOut)
+def takeout_benchmark_large(
+    req: TakeoutBenchmarkLargeRequest, db: Session = Depends(get_db)
+) -> TakeoutBenchmarkLargeOut:
+    """Full-scan dry-run benchmark for liked + watch (+ optional search). No content."""
+    try:
+        result = takeout.benchmark_large(db, get_settings(), req.path, include_search=req.include_search)
+    except takeout.TakeoutError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return TakeoutBenchmarkLargeOut(**result)
+
+
+@router.post("/import-sessions/cleanup", response_model=TakeoutSessionCleanupOut)
+def takeout_sessions_cleanup(
+    req: TakeoutSessionCleanupRequest, db: Session = Depends(get_db)
+) -> TakeoutSessionCleanupOut:
+    """Prune old import sessions. Deletes ONLY session rows — never jobs / imported data."""
+    res = takeout.cleanup_import_sessions(
+        db, keep_last=req.keep_last, older_than_days=req.older_than_days, dry_run=req.dry_run
+    )
+    if not req.dry_run:
+        db.commit()
+    return TakeoutSessionCleanupOut(**res)
 
 
 @router.get("/import-sessions/{session_id}/progress", response_model=TakeoutImportProgressOut)

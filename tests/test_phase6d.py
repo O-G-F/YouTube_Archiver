@@ -190,4 +190,4 @@ def test_session_out_exposes_6d_fields(client, settings):
     for key in ("job_id", "parser_backend", "entries_per_second", "peak_memory_mb", "current_phase"):
         assert key in r
     # no raw_json / abs-path leaked
-    assert "raw_json" not in client.get("/api/takeout/import-sessions").text
+    assert '"raw_json":' not in client.get("/api/takeout/import-sessions").text

@@ -5,6 +5,7 @@ import { useFetch } from "../lib/useFetch";
 import { fmtBytes } from "../lib/format";
 import { ErrorBox, Loading } from "../components/ui";
 import { TakeoutSessions } from "../components/TakeoutSessions";
+import { TakeoutDbStats } from "../components/TakeoutDbStats";
 import type { TakeoutBenchmark, TakeoutImportAll, TakeoutInspect, TakeoutPreview } from "../api/types";
 
 const KIND_LABEL: Record<string, string> = {
@@ -32,6 +33,7 @@ export default function Takeout() {
   const [registry, setRegistry] = useState<TakeoutInspect | null>(null);
   const [sessionsKey, setSessionsKey] = useState(0);
   const [jobMode, setJobMode] = useState(false);
+  const [noRawJson, setNoRawJson] = useState(false);
   const [bench, setBench] = useState<TakeoutBenchmark | null>(null);
 
   async function doBenchmark(kind: string) {
@@ -80,8 +82,8 @@ export default function Takeout() {
     const n = limit ? Number(limit) : undefined;
     try {
       if (jobMode) {
-        const j = await api.takeoutImportJob(kind === "watch" ? "watch-history" : "search-history", { path, limit: n, dry_run: dryRun });
-        setLikedResult(`${kind} history import queued as background job #${j.id}` + (dryRun ? " [dry-run]" : "") + ".");
+        const j = await api.takeoutImportJob(kind === "watch" ? "watch-history" : "search-history", { path, limit: n, dry_run: dryRun, store_raw_json: !noRawJson });
+        setLikedResult(`${kind} history import queued as background job #${j.id}` + (dryRun ? " [dry-run]" : "") + (noRawJson ? " [no-raw-json]" : "") + ".");
       } else {
         const r = kind === "watch"
           ? await api.takeoutImportWatch({ path, limit: n, dry_run: dryRun })
@@ -110,8 +112,8 @@ export default function Takeout() {
     const n = limit ? Number(limit) : undefined;
     try {
       if (jobMode) {
-        const j = await api.takeoutImportJob("liked-videos", { path: target, limit: n, dry_run: dryRun });
-        setLikedResult(`Liked import queued as background job #${j.id}` + (dryRun ? " [dry-run]" : "") + ".");
+        const j = await api.takeoutImportJob("liked-videos", { path: target, limit: n, dry_run: dryRun, store_raw_json: !noRawJson });
+        setLikedResult(`Liked import queued as background job #${j.id}` + (dryRun ? " [dry-run]" : "") + (noRawJson ? " [no-raw-json]" : "") + ".");
       } else {
         const r = await api.takeoutImportLiked({ path: target, limit: n });
         setLikedResult(
@@ -259,6 +261,9 @@ export default function Takeout() {
           <label className="checkbox" style={{ alignSelf: "center" }} title="Run import on the worker (large imports)">
             <input type="checkbox" checked={jobMode} onChange={(e) => setJobMode(e.target.checked)} /> background job
           </label>
+          <label className="checkbox" style={{ alignSelf: "center" }} title="Do not persist raw activity blobs (privacy / DB size)">
+            <input type="checkbox" checked={noRawJson} onChange={(e) => setNoRawJson(e.target.checked)} /> no-raw-json
+          </label>
         </div>
 
         <p className="muted small">
@@ -370,6 +375,7 @@ export default function Takeout() {
         )}
       </div>
 
+      <TakeoutDbStats path={path} onChanged={() => setSessionsKey((k) => k + 1)} />
       <TakeoutSessions reloadKey={sessionsKey} />
     </div>
   );

@@ -574,6 +574,8 @@ class TakeoutImportRequest(BaseModel):
     dry_run: bool = False
     # Phase 6C: documentary flag — imports are always incremental (dedup vs DB).
     incremental: bool = True
+    # Phase 6E: when False, the raw activity blob is NOT persisted (DB size).
+    store_raw_json: bool = True
 
 
 class TakeoutImportOut(BaseModel):
@@ -672,6 +674,7 @@ class LikedVideosImportRequest(BaseModel):
     path: str
     limit: int | None = None
     dry_run: bool = False
+    store_raw_json: bool = True
 
 
 class LikedVideosImportOut(BaseModel):
@@ -681,6 +684,9 @@ class LikedVideosImportOut(BaseModel):
     failed_count: int
     scanned: int
     videos_created: int = 0
+    raw_json_stored_count: int = 0
+    raw_json_skipped_count: int = 0
+    store_raw_json: bool = True
     source_kind: str | None = None  # takeout_my_activity | takeout_youtube | …
     detected_path: str | None = None  # the member parsed (no traversal vector)
     dry_run: bool
@@ -699,6 +705,7 @@ class TakeoutImportAllRequest(BaseModel):
     limit_items: int | None = None
     limit_liked: int | None = None
     dry_run: bool = False
+    store_raw_json: bool = True
 
 
 class TakeoutImportAllOut(BaseModel):
@@ -1137,12 +1144,61 @@ class TakeoutBenchmarkOut(BaseModel):
     parser_backend: str
     dry_run: bool
     source_kind: str | None = None
+    # Phase 6E benchmark-large extras
+    estimated_full_import_time_seconds: float | None = None
+    recommended_batch_size: int | None = None
 
 
 class TakeoutImportJobRequest(BaseModel):
     path: str
     limit: int | None = None
     dry_run: bool = False
+    store_raw_json: bool = True
+
+
+# ---- Phase 6E: db-stats / benchmark-large / session cleanup ----
+class DbStatsOut(BaseModel):
+    dialect: str
+    total_size_bytes: int | None = None
+    total_size_mb: float | None = None
+    table_counts: dict[str, int | None] = Field(default_factory=dict)
+    table_sizes_bytes: dict[str, int] = Field(default_factory=dict)
+    raw_json_stored: dict[str, int] = Field(default_factory=dict)
+    raw_json_stored_total: int = 0
+    videos: int = 0
+    liked_videos: int = 0
+    watch_history_events: int = 0
+    search_history_events: int = 0
+    takeout_import_sessions: int = 0
+
+
+class TakeoutBenchmarkLargeRequest(BaseModel):
+    path: str
+    include_search: bool = False
+
+
+class TakeoutBenchmarkLargeOut(BaseModel):
+    results: dict[str, TakeoutBenchmarkOut] = Field(default_factory=dict)
+    parser_backend: str
+    recommended_batch_size: int
+    dry_run: bool
+
+
+class TakeoutSessionCleanupRequest(BaseModel):
+    keep_last: int = 0
+    older_than_days: int = 0
+    dry_run: bool = True
+
+
+class TakeoutSessionCleanupOut(BaseModel):
+    total: int
+    matched: int
+    deleted: int
+    kept: int
+    jobs_preserved: int
+    dry_run: bool
+    keep_last: int
+    older_than_days: int
 
 
 class TakeoutImportProgressOut(BaseModel):

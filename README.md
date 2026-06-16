@@ -1236,6 +1236,77 @@ archiver takeout sessions cancel SESSION_ID        # POST /api/takeout/import-se
 
 - benchmark / job / progress は**件数・集計・eps/peak_mem のみ**で raw_json/secret/絶対パスを返さない。job.meta は basename 中心。dry-run（既定）は **DB 非書き込み**。大容量は dry-run/limit/job を安全既定に。`metadata_only` 本体非保存・body DL 明示を維持。
 
+### 実 11k/90k 本番規模 import + no-raw-json + DB stats + retention（Phase 6E）
+
+11k liked / 90k watch クラスの本番 import を **DB を肥大化させず安全に** 回すための運用機能群。
+
+#### no-raw-json import モード（DB サイズ削減）
+
+```bash
+# CLI: 各 import に --no-raw-json（raw 活動 blob を保存しない）
+archiver takeout import-liked-videos  PATH --no-raw-json [--job --limit N]
+archiver takeout import-watch-history PATH --no-raw-json
+archiver takeout import-search-history PATH --no-raw-json
+archiver takeout import-all PATH --no-raw-json
+# API: import / import-*-job リクエストに "store_raw_json": false
+```
+
+- **正規化フィールド（video_id / title / channel / timestamp / query）は常に保持**します。落とすのは `raw_json` 活動 blob のみ。
+- 既定は後方互換のため `store_raw_json=true`（UI は OFF を推奨表示）。
+- session.meta / job.meta に `store_raw_json` / `raw_json_stored_count` / `raw_json_skipped_count` を記録。
+- 11k/90k 規模では raw_json が DB 肥大化の主因なので、**本番では `--no-raw-json` 推奨**。
+
+#### DB stats（DB サイズ / raw_json 増加の可視化）
+
+```bash
+archiver storage db-stats        # GET /api/storage/db-stats
+```
+
+- table 件数・概算サイズ（PostgreSQL `pg_total_relation_size` / SQLite `PRAGMA page_count×page_size`）、`raw_json_stored`（**JSON-null literal は除外して実 blob のみ計上**）、videos / liked / watch / search / session 件数。
+- raw_json / 本文は一切読まず**集計のみ**返却。
+
+#### benchmark-large（liked+watch 一括フルスキャン dry-run）
+
+```bash
+archiver takeout benchmark-large PATH [--include-search]
+# POST /api/takeout/benchmark-large {"path","include_search"}
+```
+
+- liked + watch（任意で search）を **dry-run フルスキャン**し、kind 別に scanned / eps / peak_memory_mb / parser_backend / `estimated_full_import_time_seconds` / `recommended_batch_size` を返却（**DB 非書き込み・raw_json/本文非返却**）。
+
+#### import session の retention / cleanup（session 行のみ削除）
+
+```bash
+archiver takeout sessions cleanup --keep-last N [--older-than-days D] --dry-run   # 既定 dry-run（プレビュー）
+archiver takeout sessions cleanup --keep-last N --apply                            # 実削除
+# POST /api/takeout/import-sessions/cleanup {"keep_last","older_than_days","dry_run"}
+```
+
+- **削除対象は `takeout_import_sessions` 行のみ**。**job も、import 済み liked/watch/search データも絶対に削除しません**（結果に `jobs_preserved` を明示）。
+- **bounds 未指定（keep_last/older_than_days とも 0）では何も削除しない**安全設計。**実行中（running）session は削除対象外**。dry-run 既定。
+- config: `TAKEOUT_IMPORT_SESSION_RETENTION_DAYS` / `TAKEOUT_IMPORT_SESSION_KEEP_LAST`（既定 0 = 無効）。
+
+#### --safe-large プリセット（最も安全な既定で大容量 import）
+
+```bash
+archiver takeout import-watch-history PATH --safe-large            # benchmark のみ実行（--limit 無し）
+archiver takeout import-watch-history PATH --safe-large --limit 1000 --apply   # job + no-raw-json + 実書き込み
+archiver takeout import-liked-videos  PATH --safe-large --limit 100  --apply
+```
+
+- `--safe-large` は **job=ON / no-raw-json=ON / dry-run（`--apply` 無しの間）** を既定化。`--limit` 無しなら **benchmark のみ**走り、eps/peak_mem を表示して「`--limit N`（＋`--apply`）で再実行」を案内。UI には "Safe large import" ボタン + 確認ダイアログ。
+
+#### 実 11k/90k 本番手順
+
+1. `storage db-stats` で現状の DB サイズを確認 → 2. `benchmark-large PATH` で liked+watch の eps / peak_mem / 推定フル import 時間を把握 → 3. `import-watch-history PATH --safe-large --limit 1000 --apply`（no-raw-json job）で小さく検証 → 4. progress を `sessions progress` / UI で監視 → 5. 問題なければ limit を上げて本 import → 6. 完了後 `storage db-stats` で増加量を確認、古い session を `sessions cleanup --keep-last N --apply` で剪定。**Docker のディスク空き容量に注意**。
+
+### セキュリティ / プライバシー（6E）
+
+- db-stats / benchmark-large は**集計・件数・サイズのみ**で raw_json / 本文 / secret / 絶対パスを返さない。
+- no-raw-json は raw 活動 blob を落とすが**正規化フィールドは保持**。`raw_json_stored` は JSON-null literal を除外し実 blob 数のみ計上。
+- cleanup は **session 行のみ削除**（job / import 済みデータは不可侵）。bounds 未指定で no-op、running は保護、dry-run 既定。
+- Takeout ZIP は Git 非管理。`metadata_only` 本体非保存・body DL 明示・`--remote-components ejs:github` + deno・ZIP path traversal 対策を維持。
+
 ---
 
 ## ストレージ構成
@@ -1329,6 +1400,14 @@ archiver takeout import-watch-history PATH --limit N --job
 archiver takeout import-search-history PATH --limit N --job
 archiver takeout sessions progress SESSION_ID
 archiver takeout sessions cancel SESSION_ID
+# --- Phase 6E: no-raw-json / db-stats / benchmark-large / retention / safe-large ---
+archiver storage db-stats                              # DB 件数 + 概算サイズ + raw_json 実 blob 数
+archiver takeout benchmark-large PATH [--include-search]   # liked+watch 一括 dry-run benchmark
+archiver takeout import-liked-videos PATH --no-raw-json [--job --limit N]   # raw blob 非保存
+archiver takeout import-watch-history PATH --safe-large [--limit N] [--apply]   # job+no-raw-json+dry-run 既定
+archiver takeout import-all PATH --no-raw-json
+archiver takeout sessions cleanup --keep-last N [--older-than-days D] --dry-run   # session 行のみ剪定（job/data は不可侵）
+archiver takeout sessions cleanup --keep-last N --apply
 archiver search-history list [--limit N] / stats
 archiver subscriptions list
 archiver subscriptions enqueue --videos --shorts --streams --profile metadata_only --max-items 3 [--limit N] [--now]
@@ -1406,6 +1485,11 @@ archiver live-chat stats VIDEO_ID
 | POST | `/api/takeout/import-search-history-job` | search import を background job 化【Phase 6D】 |
 | GET | `/api/takeout/import-sessions/{session_id}/progress` | 実行中 import の進捗（status/phase/件数/eps）【Phase 6D】 |
 | POST | `/api/takeout/import-sessions/{session_id}/cancel` | 実行中 import の cancel 要求（checkpoint で停止）【Phase 6D】 |
+| GET | `/api/storage/db-stats` | DB 件数 + 概算サイズ + raw_json 実 blob 数（集計のみ・本文非返却）【Phase 6E】 |
+| POST | `/api/takeout/benchmark-large` | liked+watch（任意 search）一括 dry-run benchmark（eps/peak/推定時間/推奨 batch）【Phase 6E】 |
+| POST | `/api/takeout/import-sessions/cleanup` | 古い import session 行のみ剪定（`{keep_last,older_than_days,dry_run}`。**job/import 済みデータは削除しない**・bounds 未指定で no-op・running 保護）【Phase 6E】 |
+
+import 系（`/api/takeout/import`・`import-watch-history`・`import-search-history`・`import-liked-videos`・`import-all` と各 `-job`）は **`store_raw_json: false`**（既定 true）で raw 活動 blob を保存せず正規化フィールドのみ取り込み【Phase 6E】。
 | POST | `/api/library/bootstrap` | Hybrid 初回構築（YouTube + My Activity + 任意 API）【Phase 6B】 |
 | GET | `/api/youtube-api/status` | OAuth 状態（secret/token・パス非表示）【Phase 6B】 |
 | POST | `/api/youtube-api/sync-liked` | API 差分同期（未設定でも 200 + `ok=false` + classification）【Phase 6B】 |
@@ -1565,6 +1649,7 @@ live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_e
   - Phase 7F は**マイグレーション追加なし**（retention は `scheduler_runs` の delete のみ・ジョブ非削除。日次集計テーブルは将来拡張）
   - `b2c3d4e5f6a7` `takeout_import_sessions` テーブル新規（Phase 6C・import 履歴。basename + 集計件数のみ保存。整数列 `server_default '0'` で PostgreSQL/SQLite 両対応）
   - `c3d4e5f6a7b8` `takeout_import_sessions` に `job_id`/`rq_job_id`/`parser_backend`/`entries_per_second`/`peak_memory_mb`/`cancel_requested`/`current_phase`/`last_update_at` を追加（Phase 6D・job 化/benchmark/progress。bool は `server_default false`）
+  - **Phase 6E は migration 追加なし**（no-raw-json は既存 `raw_json` 列を NULL/省略するだけ、db-stats / benchmark-large / cleanup は読み取り・行削除のみ。head は `c3d4e5f6a7b8` のまま）。
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
 - 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 
