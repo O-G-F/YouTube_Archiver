@@ -167,6 +167,8 @@ class JobClassification(BaseModel):
     rate_limited: bool = False  # HTTP 429 seen
     partial: bool = False  # finished with usable output despite non-zero exit
     retryable: bool = False
+    permanent: bool = False  # Phase 7H: private/deleted/unavailable — cannot archive
+    primary_reason: str | None = None  # single best label (incl. "unknown" on plain failure)
     reasons: list[str] = Field(default_factory=list)  # machine keys (rate_limited, incomplete_data, …)
     warnings: list[str] = Field(default_factory=list)  # human-readable notes
     summary: str | None = None  # short headline for the UI
@@ -374,8 +376,19 @@ class LikedChannelCount(BaseModel):
 
 class LikedProgressOut(BaseModel):
     total_liked: int
+    # metadata_fetched is BROAD (>=1 metadata media). Phase 7L adds the rigorous
+    # split so callers/UI can use info_json_complete_count for full decisions.
     metadata_fetched: int
+    metadata_any_count: int = 0
+    info_json_complete_count: int = 0
+    description_only_count: int = 0
+    retryable_partial_count: int = 0
     metadata_missing: int
+    # Phase 7J: missing minus permanent (private/deleted/unavailable). permanent
+    # rows are kept (never deleted), just excluded from metadata selection.
+    eligible_metadata_missing: int = 0
+    skipped_permanent_metadata: int = 0
+    permanent_unique_videos: int = 0
     body_saved: int
     body_missing: int
     active_archive_jobs: int
@@ -388,6 +401,20 @@ class LikedProgressOut(BaseModel):
     latest_liked_at: str | None = None
     last_archive_job_at: str | None = None
     last_successful_archive_at: str | None = None
+
+
+class LikedFailureBreakdownOut(BaseModel):
+    """Phase 7H/7J: failed/partial liked-archive jobs grouped by reason —
+    per-job attempts AND distinct videos (latest reason)."""
+
+    total_failed: int = 0
+    total_partial: int = 0
+    retryable: int = 0
+    permanent: int = 0  # private/deleted/unavailable attempts — not retried, recorded
+    permanent_unique_videos: int = 0
+    by_reason: dict[str, int] = Field(default_factory=dict)  # = attempts (backward-compat)
+    attempts_by_reason: dict[str, int] = Field(default_factory=dict)
+    unique_videos_by_reason: dict[str, int] = Field(default_factory=dict)
 
 
 class QueueStatusOut(BaseModel):
@@ -757,6 +784,9 @@ class LikedArchiveRequest(BaseModel):
     profile: str | None = None
     limit: int | None = None
     dry_run: bool = False
+    # Phase 7J: include permanent failures (private/deleted/unavailable) in
+    # metadata selection. Default False (they are skipped, kept in DB).
+    include_permanent: bool = False
 
 
 class LikedArchivePlanOut(BaseModel):
@@ -1365,3 +1395,167 @@ class YouTubeApiSyncOut(BaseModel):
     ok: bool = True
     classification: str | None = None
     message: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6F: build identity / preflight / verify / cleanup status
+# --------------------------------------------------------------------------- #
+class BuildInfoOut(BaseModel):
+    app_version: str
+    build_id: str
+    git_commit: str | None = None
+    build_time: str | None = None
+    schema_head: str | None = None
+    supported_job_types: list[str] = Field(default_factory=list)
+
+
+class WorkerInfoOut(BaseModel):
+    worker_id: str | None = None
+    build_id: str | None = None
+    app_version: str | None = None
+    age_seconds: float | None = None
+    stale: bool | None = None
+    takeout_import: bool = False
+
+
+class PreflightCheckOut(BaseModel):
+    name: str
+    status: str  # ok | warn | fail
+    detail: str
+
+
+class PreflightOut(BaseModel):
+    ok: bool
+    checks: list[PreflightCheckOut] = Field(default_factory=list)
+    build_info: BuildInfoOut
+    workers: list[WorkerInfoOut] = Field(default_factory=list)
+
+
+class FullHealthOut(BaseModel):
+    status: str  # ok | degraded
+    ok: bool
+    database: bool
+    redis: bool
+    build_info: BuildInfoOut
+    workers: list[WorkerInfoOut] = Field(default_factory=list)
+    worker_build_match: bool
+    schema_head_match: bool | None = None  # None = could not determine (dev DB)
+
+
+class SecretsStatusOut(BaseModel):
+    """Phase 7I: cookie / PO-token configuration STATUS — booleans/masked only.
+    NEVER includes secret values or absolute paths."""
+
+    cookies_configured: bool = False  # a usable cookie source exists (file or browser)
+    cookies_file_configured: bool = False  # COOKIES_FILE is set
+    cookies_file_readable: bool = False
+    cookies_from_browser_configured: bool = False
+    po_token_configured: bool = False
+    visitor_data_configured: bool = False
+    cookies_last_modified: str | None = None  # timestamp only, no path
+    secret_value_exposed: bool = False  # always false — assertion for the UI
+
+
+class TakeoutPreflightLargeRequest(BaseModel):
+    path: str
+    kind: str = "all"  # liked_videos | watch_history | all
+    sample_limit: int = 5000
+
+
+class TakeoutPreflightLargeOut(BaseModel):
+    ok: bool
+    path_basename: str | None = None
+    parser_backend: str | None = None
+    checks: list[PreflightCheckOut] = Field(default_factory=list)
+    results: dict[str, dict] = Field(default_factory=dict)
+    recommended_command: str | None = None
+
+
+class TakeoutImportLargeRequest(BaseModel):
+    path: str
+    kind: str = "all"
+    limit: int | None = None
+    apply: bool = False
+    store_raw_json: bool = False
+    as_job: bool = True
+    skip_preflight: bool = False
+
+
+class TakeoutImportLargeOut(BaseModel):
+    ok: bool
+    kind: str
+    dry_run: bool
+    store_raw_json: bool
+    as_job: bool
+    preflight_ok: bool | None = None
+    items: list[dict] = Field(default_factory=list)
+    recommended_progress_command: str | None = None
+    recommended_db_stats_command: str | None = None
+    message: str | None = None
+
+
+class TakeoutVerifyImportOut(BaseModel):
+    ok: bool
+    session_id: str | None = None
+    import_kind: str | None = None
+    status: str | None = None
+    scanned: int = 0
+    imported: int = 0
+    skipped_duplicate: int = 0
+    updated: int = 0
+    failed: int = 0
+    parser_backend: str | None = None
+    entries_per_second: float | None = None
+    peak_memory_mb: float | None = None
+    store_raw_json: bool | None = None
+    raw_json_stored_count: int | None = None
+    raw_json_skipped_count: int | None = None
+    job_id: int | None = None
+    job_status: str | None = None
+    worker_error: str | None = None
+    db_stats: dict = Field(default_factory=dict)
+    raw_json_real_blobs: dict = Field(default_factory=dict)
+    leak_check_ok: bool = True
+    leak_findings: list[str] = Field(default_factory=list)
+    checks: list[PreflightCheckOut] = Field(default_factory=list)
+
+
+class TakeoutCleanupStatusOut(BaseModel):
+    enabled: bool
+    interval_hours: int
+    keep_last: int
+    retention_days: int
+    last_run_at: str | None = None
+    last_result: dict | None = None
+    next_due_at: str | None = None
+
+
+# ---- Phase 6G: operation report ----
+class TakeoutImportReportOut(BaseModel):
+    ok: bool
+    session_id: str | None = None
+    import_kind: str | None = None
+    status: str | None = None
+    path_basename: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    scanned: int = 0
+    imported: int = 0
+    skipped_duplicate: int = 0
+    updated: int = 0
+    failed: int = 0
+    parser_backend: str | None = None
+    entries_per_second: float | None = None
+    peak_memory_mb: float | None = None
+    store_raw_json: bool | None = None
+    raw_json_stored_count: int | None = None
+    raw_json_skipped_count: int | None = None
+    job_id: int | None = None
+    job_status: str | None = None
+    worker_error: str | None = None
+    db_stats: dict = Field(default_factory=dict)
+    raw_json_real_blobs: dict = Field(default_factory=dict)
+    leak_check_ok: bool = True
+    leak_findings: list[str] = Field(default_factory=list)
+    recommended_next_action: str | None = None
+    checks: list[PreflightCheckOut] = Field(default_factory=list)

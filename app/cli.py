@@ -21,6 +21,9 @@ Examples:
 
 from __future__ import annotations
 
+import sys
+import time
+
 import typer
 from sqlalchemy import select
 
@@ -57,6 +60,7 @@ doctor_app = typer.Typer(help="Environment diagnostics (general + YouTube fetch 
 youtube_diag_app = typer.Typer(help="YouTube fetch-stability diagnostics (benchmark).")
 queue_app = typer.Typer(help="Job queue health (Phase 7D).")
 storage_app = typer.Typer(help="Storage / database stats (Phase 6E).")
+system_app = typer.Typer(help="Build identity / preflight checks (Phase 6F).")
 app.add_typer(source_app, name="source")
 app.add_typer(download_app, name="download")
 app.add_typer(jobs_app, name="jobs")
@@ -79,6 +83,7 @@ app.add_typer(doctor_app, name="doctor")
 app.add_typer(youtube_diag_app, name="youtube-diagnostics")
 app.add_typer(queue_app, name="queue")
 app.add_typer(storage_app, name="storage")
+app.add_typer(system_app, name="system")
 
 
 # --------------------------------------------------------------------------- #
@@ -108,14 +113,41 @@ def server(
 @app.command()
 def worker() -> None:
     """Start an RQ worker that consumes download/refresh jobs."""
+    import threading
+
+    from redis import Redis
     from rq import Worker
 
+    from app.services import build_info
     from app.worker.queue import get_redis
 
     settings = get_settings()
     settings.ensure_dirs()
     conn = get_redis()
-    typer.echo(f"Starting RQ worker on queue {settings.rq_queue!r} ...")
+
+    # Publish a short-TTL heartbeat (carrying this worker's build_id) so
+    # `system preflight` can detect a STALE worker — one running older code than
+    # web — before a large import. A dead worker's key expires automatically.
+    #
+    # IMPORTANT: the heartbeat uses its OWN Redis connection — never the one RQ's
+    # blocking worker loop holds. Sharing a single client across the heartbeat
+    # thread and RQ's listener corrupts RQ's connection ("Redis connection
+    # timeout, quitting") and stops job processing.
+    def _heartbeat_loop() -> None:
+        hb_conn = Redis.from_url(settings.redis_url)
+        while True:
+            try:
+                build_info.write_worker_heartbeat(hb_conn)
+            except Exception:  # noqa: BLE001 - never let heartbeat kill the worker
+                pass
+            time.sleep(build_info.WORKER_HEARTBEAT_REFRESH_SECONDS)
+
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+
+    typer.echo(
+        f"Starting RQ worker on queue {settings.rq_queue!r} "
+        f"(build_id={build_info.build_id()}) ..."
+    )
     Worker([settings.rq_queue], connection=conn).work(with_scheduler=False)
 
 
@@ -1667,6 +1699,63 @@ def takeout_sessions_cleanup(
     )
 
 
+@takeout_sessions_app.command("cleanup-auto")
+def takeout_sessions_cleanup_auto(
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview (default) vs run now."),
+) -> None:
+    """Run the configured auto session-cleanup now (uses retention/keep_last config).
+
+    Deletes ONLY session rows — never jobs / imported data. ``--apply`` forces a
+    run regardless of the enabled flag and interval."""
+    from app.services import takeout as tk
+
+    s_settings = get_settings()
+    keep_last = s_settings.takeout_import_session_keep_last
+    retention = s_settings.takeout_import_session_retention_days
+    if dry_run:
+        with session_scope() as s:
+            res = tk.cleanup_import_sessions(
+                s, keep_last=keep_last, older_than_days=retention, dry_run=True
+            )
+        typer.echo(
+            f"cleanup-auto (dry-run): enabled={s_settings.takeout_import_session_cleanup_enabled} "
+            f"keep_last={keep_last} retention_days={retention} -> would delete={res['matched']} "
+            f"of {res['total']} (jobs_preserved={res['jobs_preserved']}). Jobs/data NOT deleted."
+        )
+        return
+    with session_scope() as s:
+        res = tk.auto_cleanup_import_sessions(s, s_settings, force=True)
+        s.commit()
+    if res.get("ran"):
+        r = res["result"]
+        typer.echo(
+            f"cleanup-auto (applied): deleted={r['deleted']} kept={r['kept']} "
+            f"jobs_preserved={r['jobs_preserved']}. Jobs and imported data are NOT deleted."
+        )
+    else:
+        typer.echo(f"cleanup-auto: did not run ({res.get('reason')}).")
+
+
+@takeout_sessions_app.command("cleanup-status")
+def takeout_sessions_cleanup_status() -> None:
+    """Show auto session-cleanup config + last run result."""
+    from app.services import takeout as tk
+
+    st = tk.cleanup_status(get_settings())
+    typer.echo("== takeout session cleanup status ==")
+    typer.echo(
+        f"  enabled={st['enabled']} interval_hours={st['interval_hours']} "
+        f"keep_last={st['keep_last']} retention_days={st['retention_days']}"
+    )
+    typer.echo(f"  last_run_at={st['last_run_at'] or '-'}  next_due_at={st['next_due_at'] or '-'}")
+    if st["last_result"]:
+        r = st["last_result"]
+        typer.echo(
+            f"  last_result: deleted={r.get('deleted')} kept={r.get('kept')} "
+            f"jobs_preserved={r.get('jobs_preserved')}"
+        )
+
+
 @takeout_app.command("benchmark-large")
 def takeout_benchmark_large(
     path: str = typer.Argument(...),
@@ -1690,6 +1779,212 @@ def takeout_benchmark_large(
     typer.echo(f"  recommended_batch_size: {bl['recommended_batch_size']}")
 
 
+@takeout_app.command("preflight-large")
+def takeout_preflight_large(
+    path: str = typer.Argument(...),
+    kind: str = typer.Option("all", "--kind", help="liked_videos|watch_history|search_history|all"),
+    sample_limit: int = typer.Option(5000, "--sample-limit"),
+) -> None:
+    """Go/no-go preflight for a large import (ZIP/parser/sample bench/DB counts)."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        pl = tk.preflight_large(s, get_settings(), path, kind=kind, sample_limit=sample_limit)
+    icon = {"ok": "OK  ", "warn": "WARN", "fail": "FAIL"}
+    typer.echo(f"== preflight-large ==  zip={pl['path_basename']} parser={pl['parser_backend']}")
+    for c in pl["checks"]:
+        typer.echo(f"  [{icon.get(c['status'], '?')}] {c['name']}: {c['detail']}")
+    for k, r in pl["results"].items():
+        typer.echo(
+            f"  {k:<14} sample_scanned={r['sample_scanned']} eps={r['entries_per_second']} "
+            f"peak={r['peak_memory_mb']}MB current_db_rows={r['current_db_count']}"
+        )
+    if pl["recommended_command"]:
+        typer.echo(f"  next: {pl['recommended_command']}")
+    typer.echo(f"  => {'PASS' if pl['ok'] else 'FAIL'}")
+    if not pl["ok"]:
+        raise typer.Exit(code=1)
+
+
+@takeout_app.command("import-large")
+def takeout_import_large(
+    path: str = typer.Argument(...),
+    kind: str = typer.Option("all", "--kind", help="liked_videos|watch_history|search_history|all"),
+    limit: int = typer.Option(0, "--limit", help="Max entries per kind (0 = all)."),
+    apply: bool = typer.Option(False, "--apply", help="Actually import (default dry-run)."),
+    raw_json: bool = typer.Option(False, "--raw-json", help="Persist raw blobs (default OFF / no-raw-json)."),
+    job: bool = typer.Option(True, "--job/--no-job", help="Run as background job (default on)."),
+    skip_preflight: bool = typer.Option(False, "--skip-preflight", help="NOT recommended: bypass preflight."),
+) -> None:
+    """Safe production import runner. Defaults: dry-run + no-raw-json + job, with
+    an automatic preflight (an --apply job is blocked if a stale worker is found)."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        try:
+            res = tk.import_large(
+                s, get_settings(), path, kind=kind, limit=(limit or None), apply=apply,
+                store_raw_json=raw_json, as_job=job, skip_preflight=skip_preflight,
+            )
+        except tk.TakeoutError as exc:
+            raise typer.BadParameter(str(exc))
+    typer.echo(
+        f"== import-large == kind={res['kind']} dry_run={res['dry_run']} "
+        f"store_raw_json={res['store_raw_json']} as_job={res['as_job']} preflight_ok={res['preflight_ok']}"
+    )
+    if not res["ok"]:
+        typer.echo(f"  BLOCKED: {res['message']}")
+        raise typer.Exit(code=1)
+    for it in res["items"]:
+        typer.echo(
+            f"  {it['kind']:<14} session={it.get('session_id')} job={it.get('job_id')} "
+            f"dry_run={it['dry_run']} rq_submitted={it.get('rq_submitted')}"
+            + (f" would_import={it.get('would_import')}" if it["dry_run"] else "")
+        )
+    typer.echo(f"  {res['message']}")
+    if res["recommended_progress_command"]:
+        typer.echo(f"  progress: {res['recommended_progress_command']}")
+        typer.echo(f"  db-stats: {res['recommended_db_stats_command']}")
+
+
+@takeout_app.command("verify-import")
+def takeout_verify_import(
+    session_id: str = typer.Argument(None),
+    latest: bool = typer.Option(False, "--latest", help="Verify the most recent session."),
+    kind: str = typer.Option(None, "--kind", help="With --latest: filter by import kind."),
+) -> None:
+    """Post-import inspection: outcome + DB stats + raw_json blobs + leak grep."""
+    from app.services import takeout as tk
+
+    if not session_id and not latest:
+        raise typer.BadParameter("pass a SESSION_ID or --latest")
+    with session_scope() as s:
+        v = tk.verify_import(s, get_settings(), session_id=session_id, latest=latest, kind=kind)
+    if not v.get("session_id"):
+        typer.echo("import session not found")
+        raise typer.Exit(code=1)
+    icon = {"ok": "OK  ", "warn": "WARN", "fail": "FAIL"}
+    typer.echo(f"== verify-import == session={v['session_id']} kind={v['import_kind']} status={v['status']}")
+    typer.echo(
+        f"  scanned={v['scanned']} imported={v['imported']} skipped={v['skipped_duplicate']} "
+        f"updated={v['updated']} failed={v['failed']} eps={v['entries_per_second']} peak={v['peak_memory_mb']}MB"
+    )
+    typer.echo(
+        f"  store_raw_json={v['store_raw_json']} raw_stored={v['raw_json_stored_count']} "
+        f"raw_skipped={v['raw_json_skipped_count']} job=#{v['job_id']} job_status={v['job_status']}"
+    )
+    ds = v["db_stats"]
+    typer.echo(
+        f"  db: {ds.get('total_size_mb')}MB videos={ds.get('videos')} liked={ds.get('liked_videos')} "
+        f"watch={ds.get('watch_history_events')} raw_json_real_blobs_total={ds.get('raw_json_stored_total')}"
+    )
+    for c in v["checks"]:
+        typer.echo(f"  [{icon.get(c['status'], '?')}] {c['name']}: {c['detail']}")
+    if v["worker_error"]:
+        typer.echo(f"  worker_error: {v['worker_error']}")
+    typer.echo(f"  => {'OK' if v['ok'] else 'ATTENTION'}")
+    if not v["ok"]:
+        raise typer.Exit(code=1)
+
+
+@takeout_app.command("import-staged")
+def takeout_import_staged(
+    path: str = typer.Argument(...),
+    kind: str = typer.Option("all", "--kind", help="liked_videos|watch_history|search_history|all"),
+    apply: bool = typer.Option(False, "--apply", help="Execute stages (default = dry-run plan)."),
+    raw_json: bool = typer.Option(False, "--raw-json", help="Persist raw blobs (default OFF / no-raw-json)."),
+    job: bool = typer.Option(True, "--job/--no-job", help="Run each stage as a background job (default on)."),
+    allow_full: bool = typer.Option(False, "--allow-full", help="Permit the FINAL full-import stage."),
+    max_stage: int = typer.Option(0, "--max-stage", help="Stop after N stages (0 = all)."),
+    skip_preflight: bool = typer.Option(False, "--skip-preflight", help="NOT recommended: bypass preflight."),
+) -> None:
+    """Staged production import: 100→1000→5000→full (liked) / 1000→10000→50000→full
+    (watch), with verify + db-stats between stages. Safe defaults: dry-run +
+    no-raw-json + job + preflight. Full stage requires --allow-full."""
+    from app.services import takeout as tk
+
+    res = tk.import_staged(
+        get_settings(), path, kind=kind, apply=apply, store_raw_json=raw_json, as_job=job,
+        skip_preflight=skip_preflight, allow_full=allow_full,
+        max_stage=(max_stage or None),
+    )
+    typer.echo(
+        f"== import-staged == kind={res['kind']} dry_run={res['dry_run']} "
+        f"store_raw_json={res['store_raw_json']} as_job={res['as_job']} preflight_ok={res['preflight_ok']}"
+    )
+    for k, plan in res.get("plan", {}).items():
+        typer.echo(f"  plan[{k}]: {plan}")
+    if res.get("prior_sessions"):
+        typer.echo(f"  prior sessions for this file/kind: {len(res['prior_sessions'])} "
+                   f"(rerun is dedup-safe — duplicates are skipped, nothing is deleted)")
+    if not res["ok"]:
+        typer.echo(f"  BLOCKED/STOPPED: {res['message']}")
+        raise typer.Exit(code=1)
+    for st in res["stages"]:
+        if st.get("stage") == "benchmark":
+            typer.echo(f"  [bench {st['kind']:<14}] scanned={st['scanned']} would_import={st['would_import']} "
+                       f"eps={st['eps']} peak={st['peak_memory_mb']}MB")
+        elif st.get("status") == "skipped_needs_allow_full":
+            typer.echo(f"  [stage {st['stage']} {st['kind']:<14}] limit=full SKIPPED (pass --allow-full)")
+        else:
+            typer.echo(
+                f"  [stage {st['stage']} {st['kind']:<14}] limit={st['limit']} imported={st.get('imported')} "
+                f"skipped={st.get('skipped')} raw_skipped={st.get('raw_json_skipped')} "
+                f"db {st.get('db_size_mb_before')}->{st.get('db_size_mb_after')}MB "
+                f"verify_ok={st.get('verify_ok')} status={st['status']}"
+            )
+    typer.echo(f"  {res['message']}")
+    if res.get("recommended_next"):
+        typer.echo(f"  next: {res['recommended_next']}")
+
+
+@takeout_app.command("import-report")
+def takeout_import_report(
+    session_id: str = typer.Argument(None),
+    latest: bool = typer.Option(False, "--latest", help="Report on the most recent session."),
+    kind: str = typer.Option(None, "--kind", help="Filter by import kind."),
+    recent: int = typer.Option(0, "--recent", help="List the N most recent reports."),
+) -> None:
+    """Operation report: import result + job + verify + db-stats + leak check +
+    recommended next action. No raw_json / history body / secrets / host paths."""
+    from app.services import takeout as tk
+
+    with session_scope() as s:
+        if recent:
+            rl = tk.import_report(s, get_settings(), kind=kind, recent=recent)
+            typer.echo(f"== import-report (recent {rl['count']}) ==")
+            for r in rl["reports"]:
+                typer.echo(
+                    f"  {r['session_id']} {r['import_kind']:<14} status={r['status']} "
+                    f"imported={r['imported']} raw_json={r['store_raw_json']} "
+                    f"leak_ok={r['leak_check_ok']} ok={r['ok']}"
+                )
+            return
+        if not session_id and not latest:
+            raise typer.BadParameter("pass a SESSION_ID, --latest, or --recent N")
+        r = tk.import_report(s, get_settings(), session_id=session_id, latest=latest, kind=kind)
+    if not r.get("session_id"):
+        typer.echo("import session not found")
+        raise typer.Exit(code=1)
+    typer.echo(f"== import-report == session={r['session_id']} kind={r['import_kind']} status={r['status']}")
+    typer.echo(f"  file={r.get('path_basename')} started={r.get('started_at')} finished={r.get('finished_at')}")
+    typer.echo(
+        f"  scanned={r['scanned']} imported={r['imported']} skipped={r['skipped_duplicate']} "
+        f"updated={r['updated']} failed={r['failed']} eps={r['entries_per_second']} peak={r['peak_memory_mb']}MB"
+    )
+    typer.echo(
+        f"  store_raw_json={r['store_raw_json']} raw_stored={r['raw_json_stored_count']} "
+        f"raw_skipped={r['raw_json_skipped_count']} job=#{r['job_id']} job_status={r['job_status']}"
+    )
+    ds = r["db_stats"]
+    typer.echo(
+        f"  db: {ds.get('total_size_mb')}MB watch={ds.get('watch_history_events')} liked={ds.get('liked_videos')} "
+        f"raw_json_real_blobs_total={ds.get('raw_json_stored_total')}"
+    )
+    typer.echo(f"  leak_check: {'clean' if r['leak_check_ok'] else 'LEAK ' + str(r['leak_findings'])}")
+    typer.echo(f"  => next: {r['recommended_next_action']}")
+
+
 @storage_app.command("db-stats")
 def storage_db_stats() -> None:
     """Show DB row counts + approximate sizes (raw_json growth)."""
@@ -1705,6 +2000,50 @@ def storage_db_stats() -> None:
     if st["table_sizes_bytes"]:
         top = sorted(st["table_sizes_bytes"].items(), key=lambda kv: kv[1], reverse=True)[:5]
         typer.echo("  largest tables: " + ", ".join(f"{n}={round(b/1024/1024,2)}MB" for n, b in top))
+
+
+# --------------------------------------------------------------------------- #
+# system: build identity / preflight (Phase 6F)
+# --------------------------------------------------------------------------- #
+@system_app.command("build-info")
+def system_build_info() -> None:
+    """Show this process's build identity (version / build_id / schema head)."""
+    from app.services import build_info as bi
+
+    info = bi.build_info()
+    typer.echo("== build info ==")
+    typer.echo(f"  app_version : {info['app_version']}")
+    typer.echo(f"  build_id    : {info['build_id']}")
+    typer.echo(f"  git_commit  : {info['git_commit'] or '-'}")
+    typer.echo(f"  build_time  : {info['build_time'] or '-'}")
+    typer.echo(f"  schema_head : {info['schema_head'] or '-'}")
+
+
+@system_app.command("preflight")
+def system_preflight_cmd() -> None:
+    """Go/no-go checks before a large import (DB/Redis/schema/worker build match).
+
+    Exits non-zero if any check FAILS (e.g. a stale worker), so it can gate a
+    scripted import.
+    """
+    from app.services import preflight as pf
+
+    with session_scope() as s:
+        report = pf.system_preflight(s, get_settings())
+    icon = {"ok": "OK  ", "warn": "WARN", "fail": "FAIL"}
+    typer.echo(f"== system preflight ==  build_id={report['build_info']['build_id']}")
+    for c in report["checks"]:
+        typer.echo(f"  [{icon.get(c['status'], '?')}] {c['name']}: {c['detail']}")
+    if report["workers"]:
+        typer.echo("  workers:")
+        for w in report["workers"]:
+            typer.echo(
+                f"    - {w['worker_id']} build_id={w['build_id']} "
+                f"age={w['age_seconds']}s stale={w['stale']} takeout_import={w['takeout_import']}"
+            )
+    typer.echo(f"  => {'PASS' if report['ok'] else 'FAIL'}")
+    if not report["ok"]:
+        raise typer.Exit(code=1)
 
 
 @takeout_sessions_app.command("show")
@@ -1944,8 +2283,13 @@ def liked_videos_enqueue_metadata(
     title: str = typer.Option("", "--title", help="title/channel/id contains"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     now: bool = typer.Option(False, "--now"),
+    include_permanent: bool = typer.Option(
+        False, "--include-permanent/--retry-permanent",
+        help="NOT recommended: also enqueue private/deleted/unavailable (excluded by default).",
+    ),
 ) -> None:
-    """Enqueue metadata_only jobs for liked videos (NEVER downloads the body)."""
+    """Enqueue metadata_only jobs for liked videos (NEVER downloads the body).
+    Permanent failures (private/deleted/unavailable) are excluded by default."""
     from app.services import liked_archive as la
 
     _ensure_profile(profile)
@@ -1954,11 +2298,13 @@ def liked_videos_enqueue_metadata(
             s, get_settings(),
             filters=_liked_filters(source, channel, title, missing_metadata=missing_only),
             limit=limit, profile=profile, dry_run=dry_run, submit=not now,
+            include_permanent=include_permanent,
         )
         job_ids = list(r.job_ids)
         typer.echo(
             f"[metadata_only — body NOT downloaded] selected={r.selected_count} created={r.jobs_created} "
-            f"skipped_existing={r.skipped_existing_job} skipped_has_metadata={r.skipped_already_has_metadata}"
+            f"skipped_existing={r.skipped_existing_job} skipped_has_metadata={r.skipped_already_has_metadata} "
+            f"skipped_permanent={r.skipped_permanent}"
             + ("  (dry-run)" if dry_run else "")
         )
     if now and not dry_run:
@@ -2032,6 +2378,28 @@ def liked_videos_enqueue_archive(
             _dispatch(jid, True)
 
 
+@liked_videos_app.command("failures")
+def liked_videos_failures() -> None:
+    """Phase 7H: failed/partial liked-archive jobs grouped by reason
+    (private/deleted/unavailable/network/rate_limited/unknown). Counts only."""
+    from app.services import liked_archive as la
+
+    with session_scope() as s:
+        fb = la.failure_breakdown(s)
+    typer.echo("== liked-archive failure breakdown ==")
+    typer.echo(
+        f"  attempts: failed={fb['total_failed']} partial={fb['total_partial']} retryable={fb['retryable']} "
+        f"permanent_attempts={fb['permanent']} | permanent_unique_videos={fb.get('permanent_unique_videos')}"
+    )
+    if fb["attempts_by_reason"]:
+        typer.echo(f"  {'reason':<14} {'attempts':>9} {'unique_videos':>14}")
+        uniq = fb.get("unique_videos_by_reason", {})
+        for reason, n in fb["attempts_by_reason"].items():
+            typer.echo(f"    {reason:<12} {n:>9} {uniq.get(reason, 0):>14}")
+    else:
+        typer.echo("    (no failed liked-archive jobs)")
+
+
 @queue_app.command("status")
 def queue_status_cmd() -> None:
     """Show queued/running jobs by type and source_action."""
@@ -2074,7 +2442,20 @@ def liked_videos_progress(
         p = la.progress(s, get_settings())
     typer.echo("== liked archive progress ==")
     typer.echo(f"  total liked (unique): {p['total_liked']}")
-    typer.echo(f"  metadata fetched:     {p['metadata_fetched']}  (missing {p['metadata_missing']})")
+    typer.echo(f"  metadata fetched:     {p['metadata_fetched']}  (broad: >=1 metadata media; missing {p['metadata_missing']})")
+    typer.echo(
+        f"    ├ info_json complete: {p.get('info_json_complete_count', 0)}  "
+        f"(use THIS for full-metadata decisions, not the broad count)"
+    )
+    typer.echo(
+        f"    └ description-only:   {p.get('description_only_count', 0)}  "
+        f"(retryable partial {p.get('retryable_partial_count', 0)} — upgradeable via retry-metadata)"
+    )
+    typer.echo(
+        f"  eligible missing:     {p['eligible_metadata_missing']}  "
+        f"(skipped permanent {p['skipped_permanent_metadata']}; "
+        f"permanent unique videos {p['permanent_unique_videos']} — kept, not retried)"
+    )
     typer.echo(f"  body saved:           {p['body_saved']}  (missing {p['body_missing']})")
     typer.echo(f"  active archive jobs:  {p['active_archive_jobs']}")
     typer.echo(f"  retryable / failed / partial: {p['retryable_liked_jobs']} / {p['failed_liked_jobs']} / {p['partial_liked_jobs']}")
@@ -2123,6 +2504,110 @@ def liked_videos_retry_failed(
         else:
             job_ids = la.retry_failed_liked(s, get_settings(), reason=(reason or None), limit=limit)
     typer.echo(f"Re-queued {len(job_ids)} liked-archive job(s): {job_ids}")
+    if now:
+        for jid in job_ids:
+            _dispatch(jid, True)
+
+
+@liked_videos_app.command("metadata-run")
+def liked_videos_metadata_run(
+    limit: int = typer.Option(100, "--limit", help="Max videos to attempt this run (ignored with --all)."),
+    all_missing: bool = typer.Option(False, "--all", help="Fetch metadata for ALL missing (needs --confirm)."),
+    confirm: bool = typer.Option(False, "--confirm", help="Required with --all."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Plan only (no jobs, no body)."),
+    include_permanent: bool = typer.Option(
+        False, "--include-permanent/--retry-permanent", help="NOT recommended: also retry "
+        "private/deleted/unavailable (excluded by default).",
+    ),
+) -> None:
+    """Phase 7I: safe staged liked-metadata fetch. Loops capped batches, waits for
+    the worker, and STOPS if the 429 (rate_limited) ratio gets too high. metadata
+    only — never downloads the body. Permanent failures (private/deleted/
+    unavailable) are excluded by default (use --include-permanent to retry)."""
+    from app.services import liked_archive as la
+
+    if all_missing and not confirm:
+        raise typer.BadParameter("--all requires --confirm (fetches metadata for ALL eligible missing videos)")
+    target = None if all_missing else max(1, limit)
+    settings = get_settings()
+    apply = not dry_run
+    typer.echo(
+        f"== metadata-run ==  apply={apply} target={'all' if target is None else target} "
+        f"include_permanent={include_permanent} (cap/run={settings.liked_metadata_max_enqueue_per_run})"
+    )
+    sys.stdout.flush()
+
+    def _emit_batch(b: dict) -> None:
+        # Phase 7L: stream each batch AS IT COMPLETES (flushed) so detached runs
+        # show live batch ratios in /logs/mr*.log instead of nothing until the end.
+        typer.echo(
+            f"  batch {b['batch']}: selected={b.get('selected')} skipped_permanent={b.get('skipped_permanent')} "
+            f"attempted={b['attempted']} success={b['success']} rate_limited={b['rate_limited']} "
+            f"ratio={b['ratio']} level={b['level']} by_reason={b['by_reason']}"
+        )
+        sys.stdout.flush()
+
+    res = la.metadata_run(settings, target_limit=target, apply=apply,
+                          include_permanent=include_permanent, on_batch=_emit_batch)
+    if not res["ok"]:
+        typer.echo(f"  BLOCKED: {res.get('message')}")
+        raise typer.Exit(code=1)
+    if not res["apply"]:
+        typer.echo(
+            f"  plan: missing={res['metadata_missing']} eligible={res.get('eligible_metadata_missing')} "
+            f"permanent_unique={res.get('permanent_unique_videos')} "
+            f"would-enqueue(first batch)={res.get('plan_selected')} skipped_permanent={res.get('skipped_permanent')}"
+        )
+        typer.echo(f"  {res.get('message')}")
+        return
+    # batches were streamed live via _emit_batch above.
+    typer.echo(
+        f"  enqueued={res['enqueued_total']} attempted={res['attempted']} rate_limited={res['rate_limited']} "
+        f"skipped_permanent={res.get('skipped_permanent')} eligible_missing={res.get('eligible_metadata_missing')} "
+        f"permanent_kept={res.get('permanent_unique_videos')}"
+    )
+    # Phase 7L: final level reflects the WORST batch + any STOP, not just the average.
+    typer.echo(
+        f"  LEVEL={res['level'].upper()}  (overall ratio={res.get('overall_ratio')} [{res.get('overall_level')}], "
+        f"worst batch={res.get('worst_batch_ratio')} [{res.get('worst_batch_level')}], stopped={res['stopped_reason']})"
+    )
+    if res.get("batch_stop_triggered"):
+        typer.echo(
+            "  ⚠ a batch hit the STOP threshold — overall ratio may read OK but the run HALTED; "
+            "do NOT scale up. Set PO-token / raise delay, then retry-metadata later."
+        )
+    typer.echo(
+        f"  metadata_fetched(broad) {res['metadata_fetched_before']} -> {res['metadata_fetched_after']} "
+        f"| info_json complete -> {res.get('info_json_complete_after')} "
+        f"| db {res['db_size_mb_before']} -> {res['db_size_mb_after']} MB"
+    )
+    typer.echo(f"  next: {res['recommended_next']}")
+    if res["level"] == "stop":
+        raise typer.Exit(code=2)  # signal high rate-limit so scripts halt full runs
+
+
+@liked_videos_app.command("retry-metadata")
+def liked_videos_retry_metadata(
+    limit: int = typer.Option(50, "--limit"),
+    reason: str = typer.Option("", "--reason", help="only retry this reason (rate_limited|network)"),
+    retryable: bool = typer.Option(False, "--retryable", help="retry all retryable reasons"),
+    now: bool = typer.Option(False, "--now"),
+) -> None:
+    """Phase 7I: re-queue retryable liked METADATA jobs only. private/deleted/
+    unavailable (permanent) are NEVER retried."""
+    from app.services import liked_archive as la
+
+    if not reason and not retryable:
+        retryable = True  # default: all retryable reasons
+    with session_scope() as s:
+        job_ids = la.retry_failed_liked(
+            s, get_settings(), reason=(reason or None), limit=limit, submit=not now, metadata_only=True
+        )
+    typer.echo(
+        f"Re-queued {len(job_ids)} retryable metadata job(s)"
+        + (f" (reason={reason})" if reason else " (all retryable)")
+        + " — permanent (private/deleted/unavailable) excluded."
+    )
     if now:
         for jid in job_ids:
             _dispatch(jid, True)

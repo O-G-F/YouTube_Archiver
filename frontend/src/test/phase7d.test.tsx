@@ -12,6 +12,11 @@ vi.mock("../api/endpoints", () => ({
     likedProgress: () => progressMock(),
     queueStatus: () => queueMock(),
     schedulerRunOnce: (b: unknown) => runOnceMock(b),
+    likedFailureBreakdown: () =>
+      Promise.resolve({ total_failed: 0, total_partial: 0, retryable: 0, permanent: 0, permanent_unique_videos: 0, by_reason: {}, attempts_by_reason: {}, unique_videos_by_reason: {} }),
+    secretsStatus: () =>
+      Promise.resolve({ cookies_configured: false, cookies_file_configured: false, cookies_file_readable: false, cookies_from_browser_configured: false, po_token_configured: false, visitor_data_configured: false, cookies_last_modified: null, secret_value_exposed: false }),
+    likedRetryFailed: () => Promise.resolve({ retried: 0, job_ids: [] }),
   },
 }));
 
@@ -22,6 +27,9 @@ function prog(over: Partial<LikedProgress> = {}): LikedProgress {
     total_liked: 10,
     metadata_fetched: 6,
     metadata_missing: 4,
+    eligible_metadata_missing: 4,
+    skipped_permanent_metadata: 0,
+    permanent_unique_videos: 0,
     body_saved: 2,
     body_missing: 8,
     active_archive_jobs: 1,

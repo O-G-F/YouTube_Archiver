@@ -16,6 +16,7 @@ Every job created here is tagged in ``job.meta`` with
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -100,6 +101,23 @@ def _meta_count_map(session: Session, video_ids: list[int]) -> dict[int, int]:
     return {vid: int(n) for vid, n in rows}
 
 
+def _media_type_video_ids(session: Session, video_ids: list[int], media_type: str) -> set[int]:
+    """Set of video ids (within video_ids) that have >=1 media of ``media_type``.
+
+    Used by progress() to separate broad "any metadata media" (info_json OR
+    description OR ...) from the rigorous "info_json complete" count.
+    """
+    if not video_ids:
+        return set()
+    rows = session.execute(
+        select(MediaFile.video_id)
+        .where(MediaFile.video_id.in_(video_ids))
+        .where(MediaFile.media_type == media_type)
+        .distinct()
+    ).all()
+    return {vid for (vid,) in rows}
+
+
 def video_state(session: Session, video: Video | None) -> dict:
     """has_metadata / has_body / body_media_count / metadata_file_count for a video."""
     if video is None:
@@ -128,7 +146,10 @@ def video_state(session: Session, video: Video | None) -> dict:
         or 0
     )
     return {
-        "has_metadata": bool(video.title) or meta > 0,
+        # Phase 7H: "metadata fetched" means a real metadata MEDIA file (info_json
+        # etc.) exists — a Takeout title-only stub is NOT fetched metadata, so it
+        # is correctly selected by --missing-only for the first metadata pass.
+        "has_metadata": meta > 0,
         "has_body": body > 0,
         "body_media_count": body,
         "metadata_file_count": meta,
@@ -175,7 +196,7 @@ def _select_candidates(session: Session, f: LikedFilters, *, limit: int | None):
             bc = body_map.get(video.id, 0)
             mc = meta_map.get(video.id, 0)
             state = {
-                "has_metadata": bool(video.title) or mc > 0,
+                "has_metadata": mc > 0,  # Phase 7H: real fetched metadata (info_json), not a title stub
                 "has_body": bc > 0,
                 "body_media_count": bc,
                 "metadata_file_count": mc,
@@ -191,6 +212,48 @@ def _select_candidates(session: Session, f: LikedFilters, *, limit: int | None):
         if limit is not None and len(out) >= limit:
             break
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7J: permanent-failure exclusion for metadata selection
+# --------------------------------------------------------------------------- #
+def _latest_metadata_reason_by_video(session: Session, *, scan_limit: int = 30000) -> dict[int, str]:
+    """video.id -> primary_reason of its LATEST metadata_only liked job.
+
+    A private/deleted/unavailable video never produces an info_json, so it stays
+    "missing metadata" forever and would be re-enqueued every batch. We classify
+    each video's most-recent metadata attempt so the selector can skip permanent
+    ones. ONLY metadata_only liked jobs are considered (body-archive failures are
+    not conflated). Rows are never deleted.
+    """
+    from app.services.job_classify import classify_job
+
+    out: dict[int, str] = {}
+    for j in session.scalars(
+        select(Job)
+        .where(
+            Job.type == "download",
+            Job.profile_name == METADATA_PROFILE,
+            Job.status.in_(("failed", "partial_success", "success")),
+        )
+        .order_by(Job.id.desc())
+        .limit(scan_limit)
+    ):
+        if (j.meta or {}).get("source_action") != SOURCE_ACTION:
+            continue
+        vid = j.video_id
+        if vid is None or vid in out:
+            continue  # id desc -> first seen is the latest job for this video
+        out[vid] = classify_job(j).get("primary_reason") or ("ok" if j.status == "success" else "unknown")
+    return out
+
+
+def permanent_metadata_video_ids(session: Session) -> set[int]:
+    """video.id set whose latest metadata attempt is permanent (private/deleted/
+    unavailable) — excluded from metadata selection by default. Never deleted."""
+    from app.services.job_classify import PERMANENT_REASONS
+
+    return {vid for vid, r in _latest_metadata_reason_by_video(session).items() if r in PERMANENT_REASONS}
 
 
 # --------------------------------------------------------------------------- #
@@ -297,9 +360,10 @@ def _active_job_exists(session: Session, url: str | None, profile: str) -> bool:
 class EnqueueResult:
     selected_count: int = 0
     jobs_created: int = 0
-    skipped_existing_job: int = 0
+    skipped_existing_job: int = 0  # an active (queued/running) job already exists
     skipped_already_has_metadata: int = 0
     skipped_already_has_body: int = 0
+    skipped_permanent: int = 0  # Phase 7J: private/deleted/unavailable (latest metadata attempt)
     job_ids: list[int] = field(default_factory=list)
     profile: str = ""
     downloads_body: bool = False
@@ -356,10 +420,14 @@ def _enqueue(
     downloads_body: bool,
     submit: bool = True,
     extra_meta: dict | None = None,
+    exclude_permanent: bool = False,
 ) -> EnqueueResult:
     cap = settings.liked_archive_max_enqueue_per_run
     eff_limit = min(limit or settings.liked_archive_default_limit, cap)
     res = EnqueueResult(profile=profile, downloads_body=downloads_body, dry_run=dry_run)
+    # Phase 7J: skip videos whose latest metadata attempt was permanent
+    # (private/deleted/unavailable) so they aren't re-enqueued every batch.
+    permanent_ids = permanent_metadata_video_ids(session) if exclude_permanent else set()
 
     # Select candidates WITHOUT the missing-metadata/body sub-filters so the
     # skip counters below can report how many already had metadata/body. The
@@ -380,6 +448,9 @@ def _enqueue(
             continue
         if skip_if == "body" and state["has_body"]:
             res.skipped_already_has_body += 1
+            continue
+        if permanent_ids and video is not None and video.id in permanent_ids:
+            res.skipped_permanent += 1
             continue
         v = video or jobs_svc.resolve_or_create_video(session, lv.youtube_video_id)
         if v is None:
@@ -415,8 +486,13 @@ def enqueue_metadata(
     dry_run: bool = False,
     submit: bool = True,
     extra_meta: dict | None = None,
+    include_permanent: bool = False,
 ) -> EnqueueResult:
-    """Enqueue metadata_only jobs (NEVER downloads the body)."""
+    """Enqueue metadata_only jobs (NEVER downloads the body).
+
+    By default excludes videos whose latest metadata attempt was permanent
+    (private/deleted/unavailable); pass ``include_permanent=True`` to retry them.
+    """
     get_profile_spec(session, profile)  # validate (raises KeyError -> 400 upstream)
     # metadata jobs only make sense for those missing metadata when missing-only.
     return _enqueue(
@@ -430,6 +506,7 @@ def enqueue_metadata(
         downloads_body=False,
         submit=submit,
         extra_meta=extra_meta,
+        exclude_permanent=not include_permanent,
     )
 
 
@@ -472,6 +549,7 @@ def retryable_liked(
     limit: int = 50,
     scan: int = 1000,
     now: datetime | None = None,
+    metadata_only: bool = False,
 ):
     """Failed/partial liked-archive jobs that are retryable and under the cap.
 
@@ -491,6 +569,8 @@ def retryable_liked(
     for j in session.scalars(stmt):
         if (j.meta or {}).get("source_action") != SOURCE_ACTION:
             continue
+        if metadata_only and j.profile_name != METADATA_PROFILE:
+            continue  # Phase 7I: retry-metadata restricts to metadata_only jobs
         if (j.retry_count or 0) >= max_attempts:
             continue
         if now is not None and j.next_retry_at is not None and j.next_retry_at > now:
@@ -519,9 +599,18 @@ def progress(session: Session, settings: Settings, *, top_channels: int = 10) ->
     video_ids = [v.id for _lv, v in rows if v is not None]
     body_map = _body_count_map(session, video_ids)
     meta_map = _meta_count_map(session, video_ids)
+    permanent_ids = permanent_metadata_video_ids(session)  # Phase 7J
+    # Phase 7L: split the broad "any metadata media" count from the rigorous
+    # "info_json complete" count so the full-metadata decision uses real completeness.
+    info_json_ids = _media_type_video_ids(session, video_ids, "info_json")
+    description_ids = _media_type_video_ids(session, video_ids, "description")
+    latest_reason = _latest_metadata_reason_by_video(session)
+    from app.services.job_classify import PERMANENT_REASONS
 
     seen: set[str] = set()
     total = meta_fetched = body_saved = 0
+    skipped_permanent_meta = permanent_unique = 0
+    info_json_complete = description_only = retryable_partial = 0
     by_source: dict[str, int] = {}
     by_channel: dict[str, int] = {}
     earliest = latest = None
@@ -535,12 +624,28 @@ def progress(session: Session, settings: Settings, *, top_channels: int = 10) ->
             continue
         seen.add(vid)
         total += 1
-        has_meta = bool(v is not None and (v.title or meta_map.get(v.id, 0) > 0))
+        has_meta = bool(v is not None and meta_map.get(v.id, 0) > 0)  # Phase 7H: any metadata media (broad)
         has_body = bool(v is not None and body_map.get(v.id, 0) > 0)
+        is_permanent = bool(v is not None and v.id in permanent_ids)  # Phase 7J
+        has_info = bool(v is not None and v.id in info_json_ids)        # Phase 7L: info_json complete
+        has_desc = bool(v is not None and v.id in description_ids)
         if has_meta:
             meta_fetched += 1
+        if has_info:
+            info_json_complete += 1
+        if has_meta and not has_info:
+            # Partial: has some metadata media (usually .description) but no info_json.
+            if has_desc:
+                description_only += 1
+            r = latest_reason.get(v.id) if v is not None else None
+            if r and r not in PERMANENT_REASONS and r != "ok":
+                retryable_partial += 1  # upgradeable to full info_json via retry-metadata
         if has_body:
             body_saved += 1
+        if is_permanent:
+            permanent_unique += 1
+            if not has_meta:
+                skipped_permanent_meta += 1  # missing + permanent => excluded from selection
         ch = (v.channel_title if v is not None and v.channel_title else lv.channel_title) or "—"
         by_channel[ch] = by_channel.get(ch, 0) + 1
 
@@ -566,10 +671,23 @@ def progress(session: Session, settings: Settings, *, top_channels: int = 10) ->
 
     retryable = len(retryable_liked(session, settings, limit=10_000))
     top = sorted(by_channel.items(), key=lambda kv: kv[1], reverse=True)[:top_channels]
+    metadata_missing = total - meta_fetched
     return {
         "total_liked": total,
+        # Phase 7H/7L: metadata_fetched is a BROAD count (>=1 of info_json /
+        # description / thumbnail / link / live_chat). For full-metadata decisions
+        # use info_json_complete_count (rigorous), not this broad number.
         "metadata_fetched": meta_fetched,
-        "metadata_missing": total - meta_fetched,
+        "metadata_any_count": meta_fetched,
+        "info_json_complete_count": info_json_complete,
+        "description_only_count": description_only,
+        "retryable_partial_count": retryable_partial,
+        "metadata_missing": metadata_missing,
+        # Phase 7J: missing minus permanent (private/deleted/unavailable) = what
+        # metadata-run will actually select. permanent rows are kept, not retried.
+        "eligible_metadata_missing": metadata_missing - skipped_permanent_meta,
+        "skipped_permanent_metadata": skipped_permanent_meta,
+        "permanent_unique_videos": permanent_unique,
         "body_saved": body_saved,
         "body_missing": total - body_saved,
         "active_archive_jobs": active_archive,
@@ -585,6 +703,63 @@ def progress(session: Session, settings: Settings, *, top_channels: int = 10) ->
     }
 
 
+def failure_breakdown(session: Session, *, scan_limit: int = 20000) -> dict:
+    """Phase 7H: count failed/partial liked-archive jobs by classification
+    reason (private / deleted / unavailable / network / rate_limited / unknown /
+    …). Lets the operator see WHY archive/metadata jobs failed at each stage.
+
+    Counts only — no raw_json / titles / paths. Failed videos are recorded with
+    a reason, never deleted.
+    """
+    from app.services.job_classify import PERMANENT_REASONS
+
+    by_reason: dict[str, int] = {}              # per-JOB attempts
+    latest_reason_by_video: dict[int, str] = {}  # video_id -> latest failed reason
+    total_failed = total_partial = retryable = permanent = 0
+    for j in session.scalars(
+        select(Job).where(Job.type == "download").order_by(Job.id.desc()).limit(scan_limit)
+    ):
+        if (j.meta or {}).get("source_action") != SOURCE_ACTION:
+            continue
+        if j.status not in ("failed", "partial_success"):
+            continue
+        c = classify_job(j)
+        if j.status == "failed":
+            total_failed += 1
+        else:
+            total_partial += 1
+        reason = c.get("primary_reason") or "unknown"
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+        if c.get("retryable"):
+            retryable += 1
+        if reason in PERMANENT_REASONS:
+            permanent += 1
+        # unique per video: id desc -> first seen is the latest attempt
+        if j.video_id is not None and j.video_id not in latest_reason_by_video:
+            latest_reason_by_video[j.video_id] = reason
+
+    unique_by_reason: dict[str, int] = {}
+    permanent_unique = 0
+    for r in latest_reason_by_video.values():
+        unique_by_reason[r] = unique_by_reason.get(r, 0) + 1
+        if r in PERMANENT_REASONS:
+            permanent_unique += 1
+
+    def _sorted(d: dict) -> dict:
+        return dict(sorted(d.items(), key=lambda kv: kv[1], reverse=True))
+
+    return {
+        "total_failed": total_failed,
+        "total_partial": total_partial,
+        "retryable": retryable,
+        "permanent": permanent,  # private/deleted/unavailable attempts — not retried
+        "permanent_unique_videos": permanent_unique,
+        "by_reason": _sorted(by_reason),                  # backward-compat (= attempts)
+        "attempts_by_reason": _sorted(by_reason),         # per-job attempts (Phase 7J)
+        "unique_videos_by_reason": _sorted(unique_by_reason),  # distinct videos, latest reason
+    }
+
+
 def retry_failed_liked(
     session: Session,
     settings: Settings,
@@ -593,9 +768,15 @@ def retry_failed_liked(
     limit: int = 20,
     now: datetime | None = None,
     submit: bool = True,
+    metadata_only: bool = False,
 ) -> list[int]:
-    """Re-queue retryable liked-archive jobs (respects the attempt cap + backoff)."""
-    candidates = retryable_liked(session, settings, reason=reason, limit=limit, now=now)
+    """Re-queue retryable liked-archive jobs (respects the attempt cap + backoff).
+
+    Only ``retryable`` jobs are selected, so permanent failures
+    (private/deleted/unavailable) are NEVER re-queued (Phase 7H/7I)."""
+    candidates = retryable_liked(
+        session, settings, reason=reason, limit=limit, now=now, metadata_only=metadata_only
+    )
     job_ids: list[int] = []
     for j, _c in candidates:
         jobs_svc.retry_job(session, j)
@@ -608,3 +789,247 @@ def retry_failed_liked(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("retry-failed liked: job %s not resubmitted: %s", jid, exc)
     return job_ids
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7I: safe staged metadata-run with rate-limit-ratio gating
+# --------------------------------------------------------------------------- #
+def metadata_rate_decision(
+    rate_limited: int, attempted: int, *, warn_ratio: float, stop_ratio: float
+) -> dict:
+    """Pure decision: ok / warn / stop from the rate_limited ratio of a run."""
+    ratio = round(rate_limited / attempted, 3) if attempted else 0.0
+    level = "stop" if ratio >= stop_ratio else "warn" if ratio >= warn_ratio else "ok"
+    return {"attempted": attempted, "rate_limited": rate_limited, "ratio": ratio, "level": level}
+
+
+_LEVEL_ORDER = {"ok": 0, "warn": 1, "stop": 2}
+
+
+def combine_run_level(overall_level: str, batch_levels: list[str], stopped: str | None) -> str:
+    """Phase 7L: the run's reported level must reflect the WORST batch, not just
+    the overall (averaged) ratio.
+
+    A run can average ratio < 0.5 (overall "ok") yet contain a batch that hit the
+    STOP threshold and halted the run — reporting "ok" there is misleading. So the
+    final level is the worst of (overall, every batch); and if the run halted
+    *because* a batch hit the rate-limit STOP, the level is forced to "stop".
+    """
+    rate_stopped = bool(stopped and str(stopped).startswith("rate_limit_ratio>="))
+    candidates = [overall_level, *batch_levels]
+    if rate_stopped:
+        candidates.append("stop")
+    return max(candidates, key=lambda lv: _LEVEL_ORDER.get(lv, 0))
+
+
+def _classify_run_jobs(session: Session, job_ids: list[int]) -> dict:
+    """Classify a run's (terminal) jobs by primary reason."""
+    from collections import Counter
+
+    from app.services.job_classify import PERMANENT_REASONS
+
+    by_reason: Counter = Counter()
+    attempted = success = rate_limited = permanent = 0
+    for jid in job_ids:
+        j = session.get(Job, jid)
+        if j is None or j.status not in ("success", "failed", "partial_success"):
+            continue
+        attempted += 1
+        if j.status == "success":
+            success += 1
+            continue
+        pr = classify_job(j).get("primary_reason") or "unknown"
+        by_reason[pr] += 1
+        if pr == "rate_limited":
+            rate_limited += 1
+        if pr in PERMANENT_REASONS:
+            permanent += 1
+    return {
+        "attempted": attempted, "success": success, "rate_limited": rate_limited,
+        "permanent": permanent, "by_reason": dict(by_reason),
+    }
+
+
+def _wait_for_metadata_jobs(job_ids: list[int], *, timeout: float = 3600.0, interval: float = 3.0) -> bool:
+    """Poll a batch of jobs to terminal state (fresh sessions). True if all done."""
+    import time as _t
+
+    from app.db import session_scope
+
+    waited = 0.0
+    while waited < timeout:
+        with session_scope() as s:
+            pending = sum(
+                1 for jid in job_ids
+                if (j := s.get(Job, jid)) is not None and j.status in ("queued", "running")
+            )
+        if pending == 0:
+            return True
+        _t.sleep(interval)
+        waited += interval
+    return False
+
+
+def metadata_run(
+    settings: Settings, *, target_limit: int | None = None, apply: bool = True,
+    max_batches: int = 40, wait_timeout: float = 3600.0, include_permanent: bool = False,
+    on_batch: Callable[[dict], None] | None = None,
+) -> dict:
+    """Staged liked-metadata fetch (Phase 7I). Manages its own sessions.
+
+    Loops: enqueue a capped batch of missing-metadata videos → wait for the
+    worker → measure that batch's rate_limited ratio → continue until the target
+    is met, nothing is missing, or the ratio hits the STOP threshold (so a full
+    run halts when YouTube is throttling). ``target_limit=None`` => all missing.
+    ``apply=False`` => plan only (dry-run; no jobs, no waiting). NEVER downloads
+    the body; never retries permanent failures.
+    """
+    import uuid
+
+    from app.db import session_scope
+    from app.services import build_info as bi
+    from app.services import db_stats as dbs
+
+    cap = max(1, settings.liked_metadata_max_enqueue_per_run)
+    warn_ratio = settings.liked_metadata_warn_on_rate_limit_ratio
+    stop_ratio = settings.liked_metadata_stop_on_rate_limit_ratio
+    run_id = uuid.uuid4().hex[:16]
+
+    with session_scope() as s:
+        before = progress(s, settings)
+        size_before = dbs.db_stats(s)["total_size_mb"]
+
+    out = {
+        "ok": False, "run_id": run_id, "apply": apply, "target_limit": target_limit,
+        "metadata_fetched_before": before["metadata_fetched"],
+        "metadata_missing": before["metadata_missing"],
+        "db_size_mb_before": size_before, "db_size_mb_after": size_before,
+        "batches": [], "enqueued_total": 0, "attempted": 0, "rate_limited": 0,
+        "skipped_permanent": 0, "include_permanent": include_permanent,
+        "eligible_metadata_missing": before.get("eligible_metadata_missing"),
+        "permanent_unique_videos": before.get("permanent_unique_videos"),
+        "ratio": 0.0, "level": "ok", "stopped_reason": None,
+        "overall_ratio": 0.0, "overall_level": "ok",
+        "worst_batch_ratio": 0.0, "worst_batch_level": "ok", "batch_stop_triggered": False,
+        "info_json_complete_before": before.get("info_json_complete_count"),
+        "info_json_complete_after": before.get("info_json_complete_count"),
+        "metadata_fetched_after": before["metadata_fetched"],
+        "warn_ratio": warn_ratio, "stop_ratio": stop_ratio, "recommended_next": None, "message": None,
+    }
+
+    if not apply:
+        with session_scope() as s:
+            r = enqueue_metadata(
+                s, settings, filters=LikedFilters(missing_metadata=True),
+                limit=(min(target_limit, cap) if target_limit else cap), dry_run=True, submit=False,
+                include_permanent=include_permanent,
+            )
+        out.update(ok=True, plan_selected=r.selected_count, skipped_permanent=r.skipped_permanent,
+                   message="dry-run plan (no jobs, no body) — re-run without --dry-run to fetch",
+                   recommended_next="run with --apply (worker required)")
+        return out
+
+    # apply requires a live worker (don't enqueue jobs nothing will run)
+    try:
+        from app.worker.queue import get_redis
+
+        workers = bi.read_worker_heartbeats(get_redis())
+    except Exception:  # noqa: BLE001
+        workers = []
+    if not workers:
+        out["message"] = "no worker heartbeat — start a worker before metadata-run --apply"
+        return out
+
+    enqueued = attempted = rate_limited = skipped_permanent = 0
+    remaining = target_limit
+    stopped = None
+    for batch_i in range(max_batches):
+        if remaining is not None and remaining <= 0:
+            break
+        batch = cap if remaining is None else min(remaining, cap)
+        with session_scope() as s:
+            r = enqueue_metadata(
+                s, settings, filters=LikedFilters(missing_metadata=True), limit=batch,
+                dry_run=False, submit=True, extra_meta={"metadata_run_id": run_id, "batch": batch_i},
+                include_permanent=include_permanent,
+            )
+            s.commit()
+            job_ids = list(r.job_ids)
+            created = r.jobs_created
+            batch_skipped_perm = r.skipped_permanent
+        skipped_permanent = batch_skipped_perm  # permanent set is global; last value is the live count
+        if created == 0:
+            # nothing ELIGIBLE left (permanent failures are excluded, not looped on)
+            stopped = "no_more_eligible" if batch_skipped_perm else "no_more_missing"
+            break
+        _wait_for_metadata_jobs(job_ids, timeout=wait_timeout)
+        with session_scope() as s:
+            bstats = _classify_run_jobs(s, job_ids)
+        enqueued += created
+        attempted += bstats["attempted"]
+        rate_limited += bstats["rate_limited"]
+        if remaining is not None:
+            remaining -= created
+        dec = metadata_rate_decision(bstats["rate_limited"], bstats["attempted"],
+                                     warn_ratio=warn_ratio, stop_ratio=stop_ratio)
+        batch_row = {"batch": batch_i, "created": created, "selected": created,
+                     "skipped_permanent": batch_skipped_perm, **bstats,
+                     "ratio": dec["ratio"], "level": dec["level"]}
+        out["batches"].append(batch_row)
+        if on_batch is not None:
+            # Phase 7L: emit per-batch progress AS IT HAPPENS so detached runs
+            # (docker compose exec -d ... > /logs/mr*.log) show live batch ratios
+            # instead of nothing until the run finishes.
+            try:
+                on_batch(batch_row)
+            except Exception:  # noqa: BLE001 - never let a logging callback kill the run
+                pass
+        if dec["level"] == "stop":
+            stopped = f"rate_limit_ratio>={stop_ratio}"
+            break
+    else:
+        stopped = "max_batches"
+
+    overall = metadata_rate_decision(rate_limited, attempted, warn_ratio=warn_ratio, stop_ratio=stop_ratio)
+    # Phase 7L: the reported level reflects the WORST batch + any rate-limit STOP,
+    # not just the averaged overall ratio (which can read "ok" despite a STOP).
+    batch_levels = [b["level"] for b in out["batches"]]
+    worst_batch_ratio = max((b["ratio"] for b in out["batches"]), default=0.0)
+    worst_batch_level = max(batch_levels, key=lambda lv: _LEVEL_ORDER.get(lv, 0)) if batch_levels else "ok"
+    final_level = combine_run_level(overall["level"], batch_levels, stopped)
+    batch_stop_triggered = bool(stopped and str(stopped).startswith("rate_limit_ratio>="))
+
+    with session_scope() as s:
+        after = progress(s, settings)
+        size_after = dbs.db_stats(s)["total_size_mb"]
+
+    eligible_after = after.get("eligible_metadata_missing", after["metadata_missing"])
+    if final_level == "stop":
+        rec = ("rate limit too high (a batch hit the STOP threshold) — set "
+               "COOKIES_FILE / YOUTUBE_PO_TOKEN + raise LIKED_METADATA_JOB_DELAY_SECONDS, "
+               "then `retry-metadata --retryable` later (run halted before flooding)")
+    elif final_level == "warn":
+        rec = "elevated 429 — consider PO-token / larger delay; `retry-metadata --reason rate_limited` later"
+    elif eligible_after and eligible_after > 0:
+        rec = f"{eligible_after} eligible still missing — re-run metadata-run"
+    else:
+        rec = ("all ELIGIBLE liked metadata fetched; "
+               f"{after.get('permanent_unique_videos', 0)} permanent (private/deleted/unavailable) kept, not retried")
+
+    out.update(
+        ok=True, enqueued_total=enqueued, attempted=attempted, rate_limited=rate_limited,
+        skipped_permanent=skipped_permanent,
+        eligible_metadata_missing=eligible_after,
+        permanent_unique_videos=after.get("permanent_unique_videos"),
+        ratio=overall["ratio"], level=final_level,
+        overall_ratio=overall["ratio"], overall_level=overall["level"],
+        worst_batch_ratio=worst_batch_ratio, worst_batch_level=worst_batch_level,
+        batch_stop_triggered=batch_stop_triggered, stopped_reason=stopped,
+        info_json_complete_after=after.get("info_json_complete_count"),
+        metadata_fetched_after=after["metadata_fetched"], db_size_mb_after=size_after,
+        recommended_next=rec,
+        message=(f"metadata-run complete (level={final_level}; overall ratio={overall['ratio']} "
+                 f"[{overall['level']}], worst batch={worst_batch_ratio} [{worst_batch_level}], "
+                 f"stopped={stopped})"),
+    )
+    return out

@@ -9,14 +9,20 @@ Every run records three artifacts in the job log directory:
   - ``yt-dlp.stdout.log``
   - ``yt-dlp.stderr.log``
 Cookie/token *values* are never written to logs (requirement 12). The cookies
-file *path* is kept so the command stays re-runnable.
+file *path* is also masked in ``command.txt`` (Phase 7I+). At run time yt-dlp is
+given a writable COPY of the cookies file (it rewrites the jar on exit), so a
+read-only cookies mount never triggers ``[Errno 30] Read-only file system``.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
+import shutil
 import subprocess
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +30,61 @@ from app.config import Settings, get_settings
 from app.logging_setup import get_logger
 
 logger = get_logger(__name__)
+
+
+@contextmanager
+def writable_cookie_copy(src: str | None):
+    """Yield a WRITABLE copy of a (possibly read-only) cookie file path.
+
+    yt-dlp rewrites the cookie jar back to the ``--cookies`` / ``cookiefile``
+    path when the session ends. If that path is on a read-only mount (e.g. a
+    Docker ``:ro`` secret), the write fails with ``[Errno 30] Read-only file
+    system`` and the run errors. So we hand yt-dlp a private writable copy in
+    the system temp dir (0600), then delete it afterwards. The original
+    read-only file is never modified, and the temp path is never logged.
+
+    Yields ``src`` unchanged when there's nothing to copy (no path / not a file).
+    """
+    if not src:
+        yield src
+        return
+    try:
+        if not Path(src).is_file():
+            yield src
+            return
+    except OSError:
+        yield src
+        return
+    fd, tmp = tempfile.mkstemp(prefix="ytdlp-cookies-", suffix=".txt")
+    try:
+        os.close(fd)
+        shutil.copyfile(src, tmp)
+        try:
+            os.chmod(tmp, 0o600)  # cookies are secret
+        except OSError:
+            pass
+        yield tmp
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _cookies_value(cmd: list[str]) -> str | None:
+    for i, a in enumerate(cmd):
+        if a == "--cookies" and i + 1 < len(cmd):
+            return cmd[i + 1]
+    return None
+
+
+def _swap_cookies_value(cmd: list[str], new_path: str) -> list[str]:
+    out = list(cmd)
+    for i, a in enumerate(out):
+        if a == "--cookies" and i + 1 < len(out):
+            out[i + 1] = new_path
+            break
+    return out
 
 # Values following these flags are masked in recorded commands / logs.
 _SENSITIVE_VALUE_FLAGS = {
@@ -108,7 +169,9 @@ def run_ytdlp(
     log_dir.mkdir(parents=True, exist_ok=True)
     cmd = build_command(settings, argv, url=url, batch_file=batch_file)
 
-    display = shlex.join(redact_args(cmd))
+    # Mask the cookies path too: the recorded command must not leak a secret/temp
+    # cookie path (only the value-family secrets were masked before).
+    display = shlex.join(redact_args(cmd, mask_cookies=True))
     command_path = log_dir / "command.txt"
     command_path.write_text(display + "\n", encoding="utf-8")
 
@@ -118,10 +181,17 @@ def run_ytdlp(
     logger.info("yt-dlp run: %s", display)
     with stdout_path.open("w", encoding="utf-8") as out_f, stderr_path.open(
         "w", encoding="utf-8"
-    ) as err_f:
+    ) as err_f, writable_cookie_copy(_cookies_value(cmd)) as run_cookies:
+        # yt-dlp writes the cookie jar back to --cookies; use a writable copy so a
+        # read-only cookies mount does not cause [Errno 30] Read-only file system.
+        run_cmd = (
+            _swap_cookies_value(cmd, run_cookies)
+            if run_cookies and run_cookies != _cookies_value(cmd)
+            else cmd
+        )
         try:
             proc = subprocess.run(
-                cmd,
+                run_cmd,
                 stdout=out_f,
                 stderr=err_f,
                 text=True,
@@ -138,7 +208,7 @@ def run_ytdlp(
 
     return CompletedRun(
         returncode=returncode,
-        command=cmd,
+        command=cmd,  # original (read-only) path; never the temp copy
         command_display=display,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
@@ -168,14 +238,21 @@ def extract_info(
         "ignoreerrors": True,
         "extract_flat": "in_playlist" if flat else False,
     }
-    if settings.cookies_file and Path(settings.cookies_file).is_file():
-        opts["cookiefile"] = settings.cookies_file
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        if info is None:
-            raise RuntimeError(f"yt-dlp could not extract info for {url!r}")
-        return ydl.sanitize_info(info)
+    src_cookies = (
+        settings.cookies_file
+        if settings.cookies_file and Path(settings.cookies_file).is_file()
+        else None
+    )
+    # yt-dlp's Python API also rewrites the cookie jar on close -> use a writable
+    # copy so a read-only cookies mount does not raise [Errno 30].
+    with writable_cookie_copy(src_cookies) as cf:
+        if cf:
+            opts["cookiefile"] = cf
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info is None:
+                raise RuntimeError(f"yt-dlp could not extract info for {url!r}")
+            return ydl.sanitize_info(info)
 
 
 def ytdlp_version(settings: Settings | None = None) -> str | None:

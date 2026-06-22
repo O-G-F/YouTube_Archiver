@@ -39,6 +39,7 @@ from app.api import (
     storage as storage_api,
     subscriptions,
     subtitles,
+    system as system_api,
     takeout,
     videos,
     watch_history,
@@ -102,6 +103,7 @@ app.include_router(youtube_api.router)
 app.include_router(youtube_doctor.router)
 app.include_router(queue_api.router)
 app.include_router(storage_api.router)
+app.include_router(system_api.router)
 
 
 # --------------------------------------------------------------------------- #

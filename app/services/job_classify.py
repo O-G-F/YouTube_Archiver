@@ -22,6 +22,44 @@ from app.models import Job
 # category -> (substring markers searched in the lowercased error text)
 _MARKERS: dict[str, tuple[str, ...]] = {
     "rate_limited": ("http error 429", "too many requests", "429:"),
+    # Phase 7H: permanent-availability categories for archive/metadata of
+    # imported liked/watch videos. private/deleted/unavailable are NOT retryable
+    # (the video will not come back); network IS retryable (transient).
+    "private": ("private video", "this video is private", "video is private"),
+    "deleted": (
+        "this video has been removed by the uploader",
+        "this video has been removed",
+        "has been removed by the uploader",
+        "account associated with this video has been terminated",
+        "video has been deleted",
+        "removed for violating",
+    ),
+    "unavailable": (
+        "video unavailable",
+        "this video is unavailable",
+        "this video is no longer available",
+        "no longer available",
+        "is not available",
+        "content isn't available",
+        "not available in your country",
+        "video is unavailable",
+        "members-only content",
+    ),
+    "network": (
+        "unable to download webpage",
+        "connection reset",
+        "connection timed out",
+        "read timed out",
+        "timed out",
+        "getaddrinfo",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "connection aborted",
+        "http error 500",
+        "http error 502",
+        "http error 503",
+        "http error 504",
+    ),
     "incomplete_data": ("incomplete data received",),
     "fragments_failed": (
         "unable to download video data",
@@ -48,6 +86,10 @@ _MARKERS: dict[str, tuple[str, ...]] = {
 # human-readable note per category (low-severity ones flagged as such)
 _NOTES: dict[str, str] = {
     "rate_limited": "YouTube rate limit (HTTP 429) — usually transient, retry later",
+    "private": "Video is private — cannot be archived (not retryable; recorded, not deleted)",
+    "deleted": "Video removed/deleted by uploader — cannot be archived (not retryable)",
+    "unavailable": "Video unavailable (geo/members/removed) — cannot be archived (not retryable)",
+    "network": "Network/server error — transient, retry later",
     "incomplete_data": "Incomplete data received — YouTube throttling; retry later "
     "(cookies / PO-token / impersonation may help — see README)",
     "fragments_failed": "Some media fragments failed to download — retry later",
@@ -68,6 +110,7 @@ _LOW_SEVERITY = ("impersonation", "subtitles_failed")
 RETRYABLE_REASONS = frozenset(
     {
         "rate_limited",
+        "network",  # Phase 7H: transient network/server errors
         "incomplete_data",
         "fragments_failed",
         "subtitles_failed",
@@ -77,6 +120,29 @@ RETRYABLE_REASONS = frozenset(
         "token_expired",
     }
 )
+
+# Permanent-availability reasons (Phase 7H): NOT retryable — the video will not
+# come back. Recorded with a reason; never auto-deleted.
+PERMANENT_REASONS = frozenset({"private", "deleted", "unavailable"})
+
+# Priority for the single ``primary_reason`` shown in the UI (most specific /
+# actionable first). A failed job with no recognised reason -> "unknown".
+_PRIMARY_PRIORITY = (
+    "rate_limited", "private", "deleted", "unavailable", "network",
+    "incomplete_data", "fragments_failed", "quota_exceeded", "token_expired",
+    "auth_required", "forbidden", "comments_failed", "live_chat_failed",
+    "subtitles_failed", "impersonation",
+)
+
+
+def primary_reason(reasons: list[str], status: str) -> str | None:
+    """The single best label for a job's outcome (for grouping / UI)."""
+    for r in _PRIMARY_PRIORITY:
+        if r in reasons:
+            return r
+    if status == "failed":
+        return "unknown"
+    return None
 
 
 def classify_text(status: str, error_text: str | None, meta: dict | None) -> dict:
@@ -104,9 +170,19 @@ def classify_text(status: str, error_text: str | None, meta: dict | None) -> dic
     )
 
     warnings = [_NOTES[c] for c in reasons if c in _NOTES]
+    primary = primary_reason(reasons, status)
+    permanent = bool(reasons) and all(r in PERMANENT_REASONS for r in reasons)
 
     if rate_limited:
         summary = "Rate limited (HTTP 429)"
+    elif "private" in reasons:
+        summary = "Private video — cannot archive"
+    elif "deleted" in reasons:
+        summary = "Deleted/removed video — cannot archive"
+    elif "unavailable" in reasons:
+        summary = "Video unavailable — cannot archive"
+    elif "network" in reasons:
+        summary = "Network/server error (transient)"
     elif "incomplete_data" in reasons:
         summary = "Incomplete data (YouTube throttling)"
     elif "fragments_failed" in reasons:
@@ -124,6 +200,8 @@ def classify_text(status: str, error_text: str | None, meta: dict | None) -> dic
         "rate_limited": rate_limited,
         "partial": partial,
         "retryable": retryable,
+        "permanent": permanent,
+        "primary_reason": primary,
         "reasons": reasons,
         "warnings": warnings,
         "summary": summary,

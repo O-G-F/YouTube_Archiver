@@ -28,6 +28,12 @@ import type {
   TakeoutFiles,
   TakeoutImportAll,
   DbStats,
+  BuildInfo,
+  FullHealth,
+  PreflightLarge,
+  VerifyImport,
+  CleanupStatus,
+  ImportReport,
   TakeoutBenchmark,
   TakeoutBenchmarkLarge,
   TakeoutImportProgress,
@@ -44,6 +50,8 @@ import type {
   LikedArchivePlan,
   LikedArchiveEnqueueResult,
   LikedProgress,
+  LikedFailureBreakdown,
+  SecretsStatus,
   LikedProgressHistoryPoint,
   QueueStatus,
   SchedulerRun,
@@ -210,6 +218,20 @@ export const api = {
   takeoutSessionsCleanup: (body: { keep_last?: number; older_than_days?: number; dry_run?: boolean }) =>
     apiPost<TakeoutSessionCleanup>("/api/takeout/import-sessions/cleanup", body),
   dbStats: () => apiGet<DbStats>("/api/storage/db-stats"),
+
+  // System build identity / preflight + large-import ops (Phase 6F)
+  systemBuildInfo: () => apiGet<BuildInfo>("/api/system/build-info"),
+  systemHealthFull: () => apiGet<FullHealth>("/api/system/health/full"),
+  takeoutPreflightLarge: (body: { path: string; kind?: string; sample_limit?: number }) =>
+    apiPost<PreflightLarge>("/api/takeout/preflight-large", body),
+  takeoutVerifyImport: (sessionId: string) =>
+    apiGet<VerifyImport>(`/api/takeout/import-sessions/${sessionId}/verify`),
+  takeoutCleanupStatus: () =>
+    apiGet<CleanupStatus>("/api/takeout/import-sessions/cleanup-status"),
+  takeoutImportReportLatest: () =>
+    apiGet<ImportReport>("/api/takeout/import-report/latest"),
+  takeoutImportReport: (sessionId: string) =>
+    apiGet<ImportReport>(`/api/takeout/import-report/${sessionId}`),
   takeoutImportLiked: (body: { path: string; limit?: number; dry_run?: boolean }) =>
     apiPost<{ imported_count: number; videos_created: number; skipped_duplicate_count: number; scanned: number; source_kind: string | null; detected_path: string | null }>(
       "/api/takeout/import-liked-videos",
@@ -263,6 +285,9 @@ export const api = {
   likedRetryFailed: (body: { reason?: string; limit?: number }) =>
     apiPost<{ retried: number; job_ids: number[] }>("/api/liked-videos/retry-failed", body),
   likedProgress: () => apiGet<LikedProgress>("/api/liked-videos/progress"),
+  likedFailureBreakdown: () =>
+    apiGet<LikedFailureBreakdown>("/api/liked-videos/failure-breakdown"),
+  secretsStatus: () => apiGet<SecretsStatus>("/api/system/secrets-status"),
   likedProgressHistory: (limit = 50) =>
     apiGet<{ points: LikedProgressHistoryPoint[] }>(`/api/liked-videos/progress/history${qs({ limit })}`),
   queueStatus: () => apiGet<QueueStatus>("/api/queue/status"),

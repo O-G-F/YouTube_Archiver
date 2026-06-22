@@ -153,6 +153,16 @@ def _is_unsafe_member(name: str) -> bool:
     return name.startswith("/") or ".." in Path(name).parts
 
 
+def _clip(value: str | None, maxlen: int) -> str | None:
+    """Clip a string to a column's max length (PostgreSQL enforces VARCHAR(N);
+    SQLite does not). Real Takeout titles can exceed 1024 chars, so importers
+    clip title/channel_title/query to avoid a StringDataRightTruncation that
+    would fail an entire INSERT batch."""
+    if value is None:
+        return None
+    return value if len(value) <= maxlen else value[:maxlen]
+
+
 # --------------------------------------------------------------------------- #
 # Parsers (modular)
 # --------------------------------------------------------------------------- #
@@ -1103,8 +1113,8 @@ def import_watch_history(
                     WatchHistoryEvent(
                         source="takeout",
                         youtube_video_id=ev.youtube_video_id,
-                        title=ev.title,
-                        channel_title=ev.channel_title,
+                        title=_clip(ev.title, 1024),
+                        channel_title=_clip(ev.channel_title, 512),
                         watched_at=ev.watched_at,
                         raw_json=ev.raw if store_raw_json else None,
                     )
@@ -1168,7 +1178,7 @@ def import_search_history(
                     session.add(
                         SearchHistoryEvent(
                             source="takeout",
-                            query=ev.query,
+                            query=_clip(ev.query, 512),
                             searched_at=ev.searched_at,
                             raw_json=ev.raw if store_raw_json else None,
                         )
@@ -1418,9 +1428,9 @@ def import_liked_videos(
                     if v is not None:
                         changed = False
                         if lv.title and not v.title:
-                            v.title = lv.title; changed = True
+                            v.title = _clip(lv.title, 1024); changed = True
                         if lv.channel_title and not v.channel_title:
-                            v.channel_title = lv.channel_title; changed = True
+                            v.channel_title = _clip(lv.channel_title, 512); changed = True
                         if lv.channel_id and not v.channel_id:
                             v.channel_id = lv.channel_id; changed = True
                         if changed:
@@ -1448,9 +1458,9 @@ def import_liked_videos(
                 videos_created += 1
             # Enrich the stub from the liked entry only when fields are empty.
             if lv.title and not video.title:
-                video.title = lv.title
+                video.title = _clip(lv.title, 1024)
             if lv.channel_title and not video.channel_title:
-                video.channel_title = lv.channel_title
+                video.channel_title = _clip(lv.channel_title, 512)
             if lv.channel_id and not video.channel_id:
                 video.channel_id = lv.channel_id
             video_pk = video.id
@@ -1458,8 +1468,8 @@ def import_liked_videos(
             LikedVideo(
                 source=lv.source,
                 youtube_video_id=vid,
-                title=lv.title,
-                channel_title=lv.channel_title,
+                title=_clip(lv.title, 1024),
+                channel_title=_clip(lv.channel_title, 512),
                 url=lv.url,
                 liked_at=lv.liked_at,
                 video_id=video_pk,
@@ -1629,15 +1639,24 @@ def run_takeout_import_job(session: Session, settings: Settings, job_id: int) ->
                 raise TakeoutError(f"unknown job import_kind: {import_kind!r}")
     except Exception as exc:  # noqa: BLE001
         tracemalloc.stop()
+        # The failing flush may have poisoned the session (PendingRollbackError);
+        # roll back first so the failure status actually persists (otherwise the
+        # session row is left stuck "running").
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        row = get_import_session(session, session_id) if session_id else None
+        job = session.get(Job, job_id)
         if row is not None:
             row.status = "failed"
             row.finished_at = utcnow()
             row.current_phase = "failed"
-            session.flush()
-        job.status = "failed"
-        job.error_message = f"takeout import: {exc}"
-        job.finished_at = utcnow()
-        session.flush()
+        if job is not None:
+            job.status = "failed"
+            job.error_message = f"takeout import: {exc}"[:2000]
+            job.finished_at = utcnow()
+        session.commit()
         raise
     _cur, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
@@ -1925,6 +1944,666 @@ def cleanup_import_sessions(
         "keep_last": keep_last,
         "older_than_days": older_than_days,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6F: scheduled auto-cleanup of import sessions (sessions only)
+# --------------------------------------------------------------------------- #
+def _cleanup_status_path(settings: Settings) -> Path:
+    return settings.config_root / "takeout_session_cleanup_status.json"
+
+
+def _read_cleanup_status_file(settings: Settings) -> dict:
+    try:
+        p = _cleanup_status_path(settings)
+        if p.is_file():
+            return json.loads(p.read_text("utf-8")) or {}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def cleanup_status(settings: Settings) -> dict:
+    """Auto-cleanup configuration + last run result (Phase 6F)."""
+    st = _read_cleanup_status_file(settings)
+    enabled = settings.takeout_import_session_cleanup_enabled
+    interval = max(1, settings.takeout_import_session_cleanup_interval_hours)
+    keep_last = settings.takeout_import_session_keep_last
+    retention = settings.takeout_import_session_retention_days
+    last_run_at = st.get("last_run_at")
+    next_due_at = None
+    if enabled and (keep_last or retention):
+        if last_run_at:
+            try:
+                nxt = datetime.fromisoformat(last_run_at) + timedelta(hours=interval)
+                next_due_at = nxt.isoformat()
+            except ValueError:
+                next_due_at = None
+        # no last run -> due now (next_due_at stays None == "now")
+    return {
+        "enabled": enabled,
+        "interval_hours": interval,
+        "keep_last": keep_last,
+        "retention_days": retention,
+        "last_run_at": last_run_at,
+        "last_result": st.get("last_result"),
+        "next_due_at": next_due_at,
+    }
+
+
+def auto_cleanup_import_sessions(
+    session: Session, settings: Settings, *, now: datetime | None = None, force: bool = False,
+) -> dict:
+    """Scheduler-driven session prune (Phase 6F).
+
+    Runs at most every ``CLEANUP_INTERVAL_HOURS`` and ONLY when enabled + at
+    least one retention bound is set. Deletes ONLY import-session rows (never
+    jobs / imported data; ``cleanup_import_sessions`` enforces this). The last
+    result + timestamp are persisted to a status file so CLI/API can report it.
+    ``force`` bypasses the enabled/interval gates (used by ``cleanup-auto``).
+    """
+    now = now or utcnow()
+    keep_last = settings.takeout_import_session_keep_last
+    retention = settings.takeout_import_session_retention_days
+    interval = max(1, settings.takeout_import_session_cleanup_interval_hours)
+
+    if not force and not settings.takeout_import_session_cleanup_enabled:
+        return {"ran": False, "reason": "auto cleanup disabled", **cleanup_status(settings)}
+    if not keep_last and not retention:
+        return {"ran": False, "reason": "no retention bounds set (keep_last/retention_days)",
+                **cleanup_status(settings)}
+
+    if not force:
+        st = _read_cleanup_status_file(settings)
+        last = st.get("last_run_at")
+        if last:
+            try:
+                if now - datetime.fromisoformat(last) < timedelta(hours=interval):
+                    return {"ran": False, "reason": "not due yet", **cleanup_status(settings)}
+            except ValueError:
+                pass
+
+    res = cleanup_import_sessions(
+        session, keep_last=keep_last, older_than_days=retention, dry_run=False, now=now,
+    )
+    # persist status (fail-safe; never break the scheduler)
+    try:
+        settings.config_root.mkdir(parents=True, exist_ok=True)
+        _cleanup_status_path(settings).write_text(
+            json.dumps({"last_run_at": now.isoformat(), "last_result": res}, ensure_ascii=False),
+            "utf-8",
+        )
+    except OSError:
+        logger.warning("takeout: could not persist cleanup status file")
+    logger.info("takeout auto-cleanup: %s", res)
+    return {"ran": True, "reason": "applied", "result": res, **cleanup_status(settings)}
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6F: large-import preflight / runner / post-import verify
+# --------------------------------------------------------------------------- #
+_LARGE_KINDS = ("liked_videos", "watch_history", "search_history")
+_KIND_DBSTAT = {
+    "liked_videos": "liked_videos",
+    "watch_history": "watch_history_events",
+    "search_history": "search_history_events",
+}
+_KIND_BLOB_MODEL = {
+    "liked_videos": LikedVideo,
+    "watch_history": WatchHistoryEvent,
+    "search_history": SearchHistoryEvent,
+}
+# Forbidden substrings for the import leak check (no raw blobs / secrets / host
+# absolute paths in session or job metadata).
+_LEAK_PATTERNS = (
+    '"raw_json":', "po_token", "visitor_data", "cookie", "secret",
+    "BEGIN ", "/Users/", "/home/", "/takeout_imports/",
+)
+
+
+def _pf(name: str, status: str, detail: str) -> dict:
+    return {"name": name, "status": status, "detail": detail}
+
+
+def _resolve_large_kinds(kind: str) -> list[str]:
+    if kind == "all":
+        return ["liked_videos", "watch_history"]
+    if kind in _LARGE_KINDS:
+        return [kind]
+    raise TakeoutError(f"unknown kind: {kind!r} (liked_videos|watch_history|search_history|all)")
+
+
+def _first_fail(checks: list[dict]) -> str:
+    for c in checks:
+        if c["status"] == "fail":
+            return c["detail"]
+    return "preflight failed"
+
+
+def preflight_large(
+    session: Session, settings: Settings, path: str, *, kind: str = "all", sample_limit: int = 5000,
+) -> dict:
+    """Quick go/no-go for a large import: ZIP present, ijson parser, a bounded
+    sample benchmark per kind, current DB counts, and a recommended command.
+
+    Bounded (``sample_limit``) so it stays fast; run ``benchmark-large`` for the
+    full-scan numbers. No raw_json / content / host path is returned.
+    """
+    from app.services import db_stats as dbs
+
+    kinds = _resolve_large_kinds(kind)
+    checks: list[dict] = []
+    try:
+        zip_path = resolve_takeout_path(settings, path)
+        basename = zip_path.name
+        checks.append(_pf("zip_exists", "ok", f"found {basename}"))
+    except TakeoutError as exc:
+        # Surface the reason WITHOUT the absolute path.
+        reason = "zip not found / not under takeout root"
+        if "not a .zip" in str(exc):
+            reason = "not a .zip file"
+        checks.append(_pf("zip_exists", "fail", reason))
+        return {
+            "ok": False, "path_basename": Path(path).name, "parser_backend": None,
+            "checks": checks, "results": {}, "recommended_command": None,
+        }
+
+    parser = parser_backend()
+    checks.append(_pf(
+        "parser_backend", "ok" if parser == "ijson" else "warn",
+        f"parser={parser}" + ("" if parser == "ijson" else " (install ijson for huge files)"),
+    ))
+
+    stats = dbs.db_stats(session)
+    results: dict[str, dict] = {}
+    for k in kinds:
+        try:
+            b = benchmark(session, settings, path, kind=k, limit=sample_limit, dry_run=True)
+            results[k] = {
+                "sample_scanned": b["scanned"],
+                "entries_per_second": b.get("entries_per_second"),
+                "peak_memory_mb": b.get("peak_memory_mb"),
+                "parser_backend": b.get("parser_backend"),
+                "current_db_count": stats.get(_KIND_DBSTAT[k], 0),
+                "source_kind": b.get("source_kind"),
+            }
+            checks.append(_pf(
+                f"benchmark:{k}", "ok",
+                f"sample scanned={b['scanned']} eps={b.get('entries_per_second')} "
+                f"peak={b.get('peak_memory_mb')}MB; current DB rows={stats.get(_KIND_DBSTAT[k], 0)}",
+            ))
+        except TakeoutError as exc:
+            checks.append(_pf(f"benchmark:{k}", "fail", str(exc)))
+
+    checks.append(_pf(
+        "db_stats", "ok",
+        f"dialect={stats['dialect']} raw_json_stored_total={stats['raw_json_stored_total']}",
+    ))
+    checks.append(_pf(
+        "raw_json_policy", "ok",
+        "recommended: import-large keeps --no-raw-json by default (drops raw blobs, "
+        "keeps normalized fields)",
+    ))
+
+    ok = not any(c["status"] == "fail" for c in checks)
+    rec = (
+        f"archiver takeout import-large {basename} --kind {kind} --limit 1000 --apply"
+        if ok else None
+    )
+    return {
+        "ok": ok, "path_basename": basename, "parser_backend": parser,
+        "checks": checks, "results": results, "recommended_command": rec,
+    }
+
+
+def import_large(
+    session: Session, settings: Settings, path: str, *, kind: str = "all",
+    limit: int | None = None, apply: bool = False, store_raw_json: bool = False,
+    as_job: bool = True, skip_preflight: bool = False,
+) -> dict:
+    """Safe large-import runner (Phase 6F).
+
+    Safe defaults: ``dry_run`` (``--apply`` required to write), ``no-raw-json``,
+    and background ``job``. Runs preflight first; an ``--apply`` job is BLOCKED
+    if system preflight fails (e.g. a stale worker) or the ZIP/parser preflight
+    fails. ``skip_preflight`` bypasses the gate (NOT recommended).
+    """
+    from app.services import jobs as jobs_svc
+    from app.services import preflight as pf
+
+    dry_run = not apply
+    kinds = _resolve_large_kinds(kind)
+    base = {
+        "ok": False, "kind": kind, "dry_run": dry_run, "store_raw_json": store_raw_json,
+        "as_job": as_job, "preflight_ok": None, "items": [],
+        "recommended_progress_command": None, "recommended_db_stats_command": None,
+        "message": None,
+    }
+
+    preflight_ok: bool | None = None
+    if not skip_preflight:
+        large = preflight_large(session, settings, path, kind=kind)
+        if not large["ok"]:
+            return {**base, "preflight_ok": False,
+                    "message": f"preflight-large failed: {_first_fail(large['checks'])}"}
+        # An apply-via-job needs a healthy, build-matched worker; dry-run does not.
+        sysrep = pf.system_preflight(session, settings)
+        if apply and as_job and not sysrep["ok"]:
+            return {**base, "preflight_ok": False,
+                    "message": f"system preflight failed (no import): {_first_fail(sysrep['checks'])}"}
+        preflight_ok = large["ok"] and (sysrep["ok"] if (apply and as_job) else True)
+
+    runners = {
+        "liked_videos": run_import_liked_videos,
+        "watch_history": run_import,
+        "search_history": run_import_search,
+    }
+    items: list[dict] = []
+    for k in kinds:
+        if dry_run:
+            res = runners[k](
+                session, settings, path, limit=limit, dry_run=True, store_raw_json=store_raw_json,
+            )
+            session.commit()
+            items.append({
+                "kind": k, "session_id": res.get("session_id"), "job_id": res.get("job_id"),
+                "dry_run": True, "store_raw_json": store_raw_json,
+                "scanned": res.get("scanned"), "would_import": res.get("imported_count"),
+                "rq_submitted": False,
+            })
+        elif as_job:
+            job, row = create_import_job(
+                session, settings, import_kind=k, path=path, limit=limit,
+                dry_run=False, store_raw_json=store_raw_json,
+            )
+            session.commit()
+            rq_id = None
+            try:
+                rq_id = jobs_svc.submit_job(job.id)
+                if rq_id:
+                    j = session.get(Job, job.id)
+                    j.rq_job_id = rq_id
+                    session.commit()
+            except Exception:  # noqa: BLE001 - Redis down; job stays queued
+                pass
+            items.append({
+                "kind": k, "session_id": row.session_id, "job_id": job.id,
+                "dry_run": False, "store_raw_json": store_raw_json, "rq_submitted": bool(rq_id),
+            })
+        else:  # synchronous apply (no background job) — small/explicit use
+            res = runners[k](
+                session, settings, path, limit=limit, dry_run=False, store_raw_json=store_raw_json,
+            )
+            session.commit()
+            items.append({
+                "kind": k, "session_id": res.get("session_id"), "job_id": res.get("job_id"),
+                "dry_run": False, "store_raw_json": store_raw_json,
+                "imported": res.get("imported_count"), "rq_submitted": False,
+            })
+
+    return {
+        **base, "ok": True, "preflight_ok": preflight_ok, "items": items,
+        "recommended_progress_command": "archiver takeout verify-import --latest"
+        + (f" --kind {kind}" if kind != "all" else ""),
+        "recommended_db_stats_command": "archiver storage db-stats",
+        "message": "dry-run (no writes) — re-run with --apply to import"
+        if dry_run else "import submitted",
+    }
+
+
+def verify_import(
+    session: Session, settings: Settings, *, session_id: str | None = None,
+    latest: bool = False, kind: str | None = None,
+) -> dict:
+    """Post-import inspection (Phase 6F): session outcome + DB stats + real
+    raw_json blob counts + a leak grep (no secrets / host paths in metadata) +
+    job status. Read-only."""
+    from app.services import db_stats as dbs
+
+    row = None
+    if session_id:
+        row = get_import_session(session, session_id)
+    elif latest:
+        rows = list_import_sessions(session, import_kind=kind, limit=1)
+        row = rows[0] if rows else None
+    if row is None:
+        # session_id=None signals "not found" to the API (404) / CLI.
+        return {"ok": False, "session_id": None,
+                "checks": [_pf("session_found", "fail", "import session not found")]}
+
+    meta = row.meta or {}
+    checks: list[dict] = [_pf("session_found", "ok", f"session {row.session_id}")]
+
+    # status
+    if row.status == "success":
+        checks.append(_pf("status", "ok", "import succeeded"))
+    elif row.status in ("running",):
+        checks.append(_pf("status", "warn", "import still running"))
+    else:
+        checks.append(_pf("status", "fail", f"import status={row.status}"))
+
+    # job status / worker error
+    job_status = None
+    worker_error = None
+    if row.job_id:
+        job = session.get(Job, row.job_id)
+        if job is not None:
+            job_status = job.status
+            worker_error = job.error_message
+            checks.append(_pf(
+                "job_status", "ok" if job.status in ("success", None) else "fail",
+                f"job #{row.job_id} status={job.status}",
+            ))
+
+    # DB stats + real raw_json blobs (db_stats already excludes JSON-null)
+    stats = dbs.db_stats(session)
+    real_blobs = stats.get("raw_json_stored", {})
+
+    # no-raw-json consistency: a no-raw-json run should have skipped == imported
+    store_raw = meta.get("store_raw_json")
+    if store_raw is False:
+        skipped = meta.get("raw_json_skipped_count")
+        stored = meta.get("raw_json_stored_count")
+        if stored in (0, None):
+            checks.append(_pf("raw_json_policy", "ok",
+                              f"no-raw-json honored (skipped={skipped}, stored={stored or 0})"))
+        else:
+            checks.append(_pf("raw_json_policy", "fail",
+                              f"store_raw_json=False but stored={stored}"))
+    elif store_raw is True:
+        checks.append(_pf("raw_json_policy", "warn",
+                          "raw_json ON for this session (DB growth — consider --no-raw-json)"))
+
+    # leak grep over session + job metadata (never content)
+    import json as _json
+
+    blob = _json.dumps({"session_meta": meta, "path_basename": row.path_basename,
+                        "source_kind": row.source_kind}, ensure_ascii=False)
+    if row.job_id:
+        job = session.get(Job, row.job_id)
+        blob += _json.dumps(getattr(job, "meta", {}) or {}, ensure_ascii=False)
+    findings = [p for p in _LEAK_PATTERNS if p in blob]
+    leak_ok = not findings
+    checks.append(_pf("leak_check", "ok" if leak_ok else "fail",
+                      "no secrets / raw blob / host path in metadata" if leak_ok
+                      else f"found: {findings}"))
+
+    ok = leak_ok and row.status == "success" and (job_status in ("success", None)) \
+        and not any(c["status"] == "fail" for c in checks)
+    return {
+        "ok": ok,
+        "session_id": row.session_id,
+        "import_kind": row.import_kind,
+        "status": row.status,
+        "scanned": row.scanned,
+        "imported": row.imported,
+        "skipped_duplicate": row.skipped_duplicate,
+        "updated": row.updated,
+        "failed": row.failed,
+        "parser_backend": row.parser_backend,
+        "entries_per_second": row.entries_per_second,
+        "peak_memory_mb": row.peak_memory_mb,
+        "store_raw_json": meta.get("store_raw_json"),
+        "raw_json_stored_count": meta.get("raw_json_stored_count"),
+        "raw_json_skipped_count": meta.get("raw_json_skipped_count"),
+        "job_id": row.job_id,
+        "job_status": job_status,
+        "worker_error": worker_error,
+        "db_stats": {
+            "dialect": stats["dialect"], "total_size_mb": stats["total_size_mb"],
+            "videos": stats["videos"], "liked_videos": stats["liked_videos"],
+            "watch_history_events": stats["watch_history_events"],
+            "search_history_events": stats["search_history_events"],
+            "raw_json_stored_total": stats["raw_json_stored_total"],
+        },
+        "raw_json_real_blobs": real_blobs,
+        "leak_check_ok": leak_ok,
+        "leak_findings": findings,
+        "checks": checks,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6G: staged production import + resume info + operation report
+# --------------------------------------------------------------------------- #
+# Cumulative per-stage limits. The final ``None`` = full import (gated behind
+# allow_full so a 90k import is never started accidentally).
+_STAGE_LIMITS = {
+    "liked_videos": [100, 1000, 5000, None],
+    "watch_history": [1000, 10000, 50000, None],
+    "search_history": [1000, 10000, 50000, None],
+}
+
+
+def _wait_for_job(job_id: int, *, timeout: float = 1800.0, interval: float = 2.0) -> str:
+    """Poll a job to a terminal state in fresh sessions (used by staged apply
+    with background jobs). Returns the final status or 'timeout'."""
+    from app.db import session_scope
+
+    waited = 0.0
+    while waited < timeout:
+        with session_scope() as s:
+            j = s.get(Job, job_id)
+            if j is not None and j.status in ("success", "failed", "canceled"):
+                return j.status
+        time.sleep(interval)
+        waited += interval
+    return "timeout"
+
+
+def recent_sessions(
+    session: Session, *, import_kind: str | None = None, path_basename: str | None = None,
+    limit: int = 5,
+) -> list[dict]:
+    """Compact recent-session list for resume/rerun decisions (counts only)."""
+    stmt = select(TakeoutImportSession).order_by(TakeoutImportSession.id.desc())
+    if import_kind:
+        stmt = stmt.where(TakeoutImportSession.import_kind == import_kind)
+    if path_basename:
+        stmt = stmt.where(TakeoutImportSession.path_basename == path_basename)
+    rows = list(session.scalars(stmt.limit(limit)))
+    return [
+        {
+            "session_id": r.session_id, "import_kind": r.import_kind, "status": r.status,
+            "dry_run": r.dry_run, "scanned": r.scanned, "imported": r.imported,
+            "skipped_duplicate": r.skipped_duplicate, "started_at": r.started_at.isoformat() if r.started_at else None,
+            "job_id": r.job_id,
+        }
+        for r in rows
+    ]
+
+
+def import_staged(
+    settings: Settings, path: str, *, kind: str = "all", apply: bool = False,
+    store_raw_json: bool = False, as_job: bool = True, skip_preflight: bool = False,
+    allow_full: bool = False, max_stage: int | None = None, wait_timeout: float = 1800.0,
+) -> dict:
+    """Staged production import (Phase 6G). Manages its own DB sessions.
+
+    dry-run (default): preflight + per-kind full benchmark + the staged PLAN — no
+    writes. apply: runs each stage (cumulative limit) with verify + db-stats
+    between stages; the final FULL stage runs only with ``allow_full``. Safe
+    defaults: no-raw-json, background job, preflight-gated (an --apply job is
+    blocked when system preflight fails, e.g. a stale worker).
+    """
+    from app.db import session_scope
+    from app.services import db_stats as dbs
+    from app.services import jobs as jobs_svc
+    from app.services import preflight as pf
+
+    dry_run = not apply
+    try:
+        kinds = _resolve_large_kinds(kind)
+    except TakeoutError as exc:
+        return {"ok": False, "kind": kind, "dry_run": dry_run, "message": str(exc),
+                "stages": [], "plan": {}, "prior_sessions": [], "preflight_ok": None}
+
+    out: dict = {
+        "ok": False, "kind": kind, "dry_run": dry_run, "store_raw_json": store_raw_json,
+        "as_job": as_job, "allow_full": allow_full, "preflight_ok": None,
+        "plan": {k: ["full" if v is None else v for v in _STAGE_LIMITS[k]] for k in kinds},
+        "prior_sessions": [], "stages": [], "message": None, "recommended_next": None,
+    }
+
+    base_name = Path(path).name
+
+    # ---- resume/rerun info: prior sessions for these kinds + this file ----
+    with session_scope() as s:
+        prior: list[dict] = []
+        for k in kinds:
+            prior += recent_sessions(s, import_kind=k, path_basename=base_name, limit=3)
+        out["prior_sessions"] = prior
+
+    # ---- preflight (system + large) ----
+    if not skip_preflight:
+        with session_scope() as s:
+            large = preflight_large(s, settings, path, kind=kind)
+            sysrep = pf.system_preflight(s, settings)
+        if not large["ok"]:
+            out["message"] = f"preflight-large failed: {_first_fail(large['checks'])}"
+            out["preflight_ok"] = False
+            return out
+        if apply and as_job and not sysrep["ok"]:
+            out["message"] = f"system preflight failed (no import): {_first_fail(sysrep['checks'])}"
+            out["preflight_ok"] = False
+            return out
+        out["preflight_ok"] = large["ok"] and (sysrep["ok"] if (apply and as_job) else True)
+
+    # ---- dry-run: benchmark per kind + plan only ----
+    if dry_run:
+        for k in kinds:
+            with session_scope() as s:
+                b = benchmark(s, settings, path, kind=k, limit=None, dry_run=True)
+            out["stages"].append({
+                "kind": k, "stage": "benchmark", "limit": None, "status": "dry_run",
+                "scanned": b["scanned"], "would_import": b["imported"],
+                "eps": b.get("entries_per_second"), "peak_memory_mb": b.get("peak_memory_mb"),
+            })
+        out["ok"] = True
+        out["message"] = "dry-run plan (no writes) — re-run with --apply to execute stages"
+        out["recommended_next"] = f"archiver takeout import-staged {base_name} --kind {kind} --apply"
+        return out
+
+    # ---- apply: execute stages with verify + db-stats between ----
+    runners = {
+        "liked_videos": run_import_liked_videos,
+        "watch_history": run_import,
+        "search_history": run_import_search,
+    }
+    for k in kinds:
+        for i, lim in enumerate(_STAGE_LIMITS[k]):
+            is_full = lim is None
+            if is_full and not allow_full:
+                out["stages"].append({"kind": k, "stage": i + 1, "limit": "full",
+                                       "status": "skipped_needs_allow_full"})
+                continue
+            if max_stage is not None and (i + 1) > max_stage:
+                break
+
+            with session_scope() as s:
+                size_before = dbs.db_stats(s)["total_size_mb"]
+
+            if as_job:
+                with session_scope() as s:
+                    job, row = create_import_job(
+                        s, settings, import_kind=k, path=path, limit=lim,
+                        dry_run=False, store_raw_json=store_raw_json,
+                    )
+                    s.commit()
+                    jid, sid = job.id, row.session_id
+                try:
+                    rq_id = jobs_svc.submit_job(jid)
+                    if rq_id:
+                        with session_scope() as s:
+                            jj = s.get(Job, jid)
+                            jj.rq_job_id = rq_id
+                            s.commit()
+                except Exception:  # noqa: BLE001 - Redis down; job stays queued
+                    pass
+                status = _wait_for_job(jid, timeout=wait_timeout)
+            else:
+                with session_scope() as s:
+                    res = runners[k](s, settings, path, limit=lim, dry_run=False,
+                                     store_raw_json=store_raw_json)
+                    s.commit()
+                    jid, sid = res.get("job_id"), res.get("session_id")
+                status = "success"
+
+            with session_scope() as s:
+                v = verify_import(s, settings, session_id=sid)
+                size_after = dbs.db_stats(s)["total_size_mb"]
+
+            out["stages"].append({
+                "kind": k, "stage": i + 1, "limit": "full" if is_full else lim,
+                "session_id": sid, "job_id": jid, "status": status,
+                "scanned": v["scanned"], "imported": v["imported"],
+                "skipped": v["skipped_duplicate"], "updated": v["updated"], "failed": v["failed"],
+                "eps": v["entries_per_second"], "peak_memory_mb": v["peak_memory_mb"],
+                "raw_json_stored": v["raw_json_stored_count"], "raw_json_skipped": v["raw_json_skipped_count"],
+                "db_size_mb_before": size_before, "db_size_mb_after": size_after,
+                "verify_ok": v["ok"],
+            })
+            if status != "success":
+                out["message"] = f"stage {i + 1} ({k}) status={status}; stopping (re-run is dedup-safe)"
+                out["ok"] = False
+                return out
+
+    out["ok"] = True
+    if not allow_full:
+        out["message"] = "staged apply complete (bounded stages). Re-run with --allow-full for the full import."
+        out["recommended_next"] = f"archiver takeout import-staged {base_name} --kind {kind} --apply --allow-full"
+    else:
+        out["message"] = "staged apply complete (through full import)."
+        out["recommended_next"] = "archiver takeout import-report --latest"
+    return out
+
+
+def import_report(
+    session: Session, settings: Settings, *, session_id: str | None = None,
+    latest: bool = False, kind: str | None = None, recent: int | None = None,
+) -> dict:
+    """Operation report (Phase 6G). Wraps ``verify_import`` and adds a
+    recommended next action. With ``recent`` returns a list of compact reports.
+    No raw_json / history body / secrets / host paths."""
+    if recent:
+        rows = list_import_sessions(session, import_kind=kind, limit=recent)
+        reports = []
+        for r in rows:
+            v = verify_import(session, settings, session_id=r.session_id)
+            reports.append({
+                "session_id": v["session_id"], "import_kind": v["import_kind"],
+                "status": v["status"], "imported": v["imported"], "scanned": v["scanned"],
+                "skipped_duplicate": v["skipped_duplicate"], "store_raw_json": v["store_raw_json"],
+                "job_status": v["job_status"], "leak_check_ok": v["leak_check_ok"],
+                "ok": v["ok"], "recommended_next_action": _report_next_action(v),
+            })
+        return {"reports": reports, "count": len(reports)}
+
+    v = verify_import(session, settings, session_id=session_id, latest=latest, kind=kind)
+    if not v.get("session_id"):
+        return {"ok": False, "session_id": None, "recommended_next_action": "session not found",
+                **v}
+    row = get_import_session(session, v["session_id"])
+    v["path_basename"] = row.path_basename if row else None
+    v["started_at"] = row.started_at.isoformat() if row and row.started_at else None
+    v["finished_at"] = row.finished_at.isoformat() if row and row.finished_at else None
+    v["recommended_next_action"] = _report_next_action(v)
+    return v
+
+
+def _report_next_action(v: dict) -> str:
+    if not v.get("leak_check_ok", True):
+        return "ALERT: leak check failed — investigate session/job metadata before continuing."
+    status = v.get("status")
+    if status == "failed" or v.get("job_status") == "failed":
+        return ("import failed — check worker_error, then re-run import-staged "
+                "(re-import is dedup-safe; already-imported rows are skipped).")
+    if status == "running":
+        return "import still running — monitor with `verify-import --latest`."
+    if v.get("store_raw_json") is True:
+        return ("success, but raw_json is ON (DB growth) — confirm db-stats; "
+                "consider --no-raw-json for the remaining stages.")
+    return "success — proceed to the next stage (or full import) and re-run verify/db-stats."
 
 
 def list_import_sessions(session: Session, *, import_kind: str | None = None, limit: int = 50) -> list:

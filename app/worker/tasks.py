@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import time
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
@@ -91,6 +93,29 @@ def run_job(job_id: int) -> None:
 # --------------------------------------------------------------------------- #
 # download
 # --------------------------------------------------------------------------- #
+def compute_liked_job_delay(
+    settings: Settings, *, is_liked: bool, is_liked_metadata: bool,
+    jitter_fn: Callable[[float, float], float] = random.uniform,
+) -> float:
+    """Pure: per-job sleep (seconds) for a download job, base + optional jitter.
+
+    Phase 7L: liked METADATA jobs get their own (larger) delay PLUS a random
+    jitter in [0, liked_metadata_job_delay_jitter_seconds] so requests are not
+    perfectly periodic. ``jitter_fn`` is injectable for deterministic tests.
+    """
+    delay = settings.download_job_delay_seconds or 0.0
+    if is_liked_metadata and settings.liked_metadata_job_delay_seconds > 0:
+        # liked METADATA batches: throttle independently (Phase 7I/7K/7L) to reduce 429.
+        delay = max(delay, settings.liked_metadata_job_delay_seconds)
+        jitter = settings.liked_metadata_job_delay_jitter_seconds or 0.0
+        if jitter > 0:
+            delay += max(0.0, jitter_fn(0.0, jitter))
+    elif is_liked and settings.liked_archive_job_delay_seconds > 0:
+        # liked-archive (body) batches use the (usually larger) liked-archive delay.
+        delay = max(delay, settings.liked_archive_job_delay_seconds)
+    return delay
+
+
 def _run_download(settings: Settings, job_id: int) -> None:
     # Rate control: space out consecutive download jobs on a single worker so a
     # large expand / liked-archive batch does not hammer YouTube (avoids 429).
@@ -99,11 +124,11 @@ def _run_download(settings: Settings, job_id: int) -> None:
         url = job.url
         profile_name = job.profile_name or settings.default_profile
         is_liked = (job.meta or {}).get("source_action") == "liked_archive"
+        is_liked_metadata = is_liked and profile_name == "metadata_only"
 
-    delay = settings.download_job_delay_seconds or 0.0
-    if is_liked and settings.liked_archive_job_delay_seconds > 0:
-        # liked-archive batches use the (usually larger) liked-archive delay.
-        delay = max(delay, settings.liked_archive_job_delay_seconds)
+    delay = compute_liked_job_delay(
+        settings, is_liked=is_liked, is_liked_metadata=is_liked_metadata
+    )
     if delay and delay > 0:
         time.sleep(delay)
 

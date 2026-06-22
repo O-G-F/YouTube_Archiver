@@ -38,10 +38,15 @@ from app.schemas import (
     TakeoutImportSessionOut,
     TakeoutInspectOut,
     TakeoutImportRequest,
+    TakeoutCleanupStatusOut,
+    TakeoutImportReportOut,
     TakeoutPlaylistsPreviewOut,
+    TakeoutPreflightLargeOut,
+    TakeoutPreflightLargeRequest,
     TakeoutPreviewOut,
     TakeoutPreviewRequest,
     TakeoutRegistrySource,
+    TakeoutVerifyImportOut,
 )
 from app.services import jobs as jobs_svc
 from app.services import takeout
@@ -291,6 +296,53 @@ def takeout_benchmark_large(
     except takeout.TakeoutError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return TakeoutBenchmarkLargeOut(**result)
+
+
+@router.post("/preflight-large", response_model=TakeoutPreflightLargeOut)
+def takeout_preflight_large(
+    req: TakeoutPreflightLargeRequest, db: Session = Depends(get_db)
+) -> TakeoutPreflightLargeOut:
+    """Quick go/no-go before a large import (ZIP/parser/sample bench/DB counts)."""
+    try:
+        result = takeout.preflight_large(
+            db, get_settings(), req.path, kind=req.kind, sample_limit=req.sample_limit
+        )
+    except takeout.TakeoutError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return TakeoutPreflightLargeOut(**result)
+
+
+@router.get("/import-sessions/cleanup-status", response_model=TakeoutCleanupStatusOut)
+def takeout_cleanup_status(db: Session = Depends(get_db)) -> TakeoutCleanupStatusOut:
+    """Auto session-cleanup config + last run result (Phase 6F)."""
+    return TakeoutCleanupStatusOut(**takeout.cleanup_status(get_settings()))
+
+
+@router.get("/import-sessions/{session_id}/verify", response_model=TakeoutVerifyImportOut)
+def takeout_verify_import(session_id: str, db: Session = Depends(get_db)) -> TakeoutVerifyImportOut:
+    """Post-import inspection: outcome + DB stats + raw_json blobs + leak grep."""
+    result = takeout.verify_import(db, get_settings(), session_id=session_id)
+    if not result.get("session_id"):
+        raise HTTPException(status_code=404, detail="import session not found")
+    return TakeoutVerifyImportOut(**result)
+
+
+@router.get("/import-report/latest", response_model=TakeoutImportReportOut)
+def takeout_import_report_latest(db: Session = Depends(get_db)) -> TakeoutImportReportOut:
+    """Operation report for the most recent import session (Phase 6G)."""
+    result = takeout.import_report(db, get_settings(), latest=True)
+    if not result.get("session_id"):
+        raise HTTPException(status_code=404, detail="no import sessions yet")
+    return TakeoutImportReportOut(**result)
+
+
+@router.get("/import-report/{session_id}", response_model=TakeoutImportReportOut)
+def takeout_import_report(session_id: str, db: Session = Depends(get_db)) -> TakeoutImportReportOut:
+    """Operation report for one import session (Phase 6G)."""
+    result = takeout.import_report(db, get_settings(), session_id=session_id)
+    if not result.get("session_id"):
+        raise HTTPException(status_code=404, detail="import session not found")
+    return TakeoutImportReportOut(**result)
 
 
 @router.post("/import-sessions/cleanup", response_model=TakeoutSessionCleanupOut)

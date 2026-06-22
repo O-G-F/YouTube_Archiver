@@ -829,6 +829,19 @@ def run_forever(settings: Settings | None = None) -> None:
             run_once(settings, reason="scheduler")
         except Exception:  # noqa: BLE001 - never let the loop die
             logger.exception("scheduler: run_once iteration failed")
+        # Phase 6F: scheduled Takeout import-session cleanup (sessions only;
+        # interval-gated + enabled-gated internally; never jobs/imported data).
+        if settings.takeout_import_session_cleanup_enabled:
+            try:
+                from app.services import takeout as _tk
+
+                with session_scope() as s:
+                    res = _tk.auto_cleanup_import_sessions(s, settings)
+                    s.commit()
+                if res.get("ran"):
+                    logger.info("scheduler: takeout session cleanup %s", res.get("result"))
+            except Exception:  # noqa: BLE001 - never let cleanup break the loop
+                logger.exception("scheduler: takeout session cleanup failed")
         time.sleep(interval)
 
 

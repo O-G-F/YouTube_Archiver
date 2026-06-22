@@ -20,6 +20,7 @@ from app.schemas import (
     LikedArchiveEnqueueOut,
     LikedArchivePlanOut,
     LikedArchiveRequest,
+    LikedFailureBreakdownOut,
     LikedProgressHistoryOut,
     LikedProgressHistoryPoint,
     LikedProgressOut,
@@ -106,7 +107,7 @@ def list_liked_videos(
     for lv, video in rows:
         bc = body_map.get(video.id, 0) if video is not None else 0
         mc = meta_map.get(video.id, 0) if video is not None else 0
-        has_meta = bool(video is not None and (video.title or mc > 0))
+        has_meta = bool(video is not None and mc > 0)  # Phase 7H: real fetched metadata (info_json)
         has_body = bc > 0
         if only_missing_metadata and has_meta:
             continue
@@ -144,11 +145,14 @@ def liked_videos_stats(db: Session = Depends(get_db)) -> LikedVideoStatsOut:
     linked = int(
         db.scalar(select(func.count(LikedVideo.id)).where(LikedVideo.video_id.is_not(None))) or 0
     )
+    # Phase 7H: "metadata fetched" = a real metadata media file (info_json etc.)
+    # exists for the linked Video — a Takeout title-only stub does NOT count.
     fetched = int(
         db.scalar(
-            select(func.count(LikedVideo.id))
+            select(func.count(func.distinct(LikedVideo.id)))
             .join(Video, Video.id == LikedVideo.video_id)
-            .where(Video.title.is_not(None))
+            .join(MediaFile, MediaFile.video_id == Video.id)
+            .where(MediaFile.media_type.in_(la.META_MEDIA_TYPES))
         )
         or 0
     )
@@ -171,6 +175,13 @@ def liked_videos_stats(db: Session = Depends(get_db)) -> LikedVideoStatsOut:
 def liked_progress(db: Session = Depends(get_db)) -> LikedProgressOut:
     """Liked-archive progress dashboard data (no personal data / raw_json)."""
     return LikedProgressOut(**la.progress(db, get_settings()))
+
+
+@router.get("/failure-breakdown", response_model=LikedFailureBreakdownOut)
+def liked_failure_breakdown(db: Session = Depends(get_db)) -> LikedFailureBreakdownOut:
+    """Phase 7H: failed/partial liked-archive jobs grouped by classification
+    reason (private/deleted/unavailable/network/rate_limited/unknown). Counts only."""
+    return LikedFailureBreakdownOut(**la.failure_breakdown(db))
 
 
 @router.get("/progress/history", response_model=LikedProgressHistoryOut)
@@ -244,7 +255,7 @@ def enqueue_metadata_v2(
     try:
         result = la.enqueue_metadata(
             db, get_settings(), filters=_filters(req), limit=req.limit,
-            profile=profile, dry_run=req.dry_run,
+            profile=profile, dry_run=req.dry_run, include_permanent=req.include_permanent,
         )
     except KeyError:
         raise HTTPException(status_code=400, detail=f"unknown profile: {profile!r}")

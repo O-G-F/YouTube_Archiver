@@ -21,7 +21,7 @@ dependencies = [
     "pydantic-settings>=2.3,<3",
     "typer>=0.12",
     "PyYAML>=6.0",
-    "yt-dlp>=2025.0.0",
+    "yt-dlp>=2026.6.9",
     "curl_cffi>=0.7",
 ]
 

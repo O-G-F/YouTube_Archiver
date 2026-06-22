@@ -6,6 +6,8 @@ import { fmtBytes } from "../lib/format";
 import { ErrorBox, Loading } from "../components/ui";
 import { TakeoutSessions } from "../components/TakeoutSessions";
 import { TakeoutDbStats } from "../components/TakeoutDbStats";
+import { TakeoutOps } from "../components/TakeoutOps";
+import { ProductionImportWizard } from "../components/ProductionImportWizard";
 import type { TakeoutBenchmark, TakeoutImportAll, TakeoutInspect, TakeoutPreview } from "../api/types";
 
 const KIND_LABEL: Record<string, string> = {
@@ -375,6 +377,8 @@ export default function Takeout() {
         )}
       </div>
 
+      <ProductionImportWizard path={path} />
+      <TakeoutOps path={path} />
       <TakeoutDbStats path={path} onChanged={() => setSessionsKey((k) => k + 1)} />
       <TakeoutSessions reloadKey={sessionsKey} />
     </div>

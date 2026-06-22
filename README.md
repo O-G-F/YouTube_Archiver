@@ -677,6 +677,11 @@ archiver liked-videos enqueue-archive --limit 1 --profile video_compressed_1080p
 archiver liked-videos enqueue-archive --limit 1 --profile video_compressed_1080p --now   # 本体 DL（少量）
 archiver liked-videos retryable [--reason rate_limited]
 archiver liked-videos retry-failed --limit 20 [--reason rate_limited] [--now]
+archiver liked-videos failures   # Phase 7H: 失敗を理由別に集計(private/deleted/unavailable/network/rate_limited/unknown)
+# Phase 7I: cookie/PO-token 対応 + metadata 安定全件取得
+archiver liked-videos metadata-run --limit 100 [--dry-run]   # rate-limit ゲート付き段階 metadata 取得
+archiver liked-videos metadata-run --all --confirm           # 全 missing（429 比率高で自動停止, exit 2）
+archiver liked-videos retry-metadata --retryable | --reason rate_limited   # retryable のみ再投入(permanent除外)
 ```
 
 - **video stub 連携**: `youtube_video_id` がある liked entry は `videos` に stub を作成/統合（既存があれば紐付け）。`title`/`channel` は取得できた範囲で補完し、後から `metadata_only` で詳細を埋められます。
@@ -1307,6 +1312,437 @@ archiver takeout import-liked-videos  PATH --safe-large --limit 100  --apply
 - cleanup は **session 行のみ削除**（job / import 済みデータは不可侵）。bounds 未指定で no-op、running は保護、dry-run 既定。
 - Takeout ZIP は Git 非管理。`metadata_only` 本体非保存・body DL 明示・`--remote-components ejs:github` + deno・ZIP path traversal 対策を維持。
 
+### 実運用安全化・自動cleanup・本番全件import手順化（Phase 6F）
+
+実運用で大容量 import を安全に回すための「事故防止」機能群。**stale worker（web と worker が別ビルド）** を import 前に検出し、preflight → import-large → verify-import の手順をコード化する。
+
+#### ⚠ stale worker 対策（最重要）
+
+**コード変更後は web だけでなく worker も必ず再ビルドすること**（6E 検証で worker が古いイメージのまま no-raw-json を無視した事故を踏まえた対策）。
+
+```bash
+docker compose build web worker migrate   # 必要なら --no-cache。全イメージを揃える
+docker compose up -d
+archiver system preflight                  # ← import 前に必ず実行（stale なら FAIL で止まる）
+```
+
+- 各プロセスは `build_id`（`APP_BUILD_ID` env、未設定なら `app/` ソースの content hash）を持つ。同一ソースから揃ってビルドすれば web と worker の `build_id` は一致。**古い worker は不一致 → preflight が FAIL**。
+- worker は起動時+定期に短 TTL の heartbeat（build_id 付き）を Redis に publish。preflight/health はそれを読んで「worker 生存・build 一致・takeout_import 処理可能」を判定。
+
+```bash
+archiver system build-info     # GET /api/system/build-info（app_version/build_id/schema_head）
+archiver system preflight      # DB/Redis/alembic head/web=worker build/worker稼働/パス可否（fail で exit 1）
+# GET /api/system/health/full … db/redis + workers + worker_build_match + schema_head_match
+```
+
+#### preflight-large（大容量 import 前チェック）
+
+```bash
+archiver takeout preflight-large PATH [--kind liked_videos|watch_history|all]
+# POST /api/takeout/preflight-large {"path","kind","sample_limit"}
+```
+
+- ZIP 存在（basename のみ表示）・parser=ijson・kind 別サンプル benchmark（eps/peak）・現在の DB 件数・raw_json 方針・推奨コマンドを表示。**dry-run のみ（書き込みなし）**。
+
+#### import-large（本番全件 import runner）
+
+```bash
+archiver takeout import-large PATH --kind watch_history                       # 既定 = dry-run + no-raw-json + job
+archiver takeout import-large PATH --kind watch_history --limit 1000 --apply   # 実行（段階的に limit を上げる）
+archiver takeout import-large PATH --kind all --apply                          # liked+watch
+```
+
+- **安全既定: dry-run（`--apply` 必須）/ no-raw-json（`--raw-json` で ON）/ background job（`--no-job` で同期）**。
+- **実行前に自動で preflight**（system + large）。`--apply` の job 実行は **system preflight が FAIL（例: stale worker）なら import せず中止**。`--skip-preflight` で回避可（非推奨）。
+- 出力: kind / session_id / job_id / dry_run / store_raw_json / 推奨 progress・db-stats コマンド。
+
+#### verify-import（import 後検査）
+
+```bash
+archiver takeout verify-import SESSION_ID
+archiver takeout verify-import --latest [--kind watch_history]
+# GET /api/takeout/import-sessions/{id}/verify
+```
+
+- session 結果（status/件数/eps/peak）・store_raw_json/raw_json カウント・**DB stats + raw_json 実 blob 数**・job status / worker error・**secret/cookie/絶対パスの漏洩 grep**（session/job メタのみ対象）。UI は各 session 行に “verify” ボタン。
+
+#### import session 自動 cleanup（session 行のみ）
+
+```bash
+archiver takeout sessions cleanup-auto --dry-run    # プレビュー
+archiver takeout sessions cleanup-auto --apply      # 即時実行（enabled/interval を無視して force）
+archiver takeout sessions cleanup-status            # 設定 + 直近 cleanup 結果
+# GET /api/takeout/import-sessions/cleanup-status
+```
+
+- config: `TAKEOUT_IMPORT_SESSION_CLEANUP_ENABLED` / `TAKEOUT_IMPORT_SESSION_CLEANUP_INTERVAL_HOURS`（+ 既存 `RETENTION_DAYS`/`KEEP_LAST`）。enabled かつ bound>0 のとき **scheduler が INTERVAL_HOURS ごとに自動 prune**（status は config 配下のファイルに記録）。
+- **削除対象は import session 行のみ。job も import 済みデータも削除しない。running session は保護。**
+
+#### 本番 watch 全件 import 推奨手順
+
+1. **backup**（DB バックアップ）→ 2. `docker compose build web worker migrate` → 3. `docker compose up -d`（migrate 実行）→ 4. `archiver system preflight`（PASS を確認）→ 5. `archiver takeout preflight-large myactivity.zip --kind watch_history` → 6. `archiver takeout benchmark-large myactivity.zip` → 7. `archiver takeout import-large myactivity.zip --kind watch_history --limit 1000 --apply` → 8. `archiver takeout verify-import --latest` → 9. `archiver storage db-stats` → 10. 問題なければ `--limit 10000` → 11. 最後に limit 無しで全件。
+- **raw_json を ON にする場合**: DB が肥大化（11k/90k で顕著）。`--raw-json` を付けたら verify-import / db-stats で増加量を必ず確認。
+- **rollback / retry**: import-large の job は冪等（再 import は video_id / (source,title,url) で dedup）。失敗時は verify-import で「どこまで進んだか」を確認し、同じ kind を再実行すれば未取込分のみ追加される。session cleanup は安全（データ非削除）なのでいつでも実行可。
+
+### セキュリティ / プライバシー（6F）
+
+- build-info / preflight / health/full / verify-import は **build_id・件数・集計・check 結果のみ**。raw_json 本文 / cookie / token / PO-token / visitor_data / Mac 絶対パスは返さない（worker heartbeat も build_id 等のみ）。
+- import-large は **dry-run / preflight / no-raw-json / job を安全既定**にし、stale worker 時は `--apply` を中止。
+- auto cleanup は **session 行のみ**（job / import 済みデータ不可侵・running 保護・bound 未設定で no-op）。
+
+### 本番全件importの段階実行・再開性・運用レポート（Phase 6G）
+
+実 liked 約11k / watch 約90k を **段階的に**（limit付き→全件）安全に取り込み、各段で verify + db-stats を挟み、運用レポート化する。6F の preflight / import-large / verify / db-stats を1コマンドの導線に統合。
+
+#### staged import runner
+
+```bash
+archiver takeout import-staged PATH --kind watch_history              # 既定 = dry-run（plan + benchmark、書き込みなし）
+archiver takeout import-staged PATH --kind watch_history --apply      # 段階実行（1000→10000→50000、各段で verify+db-stats）
+archiver takeout import-staged PATH --kind watch_history --apply --allow-full   # 最後の全件段を許可
+archiver takeout import-staged PATH --kind liked_videos --apply --max-stage 2   # 最初の2段だけ
+```
+
+- **段階 limit**: liked `100→1000→5000→full` / watch `1000→10000→50000→full`（累積。dedup で各段は差分のみ追加）。
+- **安全既定**: **dry-run（`--apply` 必須）/ no-raw-json（`--raw-json` で ON）/ background job（`--no-job` で同期）**。最初に system preflight + preflight-large を自動実行し、`--apply` の job は **system preflight 失敗（stale worker 等）で中止**。
+- **full 段は `--allow-full` 必須**（無いと skip して案内）。`--max-stage N` で N 段で停止。
+- 各段で保存: session_id / job_id / scanned / imported / skipped / updated / failed / eps / peak_memory_mb / raw_json stored・skipped / **db size before・after** / status / verify_ok。
+
+#### 再開 / 再実行の安全性（resume / rerun）
+
+- import-staged は実行前に**同じ kind / ファイル名の直近 session 履歴**を表示（`prior_sessions`）。
+- **再実行は冪等**: 重複は dedup（liked=youtube_video_id、watch=(source,video_id,watched_at)）で skip され、**破壊的変更にならない**。
+- **自動削除・自動巻き戻しはしない**（中断後は同じコマンドを再実行すれば未取込分のみ追加）。
+
+#### operation report
+
+```bash
+archiver takeout import-report --latest
+archiver takeout import-report SESSION_ID
+archiver takeout import-report --kind watch_history --recent 10
+# GET /api/takeout/import-report/latest ・ /api/takeout/import-report/{session_id}
+```
+
+- 内容: import 結果 + job 状態 + verify 結果 + db-stats + raw_json 保存有無 + **leak check** + **推奨次アクション**（成功→次段 / 失敗→worker_error 確認後に再実行[dedup安全] / raw_json ON→db-stats 確認 / leak→ALERT）。
+- **raw_json 本文 / 履歴本文 / 絶対パス / cookie・token 類は返さない。**
+
+#### UI: Production import wizard
+
+Takeout 画面に「**Production import wizard**」を追加。手順 1.System preflight → 2.Preflight large → 3.Dry-run benchmark → 4.Staged import（stage limit ボタン、**full は確認ダイアログ**）→ 5.Verify → 6.DB stats → 7.Report。各 step に OK/WARN/FAIL を表示、**no-raw-json は既定 ON**（raw-json 保存は「上級者向け・DB 肥大」と明示）、直近 report を表示。
+
+#### 本番 watch 全件 import 推奨手順（6G）
+
+1. `docker compose build web worker migrate`（**web/worker を必ず揃える**）→ 2. `docker compose up -d` → 3. `archiver system preflight`（PASS）→ 4. `archiver takeout import-staged myactivity.zip --kind watch_history`（dry-run plan 確認）→ 5. `archiver takeout import-staged myactivity.zip --kind watch_history --apply --max-stage 1`（1000 を投入し verify/db-stats を確認）→ 6. 問題なければ `--max-stage 2`（10000）→ `--max-stage 3`（50000）→ 7. **ユーザー確認の上** `--apply --allow-full`（全件）→ 8. `archiver takeout import-report --latest`。
+- **no-raw-json 推奨理由**: raw_json 本文は個人情報かつ DB 肥大化の主因（11k/90k で顕著）。正規化フィールド（video_id/title/channel/timestamp）は常に保持されるため、既定 OFF で運用に支障なし。
+- **DB 容量注意**: 全件取込前に `storage db-stats` で空き容量を確認。raw_json ON は容量を数倍に。
+- **cleanup との関係**: import 履歴 session は `sessions cleanup` / `cleanup-auto` で剪定可（**job・取込データは消えない**）。レポート用に直近数件は残すと良い。
+
+### セキュリティ / プライバシー（6G）
+
+- import-staged / import-report は **件数・集計・check・推奨アクションのみ**。raw_json 本文 / 履歴本文 / secret / cookie / token / 絶対パスを返さない。
+- 段階実行は **no-raw-json / preflight / verify を安全既定**。full 段は `--allow-full`（CLI）/ 確認ダイアログ（UI）でユーザー確認必須。re-run は dedup 安全で非破壊。
+
+### 本番全件import完了・運用固定（Phase 6H）
+
+実 `myactivity.zip`（約139MB）の liked / watch を **no-raw-json で全件 import 完了**。実機結果を記録し、日常運用手順を確定。
+
+#### 実本番 import 結果（PostgreSQL）
+
+| 指標 | before | after（全件） |
+|---|---|---|
+| liked_videos | 1,000 | **11,066** |
+| watch_history_events | 10,000 | **92,303** |
+| videos（stub 含む） | 1,000 | 11,066 |
+| raw_json_stored_total（実 blob） | 0 | **0** |
+| DB total size | 12.87 MB | **46.23 MB**（watch table 27.18MB） |
+
+- verify-import: 各段 / 最終とも `status=success`・`leak_check=clean`・`raw_json_real_blobs_total=0`。watch 全件 stage は scanned=92303 imported=27303（+既存65000）eps≈2215 peak≈108MB。
+- **no-raw-json 運用維持**: raw_json 実 blob は全工程で 0。正規化フィールド（video_id/title/channel/timestamp）は保持。
+- **段階実行**: liked `100→1000→5000→full`、watch `1000→10000→50000→full`。各段 dedup で差分のみ追加（既存分は skip）。full 段は `--allow-full` で実行。
+- secret/cookie/token/PO-token/visitor_data/`/Users`/`/takeout_imports` の漏洩 **なし**（API/CLI/log 全確認）。
+
+#### 実運用で踏んだ不具合と対処（6H で修正済み）
+
+- **長すぎる title による import 失敗**: 実 watch 履歴に **1024 文字超の title** があり、PostgreSQL の `VARCHAR(1024)` 制約で INSERT バッチが落ち、watch 全件 stage が途中失敗（SQLite テストでは未検出＝長さ非強制）。→ importer で **title(1024)/channel_title(512)/query(512) を column 上限に clip**（migration なし）。再ビルド後に再実行 → dedup で未取込分のみ追加され全件完了（**失敗時の自動削除・巻き戻しはなし**、再実行で安全に前進）。
+- **rolling recreate 直後の preflight 一時 STALE**: `docker compose up -d` 直後は旧 worker の heartbeat が TTL(90s) 切れ前に残り、preflight が一時的に STALE 表示。約90秒で自動解消（実害なし）。確実にしたい場合は `docker compose up -d --force-recreate worker` 後に数十秒待ってから preflight。
+
+#### 日常運用手順（確定版）
+
+```bash
+# 1. build（コード変更後は web/worker/migrate を必ず揃える）
+docker compose build web worker migrate && docker compose up -d
+# 2. preflight（PASS を確認。STALE なら ~90s 待つか worker 再作成）
+docker compose exec web archiver system preflight
+# 3. dry-run（plan + benchmark、書き込みなし）
+docker compose exec web archiver takeout import-staged myactivity.zip --kind watch_history
+# 4. 段階 apply（1000→10000→50000、各段 verify+db-stats 自動）
+docker compose exec web archiver takeout import-staged myactivity.zip --kind watch_history --apply --max-stage 1
+#    問題なければ --max-stage 2 → 3 → 最後にユーザー確認の上 --allow-full
+docker compose exec web archiver takeout import-staged myactivity.zip --kind watch_history --apply --allow-full
+# 5. verify
+docker compose exec web archiver takeout verify-import --latest
+# 6. report
+docker compose exec web archiver takeout import-report --latest
+# 7. db-stats（容量・raw_json_stored_total=0 を確認）
+docker compose exec web archiver storage db-stats
+# 8. cleanup（session 行が増えたら。job/取込データは消えない）
+docker compose exec web archiver takeout sessions cleanup-auto --dry-run   # 確認後 --apply
+```
+
+liked も同手順（`--kind liked_videos`）。UI は Takeout 画面の **Production import wizard** で同じ流れを対話実行できる（full は確認ダイアログ・no-raw-json 既定 ON）。
+
+### 取り込み済み liked/watch を起点にした本番アーカイブ運用（Phase 7H）
+
+import 済みの liked=11,066 / watch=92,303 を起点に、YouTube の **metadata 取得 → body/archive 保存** を段階的・安全に運用する。新機能は最小限（失敗理由の分類強化のみ）で、既存の liked-videos / jobs / scheduler / archive 機能を使う。
+
+#### 失敗理由の分類（Phase 7H で追加）
+
+metadata/archive ジョブの失敗を分類して可視化:
+
+| reason | 意味 | retryable | 扱い |
+|---|---|---|---|
+| `private` | 非公開動画 | × | 記録（**削除しない**） |
+| `deleted` | 削除/uploader 削除 | × | 記録 |
+| `unavailable` | 視聴不可（地域/メンバー限定/削除） | × | 記録 |
+| `network` | ネットワーク/サーバ(5xx)エラー | ○ | 後で再試行 |
+| `rate_limited` | HTTP 429（YouTube スロットリング） | ○ | 後で再試行 |
+| `unknown` | 未分類の失敗 | × | 記録（要調査） |
+
+- Jobs API は各ジョブに `classification`（`primary_reason` / `permanent` / `retryable` / `reasons`）を付与。`GET /api/jobs?reason=private` で絞り込み可。
+- 集計: `archiver liked-videos failures` / `GET /api/liked-videos/failure-breakdown` が **理由別カウント**を返す（件数のみ・本文/URL/パス非返却）。UI の Liked archive progress に "failures by reason" を表示（permanent は赤、retryable は橙）。
+- **private/deleted/unavailable は再試行しない**（永続失敗）。**失敗動画は削除せず理由付きで記録**。
+
+#### 「metadata 取得済み」の定義（重要）
+
+Takeout import は **title だけの Video stub** を作る（実 metadata ではない）。Phase 7H では「metadata 取得済み」を **実 metadata ファイル（info_json 等）が存在すること**と定義（title stub は未取得扱い）。よって取り込み直後は `metadata_fetched=0`、`--missing-only`（既定）が **全 stub を対象に metadata を取得**し、取得済み（info_json あり）は skip する。
+
+#### 推奨運用手順
+
+```bash
+docker compose exec web archiver system preflight            # PASS 確認
+docker compose exec web archiver storage db-stats            # before
+docker compose exec web archiver liked-videos plan-archive --limit 5         # 候補/未取得数の確認
+docker compose exec web archiver liked-videos enqueue-metadata --limit 100 --dry-run
+docker compose exec web archiver liked-videos enqueue-metadata --limit 100   # metadata_only（本体DLしない）
+# 完了後: jobs / metadata_fetched / 失敗理由を確認
+docker compose exec web archiver liked-videos failures
+docker compose exec web archiver liked-videos plan-archive --limit 5
+docker compose exec web archiver storage db-stats            # after
+# body archive は小規模から（本体DL・容量注意）
+docker compose exec web archiver liked-videos enqueue-archive --limit 10 --dry-run
+docker compose exec web archiver liked-videos enqueue-archive --limit 10     # → 100 → full はユーザー確認後
+```
+
+- **段階**: metadata 100 → 1000 → 全件、その後 archive 10 → 100 → full（full はユーザー確認後）。1回の enqueue は `LIKED_ARCHIVE_MAX_ENQUEUE_PER_RUN`（既定 **50**）で hard cap。
+- **deleted/private 動画**: 自動的に該当 reason で分類・記録され、再試行されない（liked 行は残る）。
+- **rate limit 注意**: cookie/PO-token 未設定だと metadata/body とも 429（rate_limited）になりやすい。安定運用には `COOKIES_FILE` / `YOUTUBE_PO_TOKEN`（README のセキュリティ節）を設定。429 は retryable なので `liked-videos retry-failed` / scheduler retry pass で後追い。
+- **storage 容量注意**: metadata(info_json) は軽量だが、**body archive は1本あたり数十〜数百MB**。full archive 前に `storage db-stats` とディスク空きを確認。
+- **scheduler**: liked passes は **既定 OFF**。有効化する場合も metadata `SCHEDULER_LIKED_METADATA_LIMIT_PER_RUN`(既定10) / archive `..._ARCHIVE_LIMIT_PER_RUN`(既定2) + hard cap 50 + `SUPPRESS_WHEN_ACTIVE`(既定 true) で**一気に大量 job を作らない**。UI の "Run … pass once" でも手動 1 回実行可。
+
+#### 実機検証結果（実 myactivity.zip / 11,066 liked）
+
+- metadata `--limit 100`（cap 50）→ 50 job: **success 8 / partial 41 / failed 1**。**metadata_fetched 0→49**（info_json 保存）。失敗分類: `rate_limited 44`(retryable) / `unavailable 1`(permanent)。
+- archive `--limit 3`（本体DL）→ cookie 無しのため全て 429 で `partial_success`（retryable・**body 0 件保存・liked データは不変**）。
+- db-stats: 46.23→46.47MB、**raw_json_stored_total は終始 0**。secret/raw_json/cookie/token/`/Users`/`/takeout_imports`/`/archive` の API/UI/log 露出 **なし**。
+
+### セキュリティ / プライバシー（7H）
+
+- failure-breakdown / progress / stats / jobs は **件数・分類・集計のみ**。raw_json 本文・履歴本文・動画 URL・cookie/token/PO-token・絶対パスを返さない。
+- 失敗動画（private/deleted/unavailable）は **理由付きで記録、削除しない**。body 保存は archive root 配下のみ（API/UI/log に絶対パス非表示）。
+- 大量 import より **metadata→小規模 archive** を優先。full archive はユーザー確認後。
+
+### cookie/PO-token 対応 + metadata 全件取得の安定運用（Phase 7I）
+
+cookie/PO-token を設定して 429（rate_limited）を減らし、liked=11,066 の metadata を **段階的・安全に全件取得**する。新機能は最小限（rate-limit ゲート付き metadata-run + 機密ステータス表示）。
+
+#### cookie / PO-token 設定（機密 — Git/UI/API/log に実値を出さない）
+
+`.env`（**ユーザーが自分で編集**。AI/Git は実値を書かない）:
+
+| env | 用途 |
+|---|---|
+| `COOKIES_FILE` | cookies.txt のパス（マウント秘密）。`/secrets/cookies.txt` 等 |
+| `COOKIES_FROM_BROWSER` | ローカルブラウザから cookie 取得（`chrome` 等） |
+| `YOUTUBE_PO_TOKEN` | PO token（429 緩和）。secret |
+| `YOUTUBE_VISITOR_DATA` | PO token とペア。secret |
+
+- 設定状況は **boolean/masked のみ**で確認: `archiver system preflight`（`cookies_file` / `po_token` / `secret_value_exposed=false` チェック）、`GET /api/system/secrets-status`、UI の Liked archive progress の "fetch auth" バッジ。**実値・絶対パスは一切表示しない**（preflight/secrets-status はパスも返さず、cookie ファイルの readable/last_modified だけ）。
+- **read-only マウント対応**: yt-dlp は終了時に cookie jar を `--cookies` パスへ書き戻すため、`COOKIES_FILE` を `:ro` マウント（`./secrets:/secrets:ro` 等）に置くと `[Errno 30] Read-only file system` で失敗する。実行時に **元 cookie を writable な一時ファイルへコピーして yt-dlp に渡し、終了後に削除**する（元ファイルは read-only のまま不変）。`command.txt` でも cookie パスは `--cookies '******'` とマスクされ、一時パスもログに出ない。**`COOKIES_FILE` は read-only マウント推奨**（書き戻しが起きても安全）。
+
+#### metadata 全件取得（段階・rate-limit ゲート）
+
+```bash
+archiver liked-videos metadata-run --limit 100            # dry-run は --dry-run
+archiver liked-videos metadata-run --limit 1000
+archiver liked-videos metadata-run --all --confirm        # 全 missing（--confirm 必須）
+```
+
+- 動作: capped バッチ（`LIKED_METADATA_MAX_ENQUEUE_PER_RUN`、既定 200）で **missing-metadata** を enqueue → worker 完了待ち → そのバッチの **rate_limited 比率**を測定 → target 到達/missing 枯渇/比率が STOP 閾値以上のいずれかで停止。**metadata_only（本体DLしない）**。
+- **rate-limit safety**: `LIKED_METADATA_WARN_ON_RATE_LIMIT_RATIO`(0.5) で WARN、`LIKED_METADATA_STOP_ON_RATE_LIMIT_RATIO`(0.8) で **full/staged run を停止**（CLI は exit 2 を返すのでスクリプトが full を止められる）。比率が高い＝cookie/PO-token を設定すべきサイン。
+- 各 run: preflight（worker 必須）→ enqueue → wait → failure-breakdown / metadata_fetched / db-stats / **推奨次アクション**を出力。
+
+#### retryable / permanent と再試行（permanent は選定から除外）
+
+- **retryable**: `rate_limited` / `network` / `impersonation` / `unknown`（一時的・要調査）→ 選定対象に残し、後で再試行。
+- **permanent**: `private` / `deleted` / `unavailable` → **metadata 選定から既定除外・再試行しない・削除しない・理由付きで保持**。
+
+permanent な動画は info_json が永遠に作られない＝「missing metadata」のままなので、対策しないと **metadata-run のたびに同じ private 動画を選び直してしまう**（実機で private が 41 unique なのに 801 attempts ＝ 約20回ずつ再試行されていた）。Phase 7J 以降、`metadata-run` / `enqueue-metadata` / `plan-archive` は **各動画の最新 metadata 試行が permanent なら選定から除外**する（`metadata_only` ジョブの最新分類で判定。body archive の失敗とは混同しない）。
+
+```bash
+archiver liked-videos progress     # eligible missing / permanent unique(kept) を表示
+archiver liked-videos failures     # reason 別に attempts と unique_videos を分けて表示
+archiver liked-videos retry-metadata --retryable            # 全 retryable を再投入（permanent 除外）
+archiver liked-videos retry-metadata --reason rate_limited  # 429 のみ
+# どうしても permanent も再試行したい場合のみ（非推奨・明示必須）:
+archiver liked-videos metadata-run --limit 100 --include-permanent
+archiver liked-videos enqueue-metadata --all --include-permanent
+```
+
+- 既定では permanent を除外（`--include-permanent` / `--retry-permanent` を明示した時のみ対象）。permanent は `retryable=false` なので `retry-metadata` の対象にも自動で入らない。
+- `metadata-run` 出力に `selected` / `skipped_permanent` / `eligible_missing` / `permanent_kept` を表示。`progress` は `eligible_metadata_missing` / `skipped_permanent_metadata` / `permanent_unique_videos` を、`failure-breakdown` は `attempts_by_reason` と `unique_videos_by_reason`（distinct 動画）を返す。UI の Liked archive progress も "Eligible missing" / "Permanent (kept)" カード + reason 別 `unique/attempts` を表示（「再試行せず保持・選定から除外」と明記）。**動画行は削除しない。**
+
+#### 429 が多い場合の対処
+
+1. `system preflight` / secrets バッジで cookie/PO-token 未設定を確認 → `.env` に `COOKIES_FILE`（または `COOKIES_FROM_BROWSER`）+ `YOUTUBE_PO_TOKEN`/`YOUTUBE_VISITOR_DATA` を設定 → `docker compose up -d`（worker 再起動）。
+2. `LIKED_METADATA_JOB_DELAY_SECONDS` を上げてリクエスト間隔を空ける。
+3. STOP した run は `retry-metadata --retryable` で後追い。**body archive は metadata 完了後に小規模から**（cookie 設定済みでも 429 になりやすい）。
+
+#### 実機検証結果（cookie 未設定状態）
+
+- `system preflight`: `cookies_file=WARN`（未設定）/ `po_token=WARN` / `secret_value_exposed=ok(false)`。secret 値・絶対パスの露出なし。
+- `metadata-run --limit 100`（cap 50/batch）: cookie 無しのため **rate_limited が大半 → ratio が STOP 閾値超 → run 停止**（429 を分類して安全に止まる挙動を確認）。`metadata_fetched` は info_json 保存分だけ増加。
+- `retry-metadata`: retryable のみ再投入、private/deleted/unavailable は除外。
+
+### セキュリティ / プライバシー（7I）
+
+- cookie/PO-token/visitor_data の **実値・絶対パスは API/UI/log/preflight/secrets-status のどこにも出さない**（configured/readable booleans + masked timestamp のみ）。`.env` はユーザーが編集、Git 非管理。
+- metadata-run は **本体DLしない・worker 必須・rate-limit STOP ゲート付き**。permanent 失敗は再試行も削除もしない。
+
+### metadata 段階取得の実機運用結果（Phase 7K）
+
+cookie 設定済み + `LIKED_METADATA_JOB_DELAY_SECONDS=1.5` で `metadata-run` を **300 → 500 → 1000 → 2000** と段階拡大。300〜1000-run は rate-limit ゲート（WARN 0.5 / STOP 0.8）下で **STOP 無しで完走**、2000-run は**深い領域で 429 が増え、batch 38 が 0.82 に達して STOP ゲートが発動**（＝設計どおり安全停止、1 バッチ手前で停止）。コード変更なし＝既存ループ + 既存集計の運用のみ。migration head は `c3d4e5f6a7b8` のまま。
+
+#### 実測（cookie + delay=1.5s、本体は一切DLしない）
+
+| run | attempted | success(info_json完備) | rate_limited(部分取得) | permanent検出 | ratio | stopped | metadata_fetched |
+|---|---|---|---|---|---|---|---|
+| `--limit 300` | 300 | 244 | 41 | — | **0.137** | none | 1033 → 1318 (+285) |
+| `--limit 500` | 500 | 392 | 92 | — | **0.184** | none | 1318 → 1802 (+484) |
+| `--limit 1000` | 1000 | 881 | 85 | 34（private18 / unavailable10 / deleted6） | **0.085** | none | 1802 → 2768 (+966) |
+| `--limit 2000` | 1950（batch38 で STOP） | 1070 | 791 | 89（private/deleted/unavailable） | **0.406**（overall） | **stop（batch38=0.82）** | 2768 → 4629 (+1861) |
+
+- 累計（2000-run 後）: `metadata_fetched=4629`（**info_json 完備 3050 / description のみ 1579**）/ `eligible_missing=6230` / `permanent_unique=207`（保持・選定除外）/ DB 51.0 → 64.26 MB。整合: `11066 = 4629 + 6230 + 207`。**全 run で raw_json stored=0・body saved=0・active jobs=0**（本体未取得）を維持。
+
+#### `success` と `metadata_fetched` の違い（定義 — 数値の食い違いは定義差）
+
+- **`success`（バッチ値）** = ジョブが status=success でクリーン終了＝`info_json` を完備。
+- **`metadata_fetched`（progress 見出し）** = `info_json/description/thumbnail/link/live_chat` の**いずれか1つ以上**を持つ liked 動画数。429 で途中停止して `.description` だけ書けた **partial_success（reason=rate_limited）も「取得済み」に数える**。
+- ゆえに `metadata_fetched` 増分 = `success` + `rate_limited 部分取得`。実測一致: 300→244+41=285 / 500→392+92=484 / 1000→881+85=966 / 2000→1070+791=1861。累計内訳は **info_json 完備 3050 + description のみ 1579 = 4629**。
+
+#### `LIKED_METADATA_JOB_DELAY_SECONDS=1.5` の効果（429 抑制）
+
+metadata ジョブ専用ディレイ（本体アーカイブの `LIKED_ARCHIVE_JOB_DELAY_SECONDS` とは別系統）を 0 → 1.5s にして rate_limited 比率が大きく低下:
+
+| 条件 | rate_limited ratio |
+|---|---|
+| cookie 無し | ~0.92（STOP 閾値超 → 即停止） |
+| cookie 有り・delay 0 | ~0.36 |
+| **cookie 有り・delay 1.5s** | **0.137 / 0.184 / 0.085 / 0.406**（300 / 500 / 1000 / 2000-run・overall） |
+
+2000-run は overall 0.406 だが**バッチ単位では深い領域で上昇**: 序盤〜中盤は 0.1〜0.3、batch 13 以降は 0.4〜0.66 を頻発し、batch 38 で 0.82（STOP）。delay だけでは深い領域の 429 を抑えきれず、**PO-token が次の手**であることを示す。
+
+#### permanent-skip の効果
+
+permanent（private/deleted/unavailable）は info_json が永遠に作られず「missing」のまま再選択され続けるため、選定から除外（Phase 7J）。実機では run を重ねるごとに `skipped_permanent` が **53 → 68 → 84 → 118 → 207** と増加（新規 permanent を検出した瞬間に除外）。除外しなければ同一動画を約20回ずつ再試行していた（cumulative: private 893 attempts / **133 unique**）。**permanent 動画は削除せず、理由付きで保持。**
+
+#### PO-token 推奨と次段（full は要ユーザー確認）
+
+- `secrets-status`: `cookies_configured=true` / **`po_token_configured=false`（未設定）**。
+- **2000-run で full への自動 GO 条件は未達**: overall ratio は 0.406（<0.5）だが、深い領域（batch 13 以降）で 429 が増え、**batch 38 が 0.82 で STOP ゲート発動**（success=8 / rate_limited=41）。`ratio<0.5 かつ STOP 無し` を満たさないため、**残り 6,230 件の full metadata へは進まない**（gate が設計どおり安全停止）。
+- **次段の推奨（ユーザー判断待ち）**: ① `.env` に `YOUTUBE_PO_TOKEN`/`YOUTUBE_VISITOR_DATA` を設定（深い領域の 429 をさらに低減）→ `docker compose up -d` で worker 再起動 → 小さめの `metadata-run` で ratio を再確認、② または現状のまま `retry-metadata --reason rate_limited` で rate_limited（cumulative unique 1,588）を間隔を空けて後追い。いずれの場合も **full metadata 全件（`--all --confirm`）・body archive は必ずユーザー確認後**に実施する（本 Phase では未実行）。
+
+### rate-limit 安定化 + info_json 完備率の可視化（Phase 7L）
+
+2000-run の batch STOP を受け、**full には進まず** 429 をさらに下げ、完備率を正しく測れるようにした（migration 追加なし、head は `c3d4e5f6a7b8` のまま）。
+
+#### `metadata_fetched` は broad count（完備率は info_json で測る）
+
+- **`metadata_fetched`（= `metadata_any_count`）**: `info_json/description/thumbnail/link/live_chat` の**いずれか1つ以上**を持つ動画数（broad）。429 で `.description` だけ書けた partial も含む。
+- **`info_json_complete_count`**: `info_json` を持つ動画数（**完備＝full-metadata 判断はこの値を使う**）。
+- **`description_only_count`**: description はあるが info_json が無い動画。
+- **`retryable_partial_count`**: 上記のうち最新 metadata ジョブが retryable（rate_limited 等）で、`retry-metadata` で info_json へ格上げ可能な動画。
+- `progress`（CLI / `GET /api/liked-videos/progress`）と UI の Liked archive progress に上記4値を表示（UI は "info_json complete" / "desc-only (retryable)" カード）。
+
+#### metadata-run の level 表記を是正（overall OK でも batch STOP を明示）
+
+- 旧: overall ratio が 0.5 未満だと batch STOP が起きても `level=OK stopped=...` と紛らわしかった。
+- 新: 最終 `level` は **overall と全 batch の最悪値**（さらに rate-limit STOP なら強制 `STOP`）。出力に `overall ratio [level]` と `worst batch [level]` を併記し、batch STOP 時は **⚠ 警告行**を出す。`level==stop` で CLI は exit 2（スクリプトが full を止められる）。
+
+#### 429 抑制チューニング + yt-dlp 更新
+
+- `LIKED_METADATA_JOB_DELAY_SECONDS` を **1.5 → 3.0**、`LIKED_METADATA_JOB_DELAY_JITTER_SECONDS=1.0`（各 metadata ジョブの遅延に 0〜1s のランダム揺らぎを足し、完全な周期性を崩す）を追加。delay 計算は `compute_liked_job_delay()`（純関数・テスト済み）に切り出し。
+- yt-dlp を **2026.03.17 → 2026.06.9**（`requirements.txt` / `pyproject.toml` の下限を更新）。90 日超の "yt-dlp is older than 90 days" 警告と抽出器ドリフトを解消。**web/worker 両イメージを再ビルド**し、`system preflight` の `worker_build_match` で一致を確認（worker が古いと旧 yt-dlp/旧コードのままになる）。
+
+#### detached 実行のログ可視化（途中経過が見える）
+
+- `metadata_run()` に `on_batch` コールバックを追加し、CLI が**各 batch 完了ごとに flush 付きで出力**（旧実装は run 完了まで何も出なかった）。イメージは `PYTHONUNBUFFERED=1`（Dockerfile 既定）。
+- 長時間 run は **detached + マウント済み `/logs`** に出すと、ホスト側タスクが落ちても batch 別 ratio が残る:
+  ```bash
+  docker compose exec -d web sh -c \
+    'archiver liked-videos metadata-run --limit 300 > /logs/mr300.log 2>&1'
+  # 進捗は /logs/mr300.log を tail（batch 行が随時 append される）／ DB の info_json_complete でも確認
+  ```
+
+#### 小規模再テスト（300）と判定ルール
+
+yt-dlp 更新 + delay 3.0s+jitter 後、まず `metadata-run --limit 300` を実行し、次の段階を決める:
+
+| 300-run overall ratio | 次アクション |
+|---|---|
+| `< 0.3` | 1000 へ拡大してよい |
+| `0.3 〜 <0.5` | 300/500 で継続（拡大は慎重に） |
+| `>= 0.5` | **拡大しない**。PO-token / visitor_data を設定して再測定 |
+| `>= 0.8`（または batch STOP） | STOP。PO-token 必須 |
+
+- retryable partial（description-only）の格上げは、**まず `retry-metadata --retryable --limit 100〜200`** で `info_json_complete_count` が増えるか確認してから（全件を一気に流さない）。
+- **本 Phase でも body archive・full metadata（`--all --confirm`）・`--include-permanent` は未実行**。permanent は保持（削除しない）。cookie/PO-token/visitor_data の実値・パスは log/UI/API/README に出さない（worker ログの cookie も `--cookies '******'` でマスク）。
+
+#### 300-run 実測（yt-dlp 2026.06.9 + delay 3.0s + jitter 1.0、本体DLなし）
+
+| batch | success | rate_limited | ratio | level |
+|---|---|---|---|---|
+| 0 | 41 | 5 | 0.10 | ok |
+| 1 | 31 | 17 | 0.34 | ok |
+| 2 | 42 | 7 | 0.14 | ok |
+| 3 | 43 | 1 | 0.02 | ok |
+| 4 | 35 | 15 | 0.30 | ok |
+| 5 | 43 | 2 | 0.04 | ok |
+
+- 全体: attempted=300 success=235 rate_limited=47 **overall ratio=0.157 [ok] / worst batch=0.34 [ok] / stopped=None**（**どの batch も WARN 未満**＝2000-run の深部 0.5〜0.82 から大幅改善）。
+- 完備率: **info_json complete 3050 → 3285（+235＝clean success）** / broad metadata 4629 → 4911（+282） / description-only 1579 → 1626（+47）。eligible 6230 → 5930 / permanent 207 → 225（+18、保持）/ DB 64.26 → 65.03 MB / raw_json=0 / body=0 / active=0 / 秘匿リーク無し。
+- **判定（decision tree）**: overall 0.157 **< 0.3 → 1000 へ拡大可**。ただし full metadata（`--all --confirm`）・body archive は引き続きユーザー確認後のみ。深部で worst batch が再び 0.5 以上 / STOP に達する場合は PO-token / visitor_data の設定を推奨。
+
+#### 1000-run 実測（判定に従い拡大、yt-dlp 2026.06.9 + delay 3.0s + jitter）
+
+300-run が 0.157 < 0.3 だったため 1000 へ拡大。**20 batch すべて ≤0.24（WARN すら無し）で完走**。
+
+- 全体: attempted=1000 success≈821 rate_limited=80 **overall ratio=0.08 [ok] / worst batch=0.24 [ok] / stopped=None**。
+- 完備率: **info_json complete 3285 → 4106（+821）** / broad 4911 → 5812（+901） / description-only 1626 → 1706。eligible 5930 → 4930 / permanent 225 → 324（保持）/ DB 65.03 → 67.77 MB / raw_json=0 / body=0 / active=0 / 秘匿リーク無し。
+- **2000-run（delay 1.5, 旧 yt-dlp）との対比**: overall 0.406→**0.08**、worst batch 0.82(STOP)→**0.24(STOPなし)**。delay 3.0s+jitter + yt-dlp 更新で深部の 429 が大幅に低減。
+
+**累計（7L 300+1000 後）**: broad **5812/11066（52.5%）** / **info_json complete 4106/11066（37%）** / eligible_missing 4930 / permanent 324。`11066 = 5812 + 4930 + 324`。**full metadata（`--all --confirm`）・body archive は未実行**（ユーザー確認後のみ）。
+
+### staged metadata completion（Phase 7M）
+
+残り eligible（4,930）を full 一括ではなく **1000件単位**で段階的に消化。主指標は broad ではなく **`info_json_complete_count`**。各 run の前に preflight（worker build 一致 / cookies OK / secret 非露出 / yt-dlp 2026.06.9 / delay 3.0+jitter）と active=0 を確認し、1 run ごとに結果を報告してから次へ進む（無断連続実行しない）。
+
+| run | attempted | success | rate_limited | overall ratio | worst batch | stopped | info_json complete | broad | eligible 残 |
+|---|---|---|---|---|---|---|---|---|---|
+| #1 | 1000 | 869 | 38 | **0.038 [ok]** | **0.16 [ok]** | None | 4106 → **4975**（+869） | 5812 → 6719 | 4930 → **3930** |
+
+- #1 後: description_only=1744 / retryable_partial=1744 / permanent_unique 324 → **417**（保持）/ DB 67.77 → 70.58 MB / raw_json=0 / body=0 / active=0 / 秘匿リーク無し。`11066 = 6719 + 3930 + 417`。
+- 判定: overall 0.038 < 0.3 ∧ worst 0.16 < 0.5 ∧ stopped=None → 次の `--limit 1000` 候補（ただし実行前に都度報告）。**full / body は未実行**。
+
 ---
 
 ## ストレージ構成
@@ -1408,6 +1844,17 @@ archiver takeout import-watch-history PATH --safe-large [--limit N] [--apply]   
 archiver takeout import-all PATH --no-raw-json
 archiver takeout sessions cleanup --keep-last N [--older-than-days D] --dry-run   # session 行のみ剪定（job/data は不可侵）
 archiver takeout sessions cleanup --keep-last N --apply
+# --- Phase 6F: build/preflight / import-large / verify / auto-cleanup ---
+archiver system build-info                             # app_version / build_id / schema_head
+archiver system preflight                              # DB/Redis/alembic/web=worker build 一致（stale で exit 1）
+archiver takeout preflight-large PATH [--kind ...]     # 大容量 import 前チェック（dry-run）
+archiver takeout import-large PATH --kind watch_history [--limit N] [--apply]   # 既定 dry-run+no-raw-json+job, 自動 preflight
+archiver takeout verify-import SESSION_ID | --latest [--kind ...]   # import 後検査 + 漏洩 grep
+archiver takeout sessions cleanup-auto --dry-run | --apply          # 設定ベースの session 剪定
+archiver takeout sessions cleanup-status               # auto cleanup 設定 + 直近結果
+# --- Phase 6G: staged production import + operation report ---
+archiver takeout import-staged PATH --kind watch_history [--apply] [--allow-full] [--max-stage N] [--raw-json] [--no-job]
+archiver takeout import-report --latest | SESSION_ID | --kind watch_history --recent 10
 archiver search-history list [--limit N] / stats
 archiver subscriptions list
 archiver subscriptions enqueue --videos --shorts --streams --profile metadata_only --max-items 3 [--limit N] [--now]
@@ -1488,6 +1935,13 @@ archiver live-chat stats VIDEO_ID
 | GET | `/api/storage/db-stats` | DB 件数 + 概算サイズ + raw_json 実 blob 数（集計のみ・本文非返却）【Phase 6E】 |
 | POST | `/api/takeout/benchmark-large` | liked+watch（任意 search）一括 dry-run benchmark（eps/peak/推定時間/推奨 batch）【Phase 6E】 |
 | POST | `/api/takeout/import-sessions/cleanup` | 古い import session 行のみ剪定（`{keep_last,older_than_days,dry_run}`。**job/import 済みデータは削除しない**・bounds 未指定で no-op・running 保護）【Phase 6E】 |
+| GET | `/api/system/build-info` | プロセスの build 識別（app_version / build_id / schema_head / job types）【Phase 6F】 |
+| GET | `/api/system/health/full` | DB/Redis + worker heartbeat + web=worker build 一致 + schema head 一致【Phase 6F】 |
+| POST | `/api/takeout/preflight-large` | 大容量 import 前チェック（ZIP/parser=ijson/サンプル bench/DB件数。dry-run）【Phase 6F】 |
+| GET | `/api/takeout/import-sessions/{id}/verify` | import 後検査（結果 + DB stats + raw_json 実 blob + 漏洩 grep + job status）【Phase 6F】 |
+| GET | `/api/takeout/import-sessions/cleanup-status` | auto session-cleanup の設定 + 直近実行結果【Phase 6F】 |
+| GET | `/api/takeout/import-report/latest` | 直近 import session の運用レポート（結果+job+verify+db-stats+leak+推奨）【Phase 6G】 |
+| GET | `/api/takeout/import-report/{session_id}` | 指定 session の運用レポート【Phase 6G】 |
 
 import 系（`/api/takeout/import`・`import-watch-history`・`import-search-history`・`import-liked-videos`・`import-all` と各 `-job`）は **`store_raw_json: false`**（既定 true）で raw 活動 blob を保存せず正規化フィールドのみ取り込み【Phase 6E】。
 | POST | `/api/library/bootstrap` | Hybrid 初回構築（YouTube + My Activity + 任意 API）【Phase 6B】 |
@@ -1548,7 +2002,9 @@ import 系（`/api/takeout/import`・`import-watch-history`・`import-search-his
 | GET | `/api/liked-videos/retryable` | liked 由来の retryable ジョブ一覧(`?reason=&limit=`)【Phase 7C】 |
 | POST | `/api/liked-videos/retry-failed` | liked 由来 retryable を再 queue(`{reason,limit}`、回数上限尊重)【Phase 7C】 |
 | GET | `/api/liked-videos/progress` | 進捗集計(metadata/body 保存・retryable・by_source/channel、raw_json 非返却)【Phase 7D】 |
-| GET | `/api/jobs?source_action=` | `source_action`/`scheduled_by` でジョブ絞り込み(liked_archive 等)【Phase 7D】 |
+| GET | `/api/liked-videos/failure-breakdown` | 失敗 liked ジョブを理由別に集計(private/deleted/unavailable/network/rate_limited/unknown、件数のみ)【Phase 7H】 |
+| GET | `/api/system/secrets-status` | cookie/PO-token/visitor_data の設定状況(boolean/masked のみ・実値/絶対パス非返却)【Phase 7I】 |
+| GET | `/api/jobs?source_action=&reason=` | `source_action`/`scheduled_by`/`reason`(分類)でジョブ絞り込み【Phase 7D/7H】 |
 | GET | `/api/takeout/files` | `TAKEOUT_IMPORT_ROOT` 配下の ZIP 一覧（root 外は不可）【Phase 5A】 |
 
 `/api/jobs`・`/api/jobs/{id}` は **`classification`**（429/partial/retryable/warnings）を含みます【Phase 5B】。Videos 一覧は `?channel_id=&sort=` を追加。
@@ -1650,6 +2106,10 @@ live_chat_messages, metadata_snapshots, download_profiles, jobs, watch_history_e
   - `b2c3d4e5f6a7` `takeout_import_sessions` テーブル新規（Phase 6C・import 履歴。basename + 集計件数のみ保存。整数列 `server_default '0'` で PostgreSQL/SQLite 両対応）
   - `c3d4e5f6a7b8` `takeout_import_sessions` に `job_id`/`rq_job_id`/`parser_backend`/`entries_per_second`/`peak_memory_mb`/`cancel_requested`/`current_phase`/`last_update_at` を追加（Phase 6D・job 化/benchmark/progress。bool は `server_default false`）
   - **Phase 6E は migration 追加なし**（no-raw-json は既存 `raw_json` 列を NULL/省略するだけ、db-stats / benchmark-large / cleanup は読み取り・行削除のみ。head は `c3d4e5f6a7b8` のまま）。
+  - **Phase 6F も migration 追加なし**（build-info/preflight は読み取りのみ、auto cleanup は既存 session 行削除のみ、build_id は実行時算出、cleanup status は config 配下のファイル。head は `c3d4e5f6a7b8` のまま）。
+  - **Phase 6G も migration 追加なし**（import-staged は既存 import 経路の段階呼び出し、import-report は既存 session/job/stats の読み取り集約のみ。head は `c3d4e5f6a7b8` のまま）。
+  - **Phase 7H も migration 追加なし**（失敗分類は error_text のパターン追加、failure-breakdown は既存 job の読み取り集約、metadata-fetched 判定は info_json 有無に精緻化。head は `c3d4e5f6a7b8` のまま）。
+  - **Phase 7I も migration 追加なし**（cookie/PO-token は既存 config、secrets-status/preflight は boolean 集約、metadata-run は既存 enqueue のループ + 既存 job 集計のみ。head は `c3d4e5f6a7b8` のまま）。
 - SQLite（ローカル/テスト）: `archiver init` がモデルから直接スキーマを作成。
 - 型は PostgreSQL / SQLite 双方で動くポータブルな SQLAlchemy 型のみ使用（`BigInteger` / `JSON` 等）。`0003` は SQLite 互換のため `batch_alter_table` を使用。
 

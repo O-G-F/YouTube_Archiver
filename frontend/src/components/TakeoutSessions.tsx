@@ -4,6 +4,7 @@ import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
 import { fmtDate } from "../lib/format";
 import { ErrorBox, Loading } from "./ui";
+import type { VerifyImport } from "../api/types";
 
 function KindBadge({ k }: { k: string }) {
   return <span className="badge muted">{k}</span>;
@@ -15,6 +16,7 @@ export function TakeoutSessions({ reloadKey }: { reloadKey?: number }) {
   const sessions = useFetch(() => api.takeoutImportSessions({ limit: 30 }), [reloadKey]);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [verify, setVerify] = useState<VerifyImport | null>(null);
   const anyRunning = (sessions.data ?? []).some((s) => s.status === "running");
 
   async function cancel(sessionId: string) {
@@ -23,6 +25,19 @@ export function TakeoutSessions({ reloadKey }: { reloadKey?: number }) {
     try {
       await api.takeoutImportCancel(sessionId);
       sessions.reload();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function doVerify(sessionId: string) {
+    setBusy(sessionId);
+    setErr(null);
+    setVerify(null);
+    try {
+      setVerify(await api.takeoutVerifyImport(sessionId));
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -95,6 +110,9 @@ export function TakeoutSessions({ reloadKey }: { reloadKey?: number }) {
                         {s.status === "cancelled" && <span className="badge warn">cancelled</span>}
                         {s.status === "failed" && <span className="badge err">failed</span>}
                         {s.parser_backend && <span className="badge muted" title="parser">{s.parser_backend}</span>}
+                        <button className="sm" disabled={busy === s.session_id} onClick={() => doVerify(s.session_id)}>
+                          {busy === s.session_id ? <span className="spin" /> : "✓"} verify
+                        </button>
                       </>
                     )}
                   </td>
@@ -105,6 +123,18 @@ export function TakeoutSessions({ reloadKey }: { reloadKey?: number }) {
         </div>
       ) : (
         <p className="muted small">No imports yet.</p>
+      )}
+
+      {verify && (
+        <div className="flash" style={{ borderColor: verify.ok ? "var(--ok)" : "var(--warn)" }}>
+          <strong>verify {verify.session_id}</strong> — {verify.ok ? "OK ✓" : "ATTENTION"} · status {verify.status} ·
+          imported {verify.imported} · store_raw_json {String(verify.store_raw_json)} ·
+          raw_stored {verify.raw_json_stored_count ?? "—"} / skipped {verify.raw_json_skipped_count ?? "—"} ·
+          job #{verify.job_id ?? "—"} ({verify.job_status ?? "—"}) ·
+          DB raw_json blobs total {verify.db_stats.raw_json_stored_total ?? "—"} ·
+          leak check {verify.leak_check_ok ? "clean ✓" : `LEAK: ${verify.leak_findings.join(", ")}`}
+          {verify.worker_error && <div className="small">worker_error: {verify.worker_error}</div>}
+        </div>
       )}
     </div>
   );

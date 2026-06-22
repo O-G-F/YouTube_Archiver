@@ -13,9 +13,35 @@ export interface JobClassification {
   rate_limited: boolean;
   partial: boolean;
   retryable: boolean;
+  permanent?: boolean; // Phase 7H: private/deleted/unavailable
+  primary_reason?: string | null;
   reasons: string[];
   warnings: string[];
   summary: string | null;
+}
+
+// Phase 7H/7J: failed/partial liked-archive jobs grouped by reason
+export interface LikedFailureBreakdown {
+  total_failed: number;
+  total_partial: number;
+  retryable: number;
+  permanent: number;
+  permanent_unique_videos: number;
+  by_reason: Record<string, number>;
+  attempts_by_reason: Record<string, number>;
+  unique_videos_by_reason: Record<string, number>;
+}
+
+// Phase 7I: cookie / PO-token configuration status (booleans/masked only)
+export interface SecretsStatus {
+  cookies_configured: boolean;
+  cookies_file_configured: boolean;
+  cookies_file_readable: boolean;
+  cookies_from_browser_configured: boolean;
+  po_token_configured: boolean;
+  visitor_data_configured: boolean;
+  cookies_last_modified: string | null;
+  secret_value_exposed: boolean;
 }
 
 export interface Job {
@@ -632,8 +658,16 @@ export interface SchedulerRunOnceResult {
 
 export interface LikedProgress {
   total_liked: number;
+  // metadata_fetched is BROAD (>=1 metadata media). Phase 7L adds the rigorous split.
   metadata_fetched: number;
+  metadata_any_count?: number;
+  info_json_complete_count?: number;
+  description_only_count?: number;
+  retryable_partial_count?: number;
   metadata_missing: number;
+  eligible_metadata_missing: number;
+  skipped_permanent_metadata: number;
+  permanent_unique_videos: number;
   body_saved: number;
   body_missing: number;
   active_archive_jobs: number;
@@ -740,4 +774,100 @@ export interface SchedulerRunCleanup {
   older_than_days: number;
   deleted_run_ids: string[];
   matched_run_ids: string[];
+}
+
+// ---- Phase 6F: build identity / preflight / verify / cleanup status ----
+export interface BuildInfo {
+  app_version: string;
+  build_id: string;
+  git_commit: string | null;
+  build_time: string | null;
+  schema_head: string | null;
+  supported_job_types: string[];
+}
+
+export interface WorkerInfo {
+  worker_id: string | null;
+  build_id: string | null;
+  app_version: string | null;
+  age_seconds: number | null;
+  stale: boolean | null;
+  takeout_import: boolean;
+}
+
+export interface FullHealth {
+  status: string;
+  ok: boolean;
+  database: boolean;
+  redis: boolean;
+  build_info: BuildInfo;
+  workers: WorkerInfo[];
+  worker_build_match: boolean;
+  schema_head_match: boolean | null;
+}
+
+export interface PreflightCheck {
+  name: string;
+  status: string; // ok | warn | fail
+  detail: string;
+}
+
+export interface PreflightLarge {
+  ok: boolean;
+  path_basename: string | null;
+  parser_backend: string | null;
+  checks: PreflightCheck[];
+  results: Record<string, {
+    sample_scanned: number;
+    entries_per_second: number | null;
+    peak_memory_mb: number | null;
+    parser_backend: string | null;
+    current_db_count: number;
+    source_kind: string | null;
+  }>;
+  recommended_command: string | null;
+}
+
+export interface VerifyImport {
+  ok: boolean;
+  session_id: string | null;
+  import_kind: string | null;
+  status: string | null;
+  scanned: number;
+  imported: number;
+  skipped_duplicate: number;
+  updated: number;
+  failed: number;
+  parser_backend: string | null;
+  entries_per_second: number | null;
+  peak_memory_mb: number | null;
+  store_raw_json: boolean | null;
+  raw_json_stored_count: number | null;
+  raw_json_skipped_count: number | null;
+  job_id: number | null;
+  job_status: string | null;
+  worker_error: string | null;
+  db_stats: Record<string, number | string | null>;
+  raw_json_real_blobs: Record<string, number>;
+  leak_check_ok: boolean;
+  leak_findings: string[];
+  checks: PreflightCheck[];
+}
+
+export interface CleanupStatus {
+  enabled: boolean;
+  interval_hours: number;
+  keep_last: number;
+  retention_days: number;
+  last_run_at: string | null;
+  last_result: Record<string, number | boolean> | null;
+  next_due_at: string | null;
+}
+
+// ---- Phase 6G: operation report ----
+export interface ImportReport extends VerifyImport {
+  path_basename: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  recommended_next_action: string | null;
 }

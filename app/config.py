@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     takeout_import_session_retention_days: int = 0
     takeout_import_session_keep_last: int = 0
 
+    # ---- Takeout import session AUTO cleanup (Phase 6F) — default OFF ----
+    # When enabled, the scheduler loop prunes old import SESSION rows (only;
+    # never jobs / imported data) at most every INTERVAL_HOURS using the
+    # retention/keep_last bounds above. Requires at least one bound to be set.
+    takeout_import_session_cleanup_enabled: bool = False
+    takeout_import_session_cleanup_interval_hours: int = 24
+
     # ---- Database ----
     database_url: str = "sqlite:///./data/archiver.sqlite3"
 
@@ -138,6 +145,19 @@ class Settings(BaseSettings):
     # Optional scheduler pickup of pending liked archives (default OFF).
     scheduler_liked_archive_enabled: bool = False
     scheduler_liked_archive_limit_per_run: int = 2  # body DL is heavy -> tiny
+
+    # ---- Liked metadata-run safety (Phase 7I) ----
+    # metadata_only is light, so allow a larger per-batch cap than the body cap.
+    liked_metadata_max_enqueue_per_run: int = 200
+    # Extra per-job delay for liked metadata jobs (spaces out requests -> fewer 429).
+    liked_metadata_job_delay_seconds: float = 0.0
+    # Phase 7L: random jitter (0..N s) ADDED to the metadata delay so requests are
+    # not perfectly periodic (a fixed cadence is easier for YouTube to rate-limit).
+    liked_metadata_job_delay_jitter_seconds: float = 0.0
+    # Rate-limit ratio (rate_limited / attempted in a run) thresholds: WARN at/above
+    # the warn ratio; STOP a staged/full run at/above the stop ratio.
+    liked_metadata_warn_on_rate_limit_ratio: float = 0.5
+    liked_metadata_stop_on_rate_limit_ratio: float = 0.8
 
     # ---- Scheduler liked passes (Phase 7D) — default OFF / small limits ----
     # metadata_only pass (no body DL): safe to run a bit more.
