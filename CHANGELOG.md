@@ -9,9 +9,9 @@ Detailed, phase-by-phase development history lives in
 
 ## [Unreleased]
 
-## [0.11.0-beta.1] — pending public-beta approval (not yet released or tagged)
+## [0.11.0-beta.1] - 2026-07-25
 
-First public-beta candidate. Local single-user scope; **not production-ready**
+First public beta. Local single-user scope; **not production-ready**
 (7 known CRITICAL OS-package CVEs accepted as residual risk, release-check FAILs
 by design, 0 active vulnerability exceptions). See the *Security* section below.
 
