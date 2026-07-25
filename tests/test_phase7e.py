@@ -90,7 +90,7 @@ def test_archive_run_jobs_have_scheduler_run_id(settings):
         for j in jobs:
             assert j.meta["scheduler_run_id"] == r["run_id"]
             assert j.meta["scheduled_by"] == "scheduler_liked_archive"
-            assert j.profile_name == settings.liked_archive_default_profile
+            assert j.profile_name == settings.effective_body_archive_profile  # Phase 9A: comments-light
 
 
 def test_retry_run_records_backoff_skip(settings):

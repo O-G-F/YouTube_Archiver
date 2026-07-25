@@ -4,6 +4,7 @@ import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
 import { fmtDate } from "../lib/format";
 import { Card, ErrorBox, JsonBlock, Loading, StatusBadge } from "../components/ui";
+import { FirstRunChecklist } from "../components/FirstRunChecklist";
 import type { Doctor, SchedulerRunOnceResult } from "../api/types";
 
 export default function Dashboard() {
@@ -47,6 +48,9 @@ export default function Dashboard() {
         <button onClick={reload}>↻ Refresh</button>
       </div>
       <ErrorBox error={error} />
+
+      {/* Phase 11B: only intrudes on a fresh install (auto-hides once set up) */}
+      <FirstRunChecklist />
 
       {data && (
         <>

@@ -8,6 +8,7 @@ secrets/
 .env
 .env.*
 !.env.example
+!.env.production.example
 
 # ---- Google Takeout exports (personal data) ----
 *.zip
@@ -16,6 +17,14 @@ takeout-*.zip
 takeout_imports/
 takeout/
 /takeout/
+
+# ---- Backups / rehearsal artifacts (Phase 9F: dumps, manifests, reports) ----
+backups/
+/backups/
+
+# ---- Release artifacts (Phase 10A: manifests, SBOMs, scans — NOT committed) ----
+release/
+/release/
 
 # ---- Archived media / logs / runtime data (rooted and anywhere) ----
 /archive/

@@ -7,7 +7,7 @@ Liked videos are personal data: ``raw_json`` is NOT returned unless
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -21,6 +21,7 @@ from app.schemas import (
     LikedArchivePlanOut,
     LikedArchiveRequest,
     LikedFailureBreakdownOut,
+    LikedOperationsOut,
     LikedProgressHistoryOut,
     LikedProgressHistoryPoint,
     LikedProgressOut,
@@ -215,11 +216,16 @@ def liked_progress_history(
 
 
 @router.post("/archive-plan", response_model=LikedArchivePlanOut)
-def archive_plan(req: LikedArchiveRequest, db: Session = Depends(get_db)) -> LikedArchivePlanOut:
+def archive_plan(req: LikedArchiveRequest, request: Request, db: Session = Depends(get_db)) -> LikedArchivePlanOut:
     """Preview what an archive run would touch — no jobs are created."""
-    plan = la.archive_plan(
-        db, get_settings(), filters=_filters(req), profile=req.profile, limit=req.limit
-    )
+    settings = get_settings()
+    plan = la.archive_plan(db, settings, filters=_filters(req), profile=req.profile, limit=req.limit)
+    from app.services import audit
+
+    audit.record_request_event(db, settings, request, event_type="archive_plan_requested",
+                               category="archive", action="plan",
+                               metadata={"limit": req.limit, "selected": plan.selected_count,
+                                         "blocked": plan.blocked})
     return LikedArchivePlanOut(**plan.__dict__)
 
 
@@ -264,7 +270,7 @@ def enqueue_metadata_v2(
 
 @router.post("/enqueue-archive", response_model=LikedArchiveEnqueueOut)
 def enqueue_archive(
-    req: LikedArchiveRequest, db: Session = Depends(get_db)
+    req: LikedArchiveRequest, request: Request, db: Session = Depends(get_db)
 ) -> LikedArchiveEnqueueOut:
     """Enqueue a BODY archive (downloads the video body with the given profile).
 
@@ -272,15 +278,34 @@ def enqueue_archive(
     plan first. ``dry_run=true`` creates no jobs.
     """
     settings = get_settings()
-    profile = req.profile or settings.liked_archive_default_profile
+    profile = req.profile or settings.effective_body_archive_profile
     try:
         result = la.enqueue_archive(
             db, settings, filters=_filters(req), limit=req.limit,
             profile=profile, dry_run=req.dry_run,
+            allow_low_disk=req.allow_low_disk, min_free_gb=req.min_free_gb,
         )
     except KeyError:
         raise HTTPException(status_code=400, detail=f"unknown profile: {profile!r}")
+    from app.services import audit
+
+    audit.record_request_event(
+        db, settings, request,
+        event_type=("archive_enqueue_blocked" if result.blocked else "archive_enqueue_created"),
+        category="archive", severity=("warning" if result.blocked else "info"),
+        outcome=("blocked" if result.blocked else "success"), action="enqueue",
+        reason_code=("disk_guard" if result.blocked else None),
+        metadata={"profile": profile, "limit": req.limit, "dry_run": req.dry_run,
+                  "jobs_created": result.jobs_created, "selected": result.selected_count},
+    )
     return LikedArchiveEnqueueOut(**result.__dict__)
+
+
+@router.get("/operations", response_model=LikedOperationsOut)
+def liked_operations(db: Session = Depends(get_db)) -> LikedOperationsOut:
+    """Phase 9A: consolidated body-archive operations snapshot (disk / queue /
+    orphan / duplicate / DB size). Counts + figures only — no raw_json / paths."""
+    return LikedOperationsOut(**la.operations_status(db, get_settings()))
 
 
 @router.get("/retryable", response_model=list[JobOutClassified])

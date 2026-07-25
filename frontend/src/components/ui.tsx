@@ -3,15 +3,18 @@ import { statusKind, stateKind } from "../lib/format";
 
 export function Loading({ what }: { what?: string }) {
   return (
-    <div className="loading">
-      <span className="spin" /> Loading{what ? ` ${what}` : ""}…
+    <div className="loading" role="status" aria-live="polite">
+      <span className="spin" aria-hidden="true" /> Loading{what ? ` ${what}` : ""}…
     </div>
   );
 }
 
 export function ErrorBox({ error }: { error: string | null }) {
   if (!error) return null;
-  return <div className="error-box">⚠ {error}</div>;
+  // role=alert so assistive tech announces the failure; the message is a short
+  // human string (never a raw stack trace / host path / secret — callers pass a
+  // sanitized message from the API layer).
+  return <div className="error-box" role="alert">⚠ {error}</div>;
 }
 
 export function Empty({ children }: { children: ReactNode }) {

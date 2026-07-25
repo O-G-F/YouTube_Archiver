@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a problem with YouTube Local Archiver
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! **Do not paste secrets, cookies, tokens, real
+        URLs, personal data, or host paths.** Redact anything sensitive.
+        For **security** issues, use the Security tab → *Report a vulnerability*
+        instead of a public issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+      placeholder: When I …, I expected … but got …
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Go to …
+        2. Click …
+        3. See …
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / screenshots (redacted)
+      description: Console / network errors or screenshots — remove any secrets or personal data first.
+      render: shell
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "e.g. Docker Compose, macOS/Linux, browser + version, commit hash"
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmations
+      options:
+        - label: I removed all secrets / cookies / tokens / personal data from this report.
+          required: true
+        - label: This is not a security vulnerability (those go via a private Security Advisory).
+          required: true

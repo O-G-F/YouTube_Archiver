@@ -257,6 +257,141 @@ def permanent_metadata_video_ids(session: Session) -> set[int]:
 
 
 # --------------------------------------------------------------------------- #
+# Phase 9A: per-video size estimator + disk capacity guard
+# --------------------------------------------------------------------------- #
+_GIB = 1024 ** 3
+_MIB = 1024 ** 2
+
+
+def video_size_estimate(session: Session, settings: Settings) -> dict:
+    """Conservative per-video body-size estimate from saved 'video' media files.
+
+    Computes avg / median / p90 of real ``filesize`` values; the estimate is the
+    p90 (bounded below by the average) so batch planning errs LARGE. Falls back to
+    a fixed size when there is too little history. Reads sizes only — no paths,
+    titles, or raw_json.
+    """
+    sizes = [
+        int(s)
+        for s in session.scalars(
+            select(MediaFile.filesize).where(
+                MediaFile.media_type == "video",
+                MediaFile.filesize.is_not(None),
+                MediaFile.filesize > 0,
+            )
+        )
+    ]
+    fallback_bytes = int(max(0.0, settings.archive_size_estimate_fallback_mb) * _MIB) or _MIB
+    min_samples = max(1, settings.archive_size_estimate_min_samples)
+    n = len(sizes)
+    if n < min_samples:
+        return {
+            "source": "fallback",
+            "sample_count": n,
+            "estimate_bytes": fallback_bytes,
+            "estimate_mb": round(fallback_bytes / _MIB, 1),
+            "avg_mb": None,
+            "median_mb": None,
+            "p90_mb": None,
+        }
+    sizes.sort()
+    avg = sum(sizes) / n
+    median = sizes[n // 2]
+    p90 = sizes[min(n - 1, int(round(0.9 * (n - 1))))]
+    estimate = max(int(p90), int(avg))  # conservative: err large
+    return {
+        "source": "measured",
+        "sample_count": n,
+        "estimate_bytes": estimate,
+        "estimate_mb": round(estimate / _MIB, 1),
+        "avg_mb": round(avg / _MIB, 1),
+        "median_mb": round(median / _MIB, 1),
+        "p90_mb": round(p90 / _MIB, 1),
+    }
+
+
+def capacity_plan(
+    session: Session,
+    settings: Settings,
+    *,
+    selected_count: int,
+    min_free_gb: float | None = None,
+    allow_low_disk: bool = False,
+) -> dict:
+    """Disk-capacity decision for a body run of ``selected_count`` videos (Phase 9A).
+
+    ``blocked`` is True ONLY when the disk is READABLE and the run would (or the
+    volume already does) drop below ``min_free_gb`` — and it is not overridden by
+    ``allow_low_disk``. When free space is unreadable we cannot prove low disk, so
+    we never hard-block on it (the caller can still see ``disk_readable=False``).
+    """
+    from app.services import storage
+
+    disk = storage.disk_usage(settings)
+    est = video_size_estimate(session, settings)
+    per = max(1, int(est["estimate_bytes"]))
+    if min_free_gb is None:
+        min_free_gb = settings.archive_min_free_gb
+    min_free_bytes = int(max(0.0, min_free_gb) * _GIB)
+    selected_count = max(0, int(selected_count))
+    required = selected_count * per
+    free = disk.get("free_bytes")
+
+    out = {
+        "disk": disk,
+        "size_estimate": est,
+        "selected_count": selected_count,
+        "estimated_required_bytes": required,
+        "estimated_required_gb": round(required / _GIB, 2),
+        "min_free_gb": round(float(min_free_gb), 2),
+        "min_free_bytes": min_free_bytes,
+        "allow_low_disk": bool(allow_low_disk),
+        "disk_readable": bool(disk.get("readable")),
+    }
+    if free is None:
+        out.update(
+            estimated_free_after_bytes=None,
+            estimated_free_after_gb=None,
+            already_below_min_free=False,
+            would_go_below_min_free=False,
+            disk_safe_limit=None,
+            blocked=False,
+            block_reason=None,
+            note="disk free space unreadable — capacity guard skipped",
+        )
+        return out
+
+    estimated_free_after = free - required
+    already_low = free < min_free_bytes
+    would_low = estimated_free_after < min_free_bytes
+    disk_safe_limit = int(max(0, (free - min_free_bytes) // per))
+    unsafe = already_low or would_low
+    blocked = bool(unsafe and not allow_low_disk)
+    reason: str | None = None
+    if unsafe:
+        if already_low:
+            reason = (f"free {disk['free_gb']} GiB is already below min-free "
+                      f"{out['min_free_gb']} GiB")
+        else:
+            reason = (f"a run of {selected_count} (~{out['estimated_required_gb']} GiB) would leave "
+                      f"{round(estimated_free_after / _GIB, 2)} GiB, below min-free {out['min_free_gb']} GiB "
+                      f"(disk-safe limit {disk_safe_limit})")
+        if allow_low_disk:
+            reason = "OVERRIDDEN by --allow-low-disk: " + reason
+    out.update(
+        estimated_free_after_bytes=estimated_free_after,
+        estimated_free_after_gb=round(estimated_free_after / _GIB, 2),
+        already_below_min_free=already_low,
+        would_go_below_min_free=would_low,
+        disk_safe_limit=disk_safe_limit,
+        blocked=blocked,
+        block_reason=reason,
+        note=None,
+    )
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Plan / dry-run
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -265,6 +400,10 @@ class ArchivePlan:
     missing_metadata: int = 0
     missing_body: int = 0
     has_body: int = 0
+    # Phase 8A: body archive also excludes permanent (private/deleted/unavailable)
+    # — they can't be downloaded and are kept, never deleted.
+    permanent_excluded: int = 0
+    eligible_missing_body: int = 0
     existing_active_jobs: int = 0
     existing_retryable: int = 0
     recommended_limit: int = 0
@@ -272,6 +411,25 @@ class ArchivePlan:
     recommended_profile: str = ""
     profile: str = ""
     notes: list[str] = field(default_factory=list)
+    # Phase 9A: batch planning + disk capacity guard.
+    requested_limit: int = 0
+    cap_per_run: int = 0
+    selected_count: int = 0          # what a run at the requested limit would enqueue (pre-disk-guard)
+    disk_safe_limit: int | None = None
+    limiting_factor: str = ""        # requested | cap | eligible | disk
+    blocked: bool = False
+    block_reason: str | None = None
+    # flattened disk / size-estimate figures (no host path — leak-safe)
+    disk_readable: bool = True
+    disk_total_gb: float | None = None
+    disk_used_gb: float | None = None
+    disk_free_gb: float | None = None
+    min_free_gb: float = 0.0
+    estimated_size_per_video_mb: float = 0.0
+    size_estimate_source: str = ""
+    size_estimate_sample_count: int = 0
+    estimated_required_gb: float = 0.0
+    estimated_free_after_gb: float | None = None
 
 
 def archive_plan(
@@ -283,7 +441,7 @@ def archive_plan(
     limit: int | None = None,
 ) -> ArchivePlan:
     """Count what an archive run WOULD touch (no jobs created)."""
-    prof = profile or settings.liked_archive_default_profile
+    prof = profile or settings.effective_body_archive_profile
     # full filtered set, deduped by youtube id (ignore body/metadata sub-filters here)
     base = LikedFilters(
         source=filters.source,
@@ -297,6 +455,14 @@ def archive_plan(
     missing_meta = sum(1 for _lv, _v, st in cands if not st["has_metadata"])
     missing_body = sum(1 for _lv, _v, st in cands if not st["has_body"])
     has_body = sum(1 for _lv, _v, st in cands if st["has_body"])
+    # Phase 8A: permanent (private/deleted/unavailable) videos can't be downloaded;
+    # they are excluded from the body run by default (kept, never deleted).
+    permanent_ids = permanent_metadata_video_ids(session)
+    permanent_excluded = sum(
+        1 for _lv, v, st in cands
+        if v is not None and v.id in permanent_ids and not st["has_body"]
+    )
+    eligible_missing_body = max(missing_body - permanent_excluded, 0)
 
     active = 0
     for _lv, v, _st in cands:
@@ -305,11 +471,22 @@ def archive_plan(
 
     retryable = len(retryable_liked(session, settings, reason=None, limit=10_000))
 
-    rec_limit = min(
-        limit or settings.liked_archive_default_limit,
-        settings.liked_archive_max_enqueue_per_run,
-        max(missing_body, 0) or settings.liked_archive_default_limit,
-    )
+    # ---- Phase 9A: batch planning + disk capacity guard ----
+    requested_limit = int(limit or settings.liked_archive_default_limit)
+    cap = int(settings.liked_archive_max_enqueue_per_run)
+    # What a run at the requested limit WOULD enqueue, ignoring disk (cap + eligible bound it).
+    intended = max(0, min(requested_limit, cap, eligible_missing_body))
+    capr = capacity_plan(session, settings, selected_count=intended)
+    disk = capr["disk"]
+    est = capr["size_estimate"]
+    disk_safe = capr.get("disk_safe_limit")  # None when free space is unreadable
+
+    bounds = {"requested": requested_limit, "cap": cap, "eligible": eligible_missing_body}
+    if disk_safe is not None:
+        bounds["disk"] = disk_safe
+    recommended_limit = max(0, min(bounds.values()))
+    limiting_factor = min(bounds, key=lambda k: bounds[k])
+
     rec_delay = (
         settings.liked_archive_job_delay_seconds
         or settings.download_job_delay_seconds
@@ -318,21 +495,45 @@ def archive_plan(
     notes = [
         "Start small: archive 10-30 videos at a time, then check classification.",
         "metadata_only does NOT download the body; a video profile DOES.",
+        "Size is an ESTIMATE (p90 of saved videos); actual varies with video length.",
     ]
     if missing_meta:
         notes.append(f"{missing_meta} need metadata first (run enqueue-metadata).")
+    if capr.get("blocked"):
+        notes.append(f"DISK BLOCK: {capr.get('block_reason')}")
+    elif not capr.get("disk_readable"):
+        notes.append("Disk free space unreadable here — capacity guard is inactive.")
     return ArchivePlan(
         total_candidates=total,
         missing_metadata=missing_meta,
         missing_body=missing_body,
         has_body=has_body,
+        permanent_excluded=permanent_excluded,
+        eligible_missing_body=eligible_missing_body,
         existing_active_jobs=active,
         existing_retryable=retryable,
-        recommended_limit=rec_limit,
+        recommended_limit=recommended_limit,
         recommended_delay_seconds=rec_delay,
-        recommended_profile=settings.liked_archive_default_profile,
+        recommended_profile=settings.effective_body_archive_profile,
         profile=prof,
         notes=notes,
+        requested_limit=requested_limit,
+        cap_per_run=cap,
+        selected_count=intended,
+        disk_safe_limit=disk_safe,
+        limiting_factor=limiting_factor,
+        blocked=bool(capr.get("blocked")),
+        block_reason=capr.get("block_reason"),
+        disk_readable=bool(capr.get("disk_readable")),
+        disk_total_gb=disk.get("total_gb"),
+        disk_used_gb=disk.get("used_gb"),
+        disk_free_gb=disk.get("free_gb"),
+        min_free_gb=capr.get("min_free_gb", settings.archive_min_free_gb),
+        estimated_size_per_video_mb=est.get("estimate_mb", 0.0),
+        size_estimate_source=est.get("source", ""),
+        size_estimate_sample_count=est.get("sample_count", 0),
+        estimated_required_gb=capr.get("estimated_required_gb", 0.0),
+        estimated_free_after_gb=capr.get("estimated_free_after_gb"),
     )
 
 
@@ -368,6 +569,10 @@ class EnqueueResult:
     profile: str = ""
     downloads_body: bool = False
     dry_run: bool = False
+    # Phase 9A: disk capacity guard outcome (body archive only).
+    blocked: bool = False
+    block_reason: str | None = None
+    capacity: dict = field(default_factory=dict)
 
 
 def _create_liked_job(
@@ -421,10 +626,28 @@ def _enqueue(
     submit: bool = True,
     extra_meta: dict | None = None,
     exclude_permanent: bool = False,
+    prioritize_info_json: bool = False,
+    disk_guard: bool = False,
+    allow_low_disk: bool = False,
+    min_free_gb: float | None = None,
 ) -> EnqueueResult:
     cap = settings.liked_archive_max_enqueue_per_run
     eff_limit = min(limit or settings.liked_archive_default_limit, cap)
     res = EnqueueResult(profile=profile, downloads_body=downloads_body, dry_run=dry_run)
+    # Phase 9A: disk capacity guard (body archive). Estimate the whole batch
+    # (eff_limit) conservatively; REFUSE a real run that would drop below min-free
+    # unless overridden. Skipped when free space is unreadable (can't prove low).
+    if disk_guard:
+        capr = capacity_plan(
+            session, settings, selected_count=eff_limit,
+            min_free_gb=min_free_gb, allow_low_disk=allow_low_disk,
+        )
+        res.capacity = capr
+        res.blocked = bool(capr.get("blocked"))
+        res.block_reason = capr.get("block_reason")
+        if res.blocked and not dry_run:
+            logger.warning("liked archive: enqueue BLOCKED by disk guard: %s", res.block_reason)
+            return res  # refuse — no jobs created
     # Phase 7J: skip videos whose latest metadata attempt was permanent
     # (private/deleted/unavailable) so they aren't re-enqueued every batch.
     permanent_ids = permanent_metadata_video_ids(session) if exclude_permanent else set()
@@ -440,6 +663,13 @@ def _enqueue(
         liked_before=filters.liked_before,
     )
     cands = _select_candidates(session, sel_filters, limit=None)
+    if prioritize_info_json:
+        # Phase 8A: archive videos we have COMPLETE metadata for (info_json) first,
+        # keeping liked_at-desc order within each group (stable sort).
+        info_ids = _media_type_video_ids(
+            session, [v.id for _l, v, _s in cands if v is not None], "info_json"
+        )
+        cands.sort(key=lambda t: 0 if (t[1] is not None and t[1].id in info_ids) else 1)
     for lv, video, state in cands:
         if res.selected_count >= eff_limit:
             break
@@ -470,9 +700,14 @@ def _enqueue(
         if submit:
             for jid in res.job_ids:
                 try:
-                    jobs_svc.submit_job(jid)
+                    # Phase 8C: persist rq_job_id so tooling can correlate DB<->RQ.
+                    rq_id = jobs_svc.submit_job(jid)
+                    job = session.get(Job, jid)
+                    if job is not None:
+                        job.rq_job_id = rq_id
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("liked archive: job %s not submitted: %s", jid, exc)
+            session.commit()
     return res
 
 
@@ -520,9 +755,23 @@ def enqueue_archive(
     dry_run: bool = False,
     submit: bool = True,
     extra_meta: dict | None = None,
+    exclude_permanent: bool = True,
+    prioritize_info_json: bool = True,
+    allow_low_disk: bool = False,
+    min_free_gb: float | None = None,
 ) -> EnqueueResult:
-    """Enqueue a BODY archive (downloads the video body with the given profile)."""
-    prof = profile or settings.liked_archive_default_profile
+    """Enqueue a BODY archive (downloads the video body with the given profile).
+
+    Phase 8A: permanent failures (private/deleted/unavailable) are excluded by
+    default — they can't be downloaded and are kept, never deleted. Pass
+    ``exclude_permanent=False`` to override (not recommended). Videos with a
+    complete info_json are archived first (``prioritize_info_json``).
+
+    Phase 9A: defaults to the production body profile (comments-light) and applies
+    the disk capacity guard — a real run that would drop the archive volume below
+    ARCHIVE_MIN_FREE_GB is REFUSED unless ``allow_low_disk=True``.
+    """
+    prof = profile or settings.effective_body_archive_profile
     get_profile_spec(session, prof)
     return _enqueue(
         session,
@@ -535,6 +784,11 @@ def enqueue_archive(
         downloads_body=True,
         submit=submit,
         extra_meta=extra_meta,
+        exclude_permanent=exclude_permanent,
+        prioritize_info_json=prioritize_info_json,
+        disk_guard=True,
+        allow_low_disk=allow_low_disk,
+        min_free_gb=min_free_gb,
     )
 
 
@@ -609,7 +863,7 @@ def progress(session: Session, settings: Settings, *, top_channels: int = 10) ->
 
     seen: set[str] = set()
     total = meta_fetched = body_saved = 0
-    skipped_permanent_meta = permanent_unique = 0
+    skipped_permanent_meta = permanent_unique = eligible_body = 0
     info_json_complete = description_only = retryable_partial = 0
     by_source: dict[str, int] = {}
     by_channel: dict[str, int] = {}
@@ -642,6 +896,8 @@ def progress(session: Session, settings: Settings, *, top_channels: int = 10) ->
                 retryable_partial += 1  # upgradeable to full info_json via retry-metadata
         if has_body:
             body_saved += 1
+        elif not is_permanent:
+            eligible_body += 1  # Phase 9A: missing body AND downloadable (not permanent)
         if is_permanent:
             permanent_unique += 1
             if not has_meta:
@@ -690,6 +946,9 @@ def progress(session: Session, settings: Settings, *, top_channels: int = 10) ->
         "permanent_unique_videos": permanent_unique,
         "body_saved": body_saved,
         "body_missing": total - body_saved,
+        # Phase 9A: missing body minus permanent (private/deleted/unavailable) =
+        # what a body archive run can actually download. permanent kept, not deleted.
+        "eligible_missing_body": eligible_body,
         "active_archive_jobs": active_archive,
         "retryable_liked_jobs": retryable,
         "failed_liked_jobs": failed,
@@ -700,6 +959,64 @@ def progress(session: Session, settings: Settings, *, top_channels: int = 10) ->
         "latest_liked_at": latest.isoformat() if latest else None,
         "last_archive_job_at": last_archive_at.isoformat() if last_archive_at else None,
         "last_successful_archive_at": last_success_at.isoformat() if last_success_at else None,
+    }
+
+
+def operations_status(session: Session, settings: Settings) -> dict:
+    """Phase 9A: one-shot production operations snapshot for body archiving.
+
+    Consolidates progress + disk + size estimate + orphan/duplicate + DB stats
+    (comments table size, raw_json total) so an operator sees, at a glance,
+    whether it is safe to run another batch. Counts/figures only — never
+    raw_json, titles, cookies, or host paths.
+    """
+    from app.services import db_stats as dbs
+    from app.services import queue_health
+    from app.services import reconcile
+    from app.services import storage
+
+    prog = progress(session, settings)
+    disk = storage.disk_usage(settings)
+    est = video_size_estimate(session, settings)
+    stats = dbs.db_stats(session)
+    q = queue_health.queue_status(session)
+
+    # orphan dry-run summary (never mutates; guards a down/absent RQ)
+    try:
+        orphan = reconcile.reconcile_orphans(session, settings, apply=False)
+        orphan_summary = {
+            "scanned": orphan.get("scanned", 0),
+            "orphan_found": orphan.get("orphan_found", 0),
+            "rq_unreadable": bool(orphan.get("rq_unreadable")),
+        }
+    except Exception as exc:  # noqa: BLE001 - status must never crash
+        logger.warning("operations_status: orphan check failed: %s", exc)
+        orphan_summary = {"scanned": 0, "orphan_found": 0, "rq_unreadable": True}
+
+    try:
+        dup_count = len(reconcile.duplicate_video_media(session))
+    except Exception:  # noqa: BLE001
+        dup_count = 0
+
+    comments_bytes = (stats.get("table_sizes_bytes") or {}).get("comments")
+
+    return {
+        "default_body_profile": settings.effective_body_archive_profile,
+        "body_saved": prog.get("body_saved", 0),
+        "remaining_eligible_body": prog.get("eligible_missing_body", 0),
+        "permanent_unique_videos": prog.get("permanent_unique_videos", 0),
+        "active_archive_jobs": prog.get("active_archive_jobs", 0),
+        "queued_jobs": q.get("queued", 0),
+        "running_jobs": q.get("running", 0),
+        "total_active_jobs": q.get("total_active", 0),
+        "worker_count": q.get("worker_count", 0),
+        "disk": disk,
+        "min_free_gb": settings.archive_min_free_gb,
+        "size_estimate": est,
+        "orphan": orphan_summary,
+        "duplicate_video_media_files": dup_count,
+        "comments_table_bytes": int(comments_bytes) if comments_bytes else 0,
+        "raw_json_stored_total": stats.get("raw_json_stored_total", 0),
     }
 
 

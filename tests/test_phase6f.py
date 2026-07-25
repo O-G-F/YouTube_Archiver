@@ -82,8 +82,11 @@ def test_build_info_has_stable_id_and_job_types():
 
 
 def test_build_info_api(client):
+    from app import __version__
+
     r = client.get("/api/system/build-info").json()
-    assert r["app_version"] == "0.1.0" and r["build_id"]
+    # version-agnostic: track the package version rather than a hard-coded literal
+    assert r["app_version"] == __version__ and r["build_id"]
     assert "takeout_import" in r["supported_job_types"]
 
 

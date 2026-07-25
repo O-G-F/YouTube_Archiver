@@ -100,13 +100,20 @@ def test_latest_attempt_wins_recovered_video_not_permanent(settings, session):
     assert v.id not in la.permanent_metadata_video_ids(session)
 
 
-def test_body_archive_selection_unaffected_by_metadata_permanent(settings, session):
-    # a video private for METADATA is still offered to body-archive (separate path)
-    ids = _setup(session)
+def test_body_archive_excludes_permanent_by_default(settings, session):
+    # Phase 8A: body archive now ALSO excludes permanent (private/deleted/unavailable)
+    # by default — they can't be downloaded and are kept, never deleted.
+    _setup(session)
     r = la.enqueue_archive(session, get_settings(), filters=la.LikedFilters(missing_body=True),
                            limit=50, profile="video_compressed_1080p", dry_run=True, submit=False)
-    assert r.skipped_permanent == 0  # body path does not apply the metadata-permanent skip
-    assert r.selected_count >= 7
+    assert r.skipped_permanent == 3      # private/deleted/unavailable excluded
+    assert r.selected_count == 4         # 3 retryable + 1 fresh
+    # --include-permanent (exclude_permanent=False) restores the old behavior.
+    r2 = la.enqueue_archive(session, get_settings(), filters=la.LikedFilters(missing_body=True),
+                            limit=50, profile="video_compressed_1080p", dry_run=True,
+                            submit=False, exclude_permanent=False)
+    assert r2.skipped_permanent == 0
+    assert r2.selected_count == 7
 
 
 def test_progress_eligible_and_permanent(settings, session):

@@ -24,6 +24,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -360,9 +361,9 @@ class Job(Base):
     # records provenance when a retry is created as a fresh job; next_retry_at
     # lets the scheduler pick up retryable jobs after a backoff window.
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
-    retry_of_job_id: Mapped[int | None] = mapped_column(
-        ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
-    )
+    # plain informational self-reference — migration 6279ed580c1a deliberately
+    # adds NO foreign key, so the model must not declare one either
+    retry_of_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     next_retry_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True, index=True
     )
@@ -553,3 +554,93 @@ class DiaryEntry(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow, onupdate=utcnow
     )
+
+
+# --------------------------------------------------------------------------- #
+# Phase 9E: append-only audit trail (tamper-evident hash chain)
+# --------------------------------------------------------------------------- #
+class AuditEvent(Base):
+    """Append-only audit record. Actor/client identifiers are stored ONLY as
+    stable HMAC pseudonyms (never raw email/IP); metadata is an allow-listed dict
+    with no secrets/paths/raw_json. Rows are never updated or deleted except by
+    retention cleanup (which records an AuditCheckpoint)."""
+
+    __tablename__ = "audit_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    category: Mapped[str] = mapped_column(String(32), index=True)   # auth|archive|ingest|scheduler|ops|deploy|security
+    severity: Mapped[str] = mapped_column(String(16), index=True)   # info|warning|critical
+    outcome: Mapped[str] = mapped_column(String(16))               # success|failure|blocked|denied
+    actor_kind: Mapped[str] = mapped_column(String(16))            # admin|proxy|system|anonymous
+    actor_id_hash: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    client_id_hash: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    resource_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    resource_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    action: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reason_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    previous_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    event_hash: Mapped[str] = mapped_column(String(64), index=True)
+    # Phase 9E.1: signing metadata (part of the canonical hash for chain_version>=2).
+    chain_version: Mapped[int] = mapped_column(Integer, default=1)
+    signature_scheme: Mapped[str] = mapped_column(String(20), default="sha256_unsigned")  # sha256_unsigned | hmac_sha256
+    signing_key_id: Mapped[str] = mapped_column(String(32), default="legacy")  # short id, never the key/path
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class AuditCheckpoint(Base):
+    """Boundary marker (Phase 9E/9E.1). ``checkpoint_type`` distinguishes retention
+    pruning from signing-lifecycle boundaries (signing_enabled / key_rotated /
+    restore_boundary). Stores hashes + short key ids only — never key values/paths —
+    and is itself tamper-evident via ``checkpoint_hash``."""
+
+    __tablename__ = "audit_checkpoints"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # nullable to match migration e5f6a7b8c9d0 (legacy retention rows predate it)
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime, default=utcnow, nullable=True)
+    checkpoint_type: Mapped[str] = mapped_column(String(24), default="retention")
+    reason: Mapped[str | None] = mapped_column(String(32), default="", nullable=True)
+    reason_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    # retention (existing) fields
+    up_to_event_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    boundary_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    deleted_count: Mapped[int] = mapped_column(Integer, default=0)
+    # signing-boundary fields
+    previous_event_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    previous_event_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    next_event_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    previous_signing_key_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    next_signing_key_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    checkpoint_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class _AuditAppendOnly(Exception):
+    """Raised when something tries to UPDATE/DELETE an audit event via the ORM."""
+
+
+@event.listens_for(AuditEvent, "before_update", propagate=True)
+def _audit_no_update(mapper, connection, target):  # noqa: ANN001
+    raise _AuditAppendOnly("audit_events are append-only (update refused)")
+
+
+@event.listens_for(AuditEvent, "before_delete", propagate=True)
+def _audit_no_delete(mapper, connection, target):  # noqa: ANN001
+    # Retention cleanup deletes via a bulk Core statement (not the ORM unit-of-work),
+    # so this ORM-level guard blocks accidental per-row deletes without blocking cleanup.
+    raise _AuditAppendOnly("audit_events are append-only (ORM delete refused; use retention cleanup)")
+
+
+@event.listens_for(AuditCheckpoint, "before_update", propagate=True)
+def _checkpoint_no_update(mapper, connection, target):  # noqa: ANN001
+    raise _AuditAppendOnly("audit_checkpoints are append-only (update refused)")
+
+
+@event.listens_for(AuditCheckpoint, "before_delete", propagate=True)
+def _checkpoint_no_delete(mapper, connection, target):  # noqa: ANN001
+    raise _AuditAppendOnly("audit_checkpoints are append-only (ORM delete refused)")

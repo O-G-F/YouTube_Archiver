@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
+import { useModalA11y } from "../lib/useModalA11y";
 import { fmtDate } from "../lib/format";
 import { ErrorBox, Loading } from "./ui";
 import { Sparkline } from "./Sparkline";
@@ -39,6 +40,7 @@ export function SchedulerHistory() {
   const [copied, setCopied] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [detail, setDetail] = useState<SchedulerRun | null>(null);
+  useModalA11y(detail !== null, () => setDetail(null));
 
   // cleanup
   const [keepLast, setKeepLast] = useState(20);

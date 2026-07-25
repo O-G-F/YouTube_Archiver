@@ -96,7 +96,7 @@ def test_archive_plan_counts(settings, session):
     assert plan.missing_metadata == 1  # only C
     assert plan.missing_body == 2  # B + C
     assert plan.has_body == 1  # A
-    assert plan.recommended_profile == settings.liked_archive_default_profile
+    assert plan.recommended_profile == settings.effective_body_archive_profile  # Phase 9A: comments-light
     assert plan.recommended_delay_seconds > 0
 
 

@@ -502,6 +502,8 @@ export interface LikedArchivePlan {
   missing_metadata: number;
   missing_body: number;
   has_body: number;
+  permanent_excluded?: number;
+  eligible_missing_body?: number;
   existing_active_jobs: number;
   existing_retryable: number;
   recommended_limit: number;
@@ -509,6 +511,24 @@ export interface LikedArchivePlan {
   recommended_profile: string;
   profile: string;
   notes: string[];
+  // Phase 9A: batch planning + disk capacity guard
+  requested_limit?: number;
+  cap_per_run?: number;
+  selected_count?: number;
+  disk_safe_limit?: number | null;
+  limiting_factor?: string;
+  blocked?: boolean;
+  block_reason?: string | null;
+  disk_readable?: boolean;
+  disk_total_gb?: number | null;
+  disk_used_gb?: number | null;
+  disk_free_gb?: number | null;
+  min_free_gb?: number;
+  estimated_size_per_video_mb?: number;
+  size_estimate_source?: string;
+  size_estimate_sample_count?: number;
+  estimated_required_gb?: number;
+  estimated_free_after_gb?: number | null;
 }
 
 export interface LikedArchiveEnqueueResult {
@@ -517,10 +537,261 @@ export interface LikedArchiveEnqueueResult {
   skipped_existing_job: number;
   skipped_already_has_metadata: number;
   skipped_already_has_body: number;
+  skipped_permanent?: number;
   job_ids: number[];
   profile: string;
   downloads_body: boolean;
   dry_run: boolean;
+  // Phase 9A: disk capacity guard outcome
+  blocked?: boolean;
+  block_reason?: string | null;
+  capacity?: Record<string, unknown>;
+}
+
+// Phase 9A: consolidated body-archive operations status
+export interface LikedOperations {
+  default_body_profile: string;
+  body_saved: number;
+  remaining_eligible_body: number;
+  permanent_unique_videos: number;
+  active_archive_jobs: number;
+  queued_jobs: number;
+  running_jobs: number;
+  total_active_jobs: number;
+  worker_count: number;
+  disk: {
+    readable: boolean;
+    total_gb: number | null;
+    used_gb: number | null;
+    free_gb: number | null;
+    used_percent: number | null;
+  };
+  min_free_gb: number;
+  size_estimate: {
+    source: string;
+    sample_count: number;
+    estimate_mb: number;
+    avg_mb: number | null;
+    median_mb: number | null;
+    p90_mb: number | null;
+  };
+  orphan: { scanned: number; orphan_found: number; rq_unreadable: boolean };
+  duplicate_video_media_files: number;
+  comments_table_bytes: number;
+  raw_json_stored_total: number;
+}
+
+// Phase 9E: audit trail
+export interface AuditEvent {
+  id: number;
+  occurred_at: string | null;
+  event_type: string;
+  category: string;
+  severity: string;
+  outcome: string;
+  actor_kind: string;
+  actor_id_hash: string | null;
+  client_id_hash: string | null;
+  request_id: string | null;
+  correlation_id: string | null;
+  resource_type: string | null;
+  resource_id: string | null;
+  action: string | null;
+  reason_code: string | null;
+  metadata: Record<string, unknown> | null;
+  event_hash: string;
+}
+export interface AuditStats {
+  total: number;
+  window_days: number;
+  by_category: Record<string, number>;
+  by_severity: Record<string, number>;
+  by_outcome: Record<string, number>;
+}
+export interface AuditVerify {
+  valid: boolean;
+  valid_with_warnings: boolean;
+  checked_count: number;
+  segment_count: number;
+  checkpoint_count: number;
+  current_signing_key_id: string | null;
+  unsigned_event_count: number;
+  missing_verification_keys: string[];
+  first_invalid_event_id: number | null;
+  failure_reason_code: string | null;
+  signed: boolean;
+}
+
+// Phase 9C: auth
+export interface AuthSession {
+  authenticated: boolean;
+  auth_mode: "disabled" | "local" | "trusted_proxy";
+  app_env: string;
+  identity: string | null;
+  login_required: boolean;
+}
+
+// Phase 9B: production deployment readiness
+export interface ProductionCheckItem {
+  name: string;
+  status: "pass" | "warn" | "fail";
+  detail: string;
+}
+export interface ProductionCheck {
+  overall: "pass" | "warn" | "fail";
+  counts: { pass?: number; warn?: number; fail?: number };
+  checks: ProductionCheckItem[];
+  default_body_profile: string;
+  app_env?: string;
+  auth_mode?: string;
+  disk_min_free_gb: number;
+  backup_reminder: string;
+}
+// Phase 9F: read-only backup / disaster-recovery readiness
+export interface BackupManifestSummary {
+  artifact?: string | null;
+  size_bytes?: number | null;
+  sha256?: string | null;
+  schema_head?: string | null;
+  created_at?: string | null;
+  manifest_version?: number | null;
+  // v2 backup-set fields (Phase 9F.1)
+  backup_id?: string | null;
+  completed?: boolean | null;
+  app_version?: string | null;
+  build_id?: string | null;
+  active_jobs_at_backup?: number | null;
+  audit_head_event_id?: number | null;
+  redis_recovery_mode?: string | null;
+  encrypted?: boolean | null;
+  archive_manifest_artifact?: string | null;
+  archive_manifest_sha256?: string | null;
+  integrity_scheme?: string | null;
+}
+export interface BackupReadiness {
+  overall: "pass" | "warn" | "fail";
+  counts: { pass?: number; warn?: number; fail?: number };
+  checks: ProductionCheckItem[];
+  manifest?: BackupManifestSummary | null;
+  backup_age_hours?: number | null;
+  backup_verified_age_hours?: number | null;
+  restore_rehearsal_age_days?: number | null;
+}
+
+// Phase 10A: release / provenance readiness (read-only)
+export interface VersionInfo {
+  app_version: string;
+  git_commit?: string | null;
+  git_tree_clean?: boolean | null;
+  build_id: string;
+  build_timestamp?: string | null;
+  schema_head?: string | null;
+  frontend_build_id?: string | null;
+  image_digest?: string | null;
+}
+export interface ReleaseManifestSummary {
+  manifest_version?: number | null;
+  release_id?: string | null;
+  app_version?: string | null;
+  git_commit?: string | null;
+  git_tree_clean?: boolean | null;
+  build_id?: string | null;
+  schema_head?: string | null;
+  frontend_build_id?: string | null;
+  completed?: boolean | null;
+  service_build_ids?: string[];
+  service_count?: number | null;
+  image_digests_captured?: number | null;
+  sbom_present?: boolean | null;
+  sbom_sha256?: string | null;
+  vulnerability_status?: string | null;
+  vulnerability_severities?: Record<string, number> | null;
+  vulnerability_tool?: string | null;
+  vulnerability_tool_version?: string | null;
+  vulnerability_db_updated_at?: string | null;
+  release_check_overall?: string | null;
+  integrity_scheme?: string | null;
+  backend_test_count?: number | null;
+  frontend_test_count?: number | null;
+  // Phase 10A.1 reproducible-lock / supply-chain gates
+  python_lock_exact?: boolean | null;
+  python_lock_hashed?: boolean | null;
+  python_lock_package_count?: number | null;
+  base_python_digest_pinned?: boolean | null;
+  base_node_digest_pinned?: boolean | null;
+}
+export interface SecurityPosture {
+  operating_mode: string; // "local_single_user_dev" | "production"
+  known_critical_accepted: number | null;
+  exception_candidates: number | null;
+  active_vulnerability_exceptions: number;
+  reachability_assessed: boolean;
+  production_ready: boolean;
+  release_check_passes: boolean;
+  risk_acceptance_doc: string;
+  decision_dossier_doc: string;
+  note: string;
+}
+export interface FirstRunItem {
+  key: string;
+  label: string;
+  done: boolean;
+  detail: string;
+  link: string;
+  optional: boolean;
+  warn?: boolean;
+  danger?: boolean;
+}
+export interface FirstRunStatus {
+  is_fresh: boolean;
+  video_count: number;
+  liked_count: number;
+  job_count: number;
+  auth_mode: string;
+  web_bind_host: string;
+  web_bind_all_interfaces: boolean;
+  exposure_warning: boolean;
+  exposure_level: "none" | "warn" | "danger";
+  exposure_note: string;
+  items: FirstRunItem[];
+  done_count: number;
+  total_count: number;
+}
+export interface RuntimeReleaseStatus {
+  verdict: "match" | "mismatch" | "no_scanned_release";
+  message: string;
+  status_source: string;
+  manifest_matches_runtime: boolean;
+  runtime_build_id: string | null;
+  manifest_build_id: string | null;
+  runtime_app_version: string | null;
+  runtime_git_commit: string | null;
+  runtime_schema_head: string | null;
+  runtime_git_tree_clean: boolean | null;
+  manifest_app_version: string | null;
+  manifest_release_id: string | null;
+  manifest_git_commit: string | null;
+  manifest_age_seconds: number | null;
+  scan_age_seconds: number | null;
+}
+export interface ReleaseReadiness {
+  overall: "pass" | "warn" | "fail";
+  counts: { pass?: number; warn?: number; fail?: number };
+  checks: ProductionCheckItem[];
+  version: VersionInfo;
+  manifest?: ReleaseManifestSummary | null;
+  security_posture?: SecurityPosture | null; // Phase 11A
+  runtime_release?: RuntimeReleaseStatus | null; // Phase 11B
+}
+export interface ArchiveMediaCheck {
+  db_video_media_files: number;
+  checked: number;
+  existing: number;
+  missing: number;
+  missing_youtube_ids: string[];
+  duplicate_video_media_files: number;
+  disk: { readable: boolean; free_gb: number | null; total_gb: number | null; used_gb: number | null };
+  ok: boolean;
 }
 
 export interface LikedVideoStats {
@@ -670,6 +941,7 @@ export interface LikedProgress {
   permanent_unique_videos: number;
   body_saved: number;
   body_missing: number;
+  eligible_missing_body?: number;
   active_archive_jobs: number;
   retryable_liked_jobs: number;
   failed_liked_jobs: number;

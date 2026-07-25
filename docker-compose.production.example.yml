@@ -1,0 +1,43 @@
+# =====================================================================
+# Phase 9D: PRODUCTION compose override — tracked TEMPLATE.
+# Contains NO secret values and NO real host paths.
+# =====================================================================
+# Merge on top of the base file (copy to docker-compose.production.yml and adjust):
+#   docker compose -f docker-compose.yml -f docker-compose.production.yml up -d
+#
+# Key hardening vs the base file:
+#   * web is bound to LOOPBACK only (127.0.0.1) — never 0.0.0.0. Put a reverse
+#     proxy / Cloudflare Tunnel in front. To run the tunnel in THIS Docker network
+#     instead, DELETE the web `ports:` block so no host port is published at all.
+#   * postgres / redis are NOT host-published (internal network only) — the base
+#     file already omits their host ports; keep it that way.
+#   * worker / scheduler are never publicly exposed.
+#   * restart policy + web healthcheck for unattended operation.
+#   * volumes (pgdata / redisdata / archive) are inherited from the base file and
+#     must NOT be removed. NEVER run `docker compose down -v`.
+# =====================================================================
+services:
+  web:
+    ports:
+      - "127.0.0.1:${WEB_HOST_PORT:-8000}:8000"   # loopback only; or delete for tunnel-in-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 6s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    restart: unless-stopped
+
+  scheduler:
+    restart: unless-stopped
+
+  postgres:
+    restart: unless-stopped
+    # datastore stays on the internal Docker network — do NOT add host `ports:`.
+
+  redis:
+    restart: unless-stopped
+    # queue/rate-limit store stays internal — do NOT add host `ports:`.

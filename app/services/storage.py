@@ -12,9 +12,40 @@ directory:
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from app.config import Settings
+
+# Phase 9A: report disk figures in GiB (1024**3) to match `df -h` on the host.
+_GIB = 1024 ** 3
+
+
+def disk_usage(settings: Settings, path: Path | str | None = None) -> dict:
+    """Free/used/total space on the archive volume (Phase 9A).
+
+    Returns ``readable=False`` (and ``None`` figures) when the path can't be
+    stat'd — callers MUST treat "unreadable" as "cannot prove low disk" and not
+    hard-block on it. Never returns the host path itself (no path leak).
+    """
+    target = Path(path) if path is not None else settings.archive_root
+    try:
+        u = shutil.disk_usage(target)
+    except OSError:
+        return {
+            "readable": False,
+            "total_bytes": None, "used_bytes": None, "free_bytes": None,
+            "total_gb": None, "used_gb": None, "free_gb": None,
+            "used_percent": None,
+        }
+    return {
+        "readable": True,
+        "total_bytes": int(u.total), "used_bytes": int(u.used), "free_bytes": int(u.free),
+        "total_gb": round(u.total / _GIB, 2),
+        "used_gb": round(u.used / _GIB, 2),
+        "free_gb": round(u.free / _GIB, 2),
+        "used_percent": round(u.used / u.total * 100, 1) if u.total else None,
+    }
 
 
 def to_relative(settings: Settings, absolute: Path | str) -> str:

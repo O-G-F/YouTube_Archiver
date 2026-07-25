@@ -27,6 +27,10 @@ def settings(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file}")
     monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:6399/0")  # intentionally dead
     monkeypatch.setenv("COOKIES_FILE", "")
+    # Phase 9A: the archive root is a real tmp dir (readable), so the disk guard
+    # would otherwise gate on the HOST's free space. Default it OFF for tests; the
+    # Phase 9A guard tests set it explicitly alongside a monkeypatched disk_usage.
+    monkeypatch.setenv("ARCHIVE_MIN_FREE_GB", "0")
 
     get_settings.cache_clear()
     s = get_settings()

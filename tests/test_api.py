@@ -30,7 +30,8 @@ def test_profiles_listed(client):
     assert "video_best_archive" in names
     assert "video_best_archive_all_subs" in names
     assert "subtitles_refresh_only" in names
-    assert len(names) == 10
+    assert "video_compressed_1080p_light" in names  # Phase 8B comments-light profile
+    assert len(names) == 11
 
 
 def test_archive_url_creates_queued_job(client):

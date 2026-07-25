@@ -165,6 +165,44 @@ def system_preflight(session: Session, settings: Settings | None = None) -> dict
     # Assertion: this report exposes booleans/masked status only — never values.
     checks.append(_check("secret_value_exposed", "ok", "false — only configured/readable booleans are reported"))
 
+    # ---- orphan download jobs (Phase 8C): running/queued in DB but gone from RQ ----
+    try:
+        from app.services import reconcile
+
+        orphans = reconcile.orphan_warning_count(session, settings, older_than_minutes=30)
+        if orphans > 0:
+            checks.append(_check(
+                "orphan_jobs", "warn",
+                f"{orphans} download job(s) stuck (running/queued in DB, absent from RQ >30min) — "
+                "likely a worker crash/restart. Run `archiver jobs reconcile-orphans --dry-run` "
+                "then `--apply` to safely re-queue (no re-download of saved bodies).",
+            ))
+        else:
+            checks.append(_check("orphan_jobs", "ok", "no orphaned download jobs"))
+    except Exception:  # noqa: BLE001 - preflight must never crash on this
+        checks.append(_check("orphan_jobs", "warn", "orphan check unavailable (RQ unreadable)"))
+
+    # ---- archive disk free (Phase 9A): warn below the body-archive min-free guard ----
+    try:
+        from app.services import storage
+
+        disk = storage.disk_usage(settings)
+        if not disk.get("readable"):
+            checks.append(_check("archive_disk_free", "warn", "archive volume free space unreadable"))
+        elif disk["free_gb"] is not None and disk["free_gb"] < settings.archive_min_free_gb:
+            checks.append(_check(
+                "archive_disk_free", "warn",
+                f"free {disk['free_gb']} GiB below min-free {settings.archive_min_free_gb} GiB — "
+                "body archive enqueue will be BLOCKED (use a smaller batch or expand storage)",
+            ))
+        else:
+            checks.append(_check(
+                "archive_disk_free", "ok",
+                f"free {disk['free_gb']} GiB (min-free {settings.archive_min_free_gb} GiB)",
+            ))
+    except Exception:  # noqa: BLE001 - preflight must never crash on this
+        checks.append(_check("archive_disk_free", "warn", "disk free check unavailable"))
+
     ok = not any(c["status"] == "fail" for c in checks)
     # workers list is summarized (no host paths / secrets — heartbeat carries none)
     worker_summary = [
