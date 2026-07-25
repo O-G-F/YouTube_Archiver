@@ -20,6 +20,8 @@ from fastapi.staticfiles import StaticFiles
 from app import __version__
 from app.api import (
     archive,
+    audit as audit_api,
+    auth as auth_api,
     collections,
     comments,
     dashboard,
@@ -49,6 +51,7 @@ from app.api import (
 from app.bootstrap import startup_bootstrap
 from app.config import get_settings
 from app.logging_setup import setup_logging
+from app.middleware import AuthMiddleware
 
 
 @asynccontextmanager
@@ -66,19 +69,29 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS: the API has no auth/cookies, so "*" is acceptable for a local admin tool.
-# In production behind the bundled SPA this is same-origin and CORS is unused.
+# Phase 9C: access control. AuthMiddleware (added first => inner) enforces auth
+# for /api/*; CORS (added last => outermost) handles preflight + wraps auth
+# responses with CORS headers. In development (AUTH_MODE=disabled) the middleware
+# is a pass-through, so behaviour is unchanged.
 _settings = get_settings()
+app.add_middleware(AuthMiddleware)
+# When cookie-session auth is on with specific origins, browsers require
+# credentialed CORS + explicit headers; a wildcard origin cannot use credentials.
+_cors_credentials = (
+    (_settings.auth_mode or "disabled").lower() == "local" and not _settings.cors_is_wildcard
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_settings.cors_origins_list,
-    allow_credentials=False,
+    allow_credentials=_cors_credentials,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=(["Content-Type", "X-CSRF-Token", "Authorization"] if _cors_credentials else ["*"]),
 )
 
 # ---- API routers ----
 app.include_router(health.router)
+app.include_router(auth_api.router)
+app.include_router(audit_api.router)
 app.include_router(doctor.router)
 app.include_router(dashboard.router)
 app.include_router(settings_api.router)
@@ -129,9 +142,16 @@ if _ui_dir is not None:
     if _assets.is_dir():
         app.mount("/assets", StaticFiles(directory=str(_assets)), name="assets")
 
+    def _index_response() -> FileResponse:
+        # index.html must NOT be heuristically cached: it references content-hashed
+        # asset bundles, so a stale index.html would keep loading an OLD UI after a
+        # deploy (Phase 11A). `no-cache` forces revalidation (ETag) on each load;
+        # the content-hashed /assets/* files stay long-cacheable.
+        return FileResponse(_ui_dir / "index.html", headers={"Cache-Control": "no-cache"})
+
     @app.get("/", include_in_schema=False)
     def _spa_root() -> FileResponse:
-        return FileResponse(_ui_dir / "index.html")
+        return _index_response()
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def _spa_fallback(full_path: str):
@@ -151,7 +171,7 @@ if _ui_dir is not None:
         except (ValueError, OSError):
             pass
         # Otherwise hand off to the SPA router (history-API fallback).
-        return FileResponse(_ui_dir / "index.html")
+        return _index_response()
 
 else:
 

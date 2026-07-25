@@ -23,6 +23,21 @@ async function parse(res: Response): Promise<unknown> {
   return res.text();
 }
 
+// Phase 9C: read the double-submit CSRF token cookie and echo it on mutations.
+const CSRF_COOKIE = "ytarch_csrf";
+function readCookie(name: string): string | null {
+  const m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+// A global handler the app registers so any 401 (expired/absent session) routes
+// the user back to the login screen.
+let onUnauthorized: (() => void) | null = null;
+export function setUnauthorizedHandler(fn: (() => void) | null): void {
+  onUnauthorized = fn;
+}
+const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
 function extractDetail(body: unknown, fallback: string): string {
   if (body && typeof body === "object" && "detail" in body) {
     const d = (body as { detail: unknown }).detail;
@@ -34,17 +49,25 @@ function extractDetail(body: unknown, fallback: string): string {
 }
 
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method || "GET").toUpperCase();
+  const extraHeaders: Record<string, string> = {};
+  if (MUTATING.has(method)) {
+    const csrf = readCookie(CSRF_COOKIE);
+    if (csrf) extraHeaders["X-CSRF-Token"] = csrf;
+  }
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, {
-      headers: { Accept: "application/json", ...(init?.headers || {}) },
+      credentials: "same-origin", // send the session cookie
       ...init,
+      headers: { Accept: "application/json", ...extraHeaders, ...(init?.headers || {}) },
     });
   } catch (e) {
     throw new ApiError(0, `network error: ${(e as Error).message}`, null);
   }
   const body = await parse(res).catch(() => null);
   if (!res.ok) {
+    if (res.status === 401 && onUnauthorized) onUnauthorized();
     throw new ApiError(res.status, extractDetail(body, res.statusText), body);
   }
   return body as T;

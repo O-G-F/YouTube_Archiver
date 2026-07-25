@@ -2,6 +2,10 @@ import { api } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
 import { ErrorBox, Loading } from "../components/ui";
 import { YouTubeDiagnostics } from "../components/YouTubeDiagnostics";
+import { ReleaseInfoPanel } from "../components/ReleaseInfoPanel";
+import { BackupReadinessPanel } from "../components/BackupReadinessPanel";
+import { AuditPanel } from "../components/AuditPanel";
+import { FirstRunChecklist } from "../components/FirstRunChecklist";
 
 export default function Settings() {
   const settings = useFetch(() => api.settings(), []);
@@ -10,8 +14,15 @@ export default function Settings() {
 
   return (
     <div>
-      <h1 className="page-title">Settings / Doctor</h1>
+      <h1 className="page-title">System / Settings</h1>
       <p className="page-sub">Read-only. Secrets (cookies, tokens, DB/Redis credentials) are never shown.</p>
+
+      <FirstRunChecklist forceShow />
+
+      {/* System status (moved here from Liked videos in Phase 11B) */}
+      <ReleaseInfoPanel />
+      <BackupReadinessPanel />
+      <AuditPanel />
 
       <YouTubeDiagnostics />
 

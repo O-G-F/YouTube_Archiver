@@ -138,10 +138,30 @@ class Settings(BaseSettings):
     liked_archive_default_limit: int = 20
     # Hard cap on how many jobs a single enqueue call may create (safety brake).
     liked_archive_max_enqueue_per_run: int = 50
-    # Profile used for a body archive (downloads the video BODY).
+    # Profile used for a body archive (downloads the video BODY). Kept for
+    # backward-compat; the production body default is body_archive_default_profile
+    # (Phase 9A) which the plan/enqueue paths actually use.
     liked_archive_default_profile: str = "video_compressed_1080p"
     # Extra per-job sleep applied to liked-archive download jobs (throttling).
     liked_archive_job_delay_seconds: float = 0.0
+
+    # ---- Production body-archive controls (Phase 9A) ----
+    # Default body-archive profile for the plan/enqueue paths. The comments-light
+    # profile avoids the large `comments` DB table growth seen when bulk-archiving
+    # with a comments-enabled profile (video_compressed_1080p). Set this to select
+    # a different body profile; the comments-heavy one is NOT recommended at scale.
+    body_archive_default_profile: str = "video_compressed_1080p_light"
+    # Minimum free space (GiB) the archive volume must retain. A body-archive
+    # enqueue that would (or already does) leave less than this is BLOCKED unless
+    # explicitly overridden (--allow-low-disk). Guard is skipped only when free
+    # space cannot be read (e.g. the archive path is unavailable).
+    archive_min_free_gb: float = 500.0
+    # Conservative fallback per-video body size estimate (MiB) used by the size
+    # estimator when there is not enough saved-media history to estimate from.
+    archive_size_estimate_fallback_mb: float = 300.0
+    # How many saved 'video' media files must exist before the estimator trusts
+    # measured sizes instead of the fixed fallback.
+    archive_size_estimate_min_samples: int = 10
     # Optional scheduler pickup of pending liked archives (default OFF).
     scheduler_liked_archive_enabled: bool = False
     scheduler_liked_archive_limit_per_run: int = 2  # body DL is heavy -> tiny
@@ -182,8 +202,19 @@ class Settings(BaseSettings):
     scheduler_run_keep_last: int = 0
 
     @property
+    def effective_body_archive_profile(self) -> str:
+        """Production body-archive profile (Phase 9A).
+
+        Falls back to ``liked_archive_default_profile`` only if the Phase 9A
+        setting is explicitly blanked, so the comments-light default holds.
+        """
+        return (self.body_archive_default_profile or "").strip() or self.liked_archive_default_profile
+
+    @property
     def effective_scheduler_liked_archive_profile(self) -> str:
-        return (self.scheduler_liked_archive_profile or "").strip() or self.liked_archive_default_profile
+        # Phase 9A: the scheduler's body pass defaults to the production body
+        # profile (comments-light) unless SCHEDULER_LIKED_ARCHIVE_PROFILE is set.
+        return (self.scheduler_liked_archive_profile or "").strip() or self.effective_body_archive_profile
 
     # ---- YouTube fetch stabilization secrets (Phase 7A / 7B) ----
     # All are SECRETS: never returned by the API / shown in the UI (only a
@@ -264,6 +295,136 @@ class Settings(BaseSettings):
     # ---- App ----
     log_level: str = "INFO"
 
+    # ---- Production access control / auth (Phase 9C) ----
+    # Deployment environment. "production" makes production-check enforce secure
+    # auth/CORS/cookie settings (FAIL otherwise). Default development => the app
+    # runs unauthenticated for local use (auth_mode=disabled).
+    app_env: str = "development"  # development | production
+    # disabled: no auth (dev only). local: in-app admin login (scrypt hash +
+    # signed session cookie). trusted_proxy: trust an authenticating reverse proxy
+    # (e.g. Cloudflare Access) header, but ONLY from a trusted proxy IP.
+    auth_mode: str = "disabled"  # disabled | local | trusted_proxy
+    # Secret files (values are read from disk; NEVER logged / returned by the API).
+    session_secret_file: str = ""       # HMAC key for signed sessions
+    admin_password_hash_file: str = ""  # scrypt PHC-style hash for local login
+    # Session cookie policy. Secure MUST be true in production (HTTPS).
+    session_cookie_secure: bool = True
+    session_cookie_samesite: str = "strict"  # strict | lax
+    session_cookie_name: str = "ytarch_session"
+    csrf_cookie_name: str = "ytarch_csrf"
+    session_max_age_seconds: int = 28800  # 8h
+    # trusted_proxy mode: only accept the auth header from these proxy source CIDRs,
+    # and only for the allow-listed admin emails. Direct clients cannot spoof it.
+    trusted_proxy_auth_header: str = "CF-Access-Authenticated-User-Email"
+    trusted_proxy_cidrs: str = ""   # comma-separated, e.g. "173.245.48.0/20,103.21.244.0/22"
+    allowed_admin_emails: str = ""  # comma-separated allow-list
+    # Trust X-Forwarded-Proto/For only when the direct peer is a trusted proxy.
+    trust_forwarded_headers: bool = False
+    # Lightweight login rate limit (per client IP).
+    login_rate_limit_max_attempts: int = 5
+    login_rate_limit_window_seconds: int = 300
+
+    # ---- Ingress / release hardening (Phase 9D) ----
+    # Host header allow-list (comma). Empty = allow any (dev). production-check
+    # FAILs if empty in production. No wildcard entries.
+    allowed_hosts: str = ""
+    # CSRF trusted browser origins (comma, scheme+host) — SEPARATE from CORS
+    # origins. Wildcard forbidden. Empty falls back to same-origin only.
+    csrf_trusted_origins: str = ""
+    # Security response headers (CSP / nosniff / frame / referrer / permissions).
+    security_headers_enabled: bool = True
+    # HSTS is added ONLY in production (HTTPS is assumed terminated at the proxy);
+    # never in development over HTTP.
+    hsts_max_age_seconds: int = 31536000
+    # Login rate-limit backend. "auto" uses Redis when reachable, else in-memory
+    # (dev) / fail-closed (prod). Keys are HMAC-anonymised (no raw IP stored).
+    login_rate_limit_backend: str = "auto"  # auto | redis | memory
+    # Optional PREVIOUS session secret (verification-only) for zero-downtime
+    # session-secret rotation. New sessions are always signed with the current one.
+    session_secret_previous_file: str = ""
+    # Backup freshness marker (touched by the backup script). release-check WARNs
+    # when missing or older than the max age.
+    backup_marker_file: str = ""
+    backup_max_age_hours: int = 168  # 7 days
+
+    # ---- Backup integrity / DR acceptance (Phase 9F) ----
+    # Small JSON summary of the latest backup manifest (basename/sha256/size/
+    # schema_head only — no host paths). Written by `archiver backup write-manifest
+    # --summary-file`, read by release-check + the backup-readiness API.
+    backup_manifest_summary_file: str = ""
+    # Marker touched by `archiver backup verify-manifest --write-marker` on a
+    # successful integrity verification of the newest backup artifact.
+    backup_verified_marker_file: str = ""
+    backup_verify_max_age_hours: int = 336  # 14 days
+    # Marker touched by scripts/restore-rehearsal.sh after a PASSING isolated
+    # restore rehearsal (never by the rehearsal environment itself).
+    restore_rehearsal_marker_file: str = ""
+    restore_rehearsal_max_age_days: int = 90
+    # Optional HMAC key for the backup manifest's canonical integrity hash
+    # (Phase 9F.1). Unset -> plain SHA-256 (development). Value never logged.
+    backup_manifest_hmac_key_file: str = ""
+
+    # ---- Release candidate / supply chain (Phase 10A) ----
+    # Small release-manifest summary (basenames/hashes/counts) written by
+    # scripts/build-release.sh, read by release-check + the release-readiness API.
+    release_manifest_summary_file: str = ""
+    # Optional HMAC key for the release manifest integrity hash (value never
+    # logged). Unset -> plain SHA-256 (development).
+    release_manifest_hmac_key_file: str = ""
+    # Vulnerability policy: WARN or FAIL when the scanner is unavailable / a
+    # release build has no scan; production defaults stricter (see release-check).
+    release_scanner_unavailable_policy: str = "warn"  # warn | fail
+    # Max critical/high vulnerabilities tolerated before release-check FAILs.
+    release_max_critical_vulnerabilities: int = 0
+    # Max age of the vulnerability DB (days) before release-check flags it stale.
+    release_vuln_db_max_age_days: int = 7
+    # Phase 10B: vulnerability triage / remediation gating.
+    # Repo-tracked exception file (operator-approved, time-bound). Empty template.
+    vulnerability_exceptions_file: str = "vulnerability-exceptions.yml"
+    # HIGH-severity policy: warn (know the count, reduce fixable) | fail.
+    release_high_vuln_policy: str = "warn"  # warn | fail
+    release_max_high_vulnerabilities: int = 0  # only enforced when policy == fail
+    # Scanner provenance: production requires a verified scanner. When a digest
+    # can't be resolved offline, an operator marks it verified out-of-band.
+    release_require_scanner_provenance: bool = True
+    # Phase 10B.3: advisory exception PROPOSALS (never active) + the machine
+    # decision dossier release-check reads. Proposals are NOT enforced; only
+    # vulnerability_exceptions_file suppresses findings.
+    vulnerability_exception_proposals_file: str = "vulnerability-exception-proposals.yml"
+    vulnerability_decision_dossier_file: str = "docs/vulnerability-decision-dossier.json"
+    # Public HTTPS URL the admin UI is served on (e.g. https://archiver.example.com).
+    # HTTPS readiness is judged from THIS + the proxy config, NOT from the HSTS header.
+    public_base_url: str = ""
+
+    # ---- Audit trail / observability (Phase 9E) ----
+    audit_enabled: bool = True
+    # HMAC key for the tamper-evident audit hash chain (file; value never logged).
+    audit_hmac_key_file: str = ""
+    # Legacy alias (Phase 9E) kept for compatibility; use audit_pseudonym_key_file.
+    audit_pseudonymize_key_file: str = ""
+    audit_retention_days: int = 365
+    audit_security_retention_days: int = 730
+    audit_max_export_events: int = 100000
+
+    # ---- Audit signing lifecycle (Phase 9E.1) ----
+    # Short id for the CURRENT signing key (never the key value/path). Required in
+    # production when a signing key is set.
+    audit_hmac_key_id: str = ""
+    # PREVIOUS keys — verification only (never used to sign new events). Comma
+    # lists; the file count and id count MUST match; ids must be unique.
+    audit_hmac_previous_key_files: str = ""
+    audit_hmac_previous_key_ids: str = ""
+    # Pseudonymisation key — SEPARATE from the signing key so rotating the signing
+    # key does not change actor/client pseudonyms. Value never logged.
+    audit_pseudonym_key_file: str = ""
+    # Policy: allow a legacy unsigned prefix (bounded by an explicit checkpoint).
+    # Production default false.
+    audit_allow_legacy_unsigned_prefix: bool = False
+    # Metrics endpoint: require auth (never expose publicly in production).
+    metrics_require_auth: bool = True
+    # Emit structured JSON logs (with a shared redaction filter).
+    structured_logging: bool = False
+
     # ---- Web UI / CORS (Phase 5A) ----
     # Built frontend directory. Empty -> <repo>/frontend/dist (Docker: /app/frontend/dist).
     web_ui_dir: str = ""
@@ -273,12 +434,179 @@ class Settings(BaseSettings):
     # tool with no auth/cookies on the API). Set explicit origins to restrict.
     cors_allow_origins: str = "*"
 
+    # ---- Host bind (Phase 12A) ----
+    # The host interface docker-compose publishes the web port on. Compose reads
+    # ${WEB_BIND_HOST:-127.0.0.1}; when set in .env it is also passed into the
+    # container (env_file) so the app can warn about its own exposure. The default
+    # is loopback — safe for local single-user. Set 0.0.0.0 ONLY with auth enabled.
+    web_bind_host: str = "127.0.0.1"
+    web_port: int = 8000
+
+    @property
+    def web_bind_is_all_interfaces(self) -> bool:
+        """True when the web port is (or would be) published on every interface."""
+        return (self.web_bind_host or "").strip() in ("", "0.0.0.0", "::")
+
     @property
     def cors_origins_list(self) -> list[str]:
         raw = (self.cors_allow_origins or "").strip()
         if not raw or raw == "*":
             return ["*"]
         return [o.strip() for o in raw.split(",") if o.strip()]
+
+    @property
+    def cors_is_wildcard(self) -> bool:
+        return self.cors_origins_list == ["*"]
+
+    # ---- Auth helpers (Phase 9C) — never expose secret VALUES ----
+    @property
+    def is_production(self) -> bool:
+        return (self.app_env or "").strip().lower() == "production"
+
+    @property
+    def auth_enabled(self) -> bool:
+        return (self.auth_mode or "disabled").strip().lower() in {"local", "trusted_proxy"}
+
+    def _read_secret_file(self, path: str) -> str | None:
+        """Return the stripped contents of a secret file, or None. Never logged."""
+        from pathlib import Path as _P
+
+        p = (path or "").strip()
+        if not p:
+            return None
+        try:
+            fp = _P(p)
+            if fp.is_file():
+                val = fp.read_text("utf-8").strip()
+                return val or None
+        except OSError:
+            return None
+        return None
+
+    def session_secret(self) -> str | None:
+        return self._read_secret_file(self.session_secret_file)
+
+    def admin_password_hash(self) -> str | None:
+        return self._read_secret_file(self.admin_password_hash_file)
+
+    @property
+    def session_secret_configured(self) -> bool:
+        return self.session_secret() is not None
+
+    @property
+    def admin_password_hash_configured(self) -> bool:
+        return self.admin_password_hash() is not None
+
+    @property
+    def effective_session_cookie_secure(self) -> bool:
+        # Reflect the configured setting (default True). production-check FAILs if
+        # this is False in production so an insecure cookie is caught, not hidden.
+        return bool(self.session_cookie_secure)
+
+    @property
+    def trusted_proxy_cidr_list(self) -> list[str]:
+        return [c.strip() for c in (self.trusted_proxy_cidrs or "").split(",") if c.strip()]
+
+    @property
+    def allowed_admin_email_list(self) -> list[str]:
+        return [e.strip().lower() for e in (self.allowed_admin_emails or "").split(",") if e.strip()]
+
+    # ---- Ingress / release helpers (Phase 9D) ----
+    @property
+    def allowed_hosts_list(self) -> list[str]:
+        return [h.strip().lower() for h in (self.allowed_hosts or "").split(",") if h.strip()]
+
+    @property
+    def csrf_trusted_origins_list(self) -> list[str]:
+        return [o.strip() for o in (self.csrf_trusted_origins or "").split(",") if o.strip()]
+
+    @property
+    def effective_hsts(self) -> bool:
+        # HSTS only in production (HTTPS assumed at the proxy); never dev/HTTP.
+        return bool(self.is_production and self.security_headers_enabled)
+
+    def session_secret_previous(self) -> str | None:
+        return self._read_secret_file(self.session_secret_previous_file)
+
+    def session_secrets(self) -> list[str]:
+        """Verification secrets: current first, then previous (rotation window)."""
+        out: list[str] = []
+        cur = self.session_secret()
+        if cur:
+            out.append(cur)
+        prev = self.session_secret_previous()
+        if prev and prev != cur:
+            out.append(prev)
+        return out
+
+    # ---- Audit / observability helpers (Phase 9E) — never expose secret VALUES ----
+    @property
+    def public_base_url_is_https(self) -> bool:
+        return (self.public_base_url or "").strip().lower().startswith("https://")
+
+    def audit_hmac_key(self) -> str | None:
+        return self._read_secret_file(self.audit_hmac_key_file)
+
+    def backup_manifest_hmac_key(self) -> str | None:
+        """Phase 9F.1: optional key for signing backup manifests (never logged)."""
+        return self._read_secret_file(self.backup_manifest_hmac_key_file)
+
+    def release_manifest_hmac_key(self) -> str | None:
+        """Phase 10A: optional key for signing release manifests (never logged)."""
+        return self._read_secret_file(self.release_manifest_hmac_key_file)
+
+    @property
+    def audit_hmac_key_configured(self) -> bool:
+        return self.audit_hmac_key() is not None
+
+    def audit_current_signing(self) -> tuple[str | None, str | None]:
+        """(key_id, key_value) for the CURRENT signing key, or (None, None)."""
+        key = self.audit_hmac_key()
+        if not key:
+            return (None, None)
+        return ((self.audit_hmac_key_id or "").strip() or "unspecified", key)
+
+    def audit_previous_keys(self) -> dict[str, str]:
+        """{key_id: key_value} for verification-only previous keys (readable ones)."""
+        files = [f.strip() for f in (self.audit_hmac_previous_key_files or "").split(",") if f.strip()]
+        ids = [i.strip() for i in (self.audit_hmac_previous_key_ids or "").split(",") if i.strip()]
+        out: dict[str, str] = {}
+        for kid, f in zip(ids, files):
+            v = self._read_secret_file(f)
+            if v:
+                out[kid] = v
+        return out
+
+    def audit_verification_keys(self) -> dict[str, str]:
+        """Registry {key_id: key} used to VERIFY (current + previous)."""
+        reg = dict(self.audit_previous_keys())
+        kid, key = self.audit_current_signing()
+        if kid and key:
+            reg[kid] = key
+        return reg
+
+    def audit_key_config_error(self) -> str | None:
+        """Reason string if the key registry is misconfigured, else None."""
+        files = [f.strip() for f in (self.audit_hmac_previous_key_files or "").split(",") if f.strip()]
+        ids = [i.strip() for i in (self.audit_hmac_previous_key_ids or "").split(",") if i.strip()]
+        if len(files) != len(ids):
+            return "previous key file/id count mismatch"
+        all_ids = ids + ([self.audit_hmac_key_id.strip()] if (self.audit_hmac_key_id or "").strip() else [])
+        if len(all_ids) != len(set(all_ids)):
+            return "duplicate audit key id"
+        return None
+
+    @property
+    def audit_pseudonym_key_configured(self) -> bool:
+        return self._read_secret_file(self.audit_pseudonym_key_file) is not None
+
+    def audit_pseudonymize_key(self) -> str:
+        """Key for pseudonymising actor/client ids — SEPARATE from the signing key
+        so rotating the signing key does not change pseudonyms. Falls back to the
+        legacy alias, then a fixed dev constant (NEVER the signing key)."""
+        return (self._read_secret_file(self.audit_pseudonym_key_file)
+                or self._read_secret_file(self.audit_pseudonymize_key_file)
+                or "ytarch-pseudonym-dev")
 
     # ---- YouTube Data API OAuth (Phase 6B) — DEFAULT DISABLED ----
     # When disabled (default) the app starts and runs fully without any OAuth

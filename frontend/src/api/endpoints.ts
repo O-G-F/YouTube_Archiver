@@ -1,5 +1,8 @@
 import { apiGet, apiPost, apiPatch, apiText } from "./client";
 import type {
+  BackupReadiness,
+  FirstRunStatus,
+  ReleaseReadiness,
   Channel,
   Collection,
   CollectionItem,
@@ -50,6 +53,13 @@ import type {
   LikedArchivePlan,
   LikedArchiveEnqueueResult,
   LikedProgress,
+  LikedOperations,
+  ProductionCheck,
+  ArchiveMediaCheck,
+  AuthSession,
+  AuditEvent,
+  AuditStats,
+  AuditVerify,
   LikedFailureBreakdown,
   SecretsStatus,
   LikedProgressHistoryPoint,
@@ -72,6 +82,9 @@ export interface LikedArchiveBody {
   profile?: string;
   limit?: number;
   dry_run?: boolean;
+  // Phase 9A: override the disk capacity guard on a body archive (NOT default).
+  allow_low_disk?: boolean;
+  min_free_gb?: number;
 }
 
 export function mediaUrl(videoId: number, mediaFileId: number): string {
@@ -285,6 +298,28 @@ export const api = {
   likedRetryFailed: (body: { reason?: string; limit?: number }) =>
     apiPost<{ retried: number; job_ids: number[] }>("/api/liked-videos/retry-failed", body),
   likedProgress: () => apiGet<LikedProgress>("/api/liked-videos/progress"),
+  // Phase 9A: consolidated body-archive operations status
+  likedOperations: () => apiGet<LikedOperations>("/api/liked-videos/operations"),
+  // Phase 9C: auth
+  authSession: () => apiGet<AuthSession>("/api/auth/session"),
+  authLogin: (password: string) => apiPost<AuthSession>("/api/auth/login", { password }),
+  authLogout: () => apiPost<{ ok: boolean }>("/api/auth/logout"),
+  // Phase 9B: production deployment readiness
+  productionCheck: () => apiGet<ProductionCheck>("/api/system/production-check"),
+  archiveCheck: (limit = 0) => apiGet<ArchiveMediaCheck>(`/api/system/archive-check${qs({ limit })}`),
+  // Phase 9D: deploy gate (production-check + archive presence + migration + backup + build)
+  releaseCheck: () => apiGet<ProductionCheck>("/api/system/release-check"),
+  // Phase 9E: audit trail (read-only)
+  auditEvents: (p: { limit?: number; category?: string; severity?: string; event_type?: string; request_id?: string } = {}) =>
+    apiGet<{ events: AuditEvent[]; limit: number; offset: number }>(`/api/audit/events${qs(p)}`),
+  auditStats: (days = 30) => apiGet<AuditStats>(`/api/audit/stats${qs({ days })}`),
+  auditVerify: () => apiGet<AuditVerify>("/api/audit/verify"),
+  // Phase 9F: read-only backup / disaster-recovery readiness
+  backupReadiness: () => apiGet<BackupReadiness>("/api/system/backup-readiness"),
+  // Phase 10A: read-only release / provenance readiness
+  releaseReadiness: () => apiGet<ReleaseReadiness>("/api/system/release-readiness"),
+  // Phase 11B: fresh-install setup checklist
+  firstRun: () => apiGet<FirstRunStatus>("/api/system/first-run"),
   likedFailureBreakdown: () =>
     apiGet<LikedFailureBreakdown>("/api/liked-videos/failure-breakdown"),
   secretsStatus: () => apiGet<SecretsStatus>("/api/system/secrets-status"),

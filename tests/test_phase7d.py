@@ -87,7 +87,7 @@ def test_scheduler_liked_archive(settings):
     with session_scope() as s:
         for jid in r["job_ids"]:
             j = s.get(Job, jid)
-            assert j.profile_name == settings.liked_archive_default_profile
+            assert j.profile_name == settings.effective_body_archive_profile  # Phase 9A: comments-light
             assert j.meta["scheduled_by"] == "scheduler_liked_archive"
             assert j.meta["selected_by"] == "missing_body"
 

@@ -151,6 +151,24 @@ BUILTIN_PROFILES: dict[str, ProfileSpec] = {
         ],
         flags=_flags(embed_thumbnail=True, write_comments=True),
     ),
+    "video_compressed_1080p_light": ProfileSpec(
+        name="video_compressed_1080p_light",
+        media_mode="video",
+        quality_mode="1080p",
+        description="Comments-light save profile: identical to video_compressed_1080p "
+        "(<=1080p mp4 + info_json/description/thumbnail/subtitles) but WITHOUT comments, "
+        "to avoid large DB growth when body-archiving in bulk (Phase 8B).",
+        ytdlp_args=[
+            "-f",
+            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=1080]+bestaudio/"
+            "best[height<=1080][ext=mp4]/best[height<=1080]/best",
+            "--merge-output-format",
+            "mp4",
+        ],
+        # write_comments stays at the default (False) — comments are NOT fetched/saved.
+        flags=_flags(embed_thumbnail=True),
+    ),
     "video_proxy_1080p_mp4": ProfileSpec(
         name="video_proxy_1080p_mp4",
         media_mode="video",

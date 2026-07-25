@@ -61,6 +61,10 @@ youtube_diag_app = typer.Typer(help="YouTube fetch-stability diagnostics (benchm
 queue_app = typer.Typer(help="Job queue health (Phase 7D).")
 storage_app = typer.Typer(help="Storage / database stats (Phase 6E).")
 system_app = typer.Typer(help="Build identity / preflight checks (Phase 6F).")
+auth_app = typer.Typer(help="Auth / access control secrets (Phase 9C).")
+audit_app = typer.Typer(help="Audit trail: list / verify / stats / export (Phase 9E).")
+backup_app = typer.Typer(help="Backup / archive manifests + integrity verification (Phase 9F).")
+release_app = typer.Typer(help="Release-candidate manifest + provenance / supply-chain (Phase 10A).")
 app.add_typer(source_app, name="source")
 app.add_typer(download_app, name="download")
 app.add_typer(jobs_app, name="jobs")
@@ -84,6 +88,10 @@ app.add_typer(youtube_diag_app, name="youtube-diagnostics")
 app.add_typer(queue_app, name="queue")
 app.add_typer(storage_app, name="storage")
 app.add_typer(system_app, name="system")
+app.add_typer(auth_app, name="auth")
+app.add_typer(audit_app, name="audit")
+app.add_typer(backup_app, name="backup")
+app.add_typer(release_app, name="release")
 
 
 # --------------------------------------------------------------------------- #
@@ -1016,6 +1024,40 @@ def jobs_show(job_id: int = typer.Argument(...)) -> None:
             typer.echo(f"  meta        : {job.meta}")
         if job.error_message:
             typer.echo(f"  error/notes : {job.error_message.splitlines()[0]}")
+
+
+@jobs_app.command("reconcile-orphans")
+def jobs_reconcile_orphans(
+    apply: bool = typer.Option(False, "--apply/--dry-run", help="Default dry-run. --apply re-queues orphans."),
+    older_than_minutes: int = typer.Option(30, "--older-than-minutes", help="Only touch jobs idle this long."),
+) -> None:
+    """Phase 8C: find download jobs stuck ``running``/``queued`` in the DB but
+    ABSENT from RQ (worker crash / restart / host sleep) and safely re-queue them.
+
+    Dry-run by default. Jobs whose video already has a body are reconciled to
+    ``success`` (no re-download); yt-dlp's --download-archive also prevents dups.
+    Jobs still in RQ or younger than the threshold are never touched.
+    """
+    from app.services import reconcile
+
+    with session_scope() as s:
+        r = reconcile.reconcile_orphans(
+            s, get_settings(), apply=apply, older_than_minutes=older_than_minutes
+        )
+    mode = "APPLY" if apply else "dry-run"
+    if r["rq_unreadable"]:
+        typer.secho("  RQ unreadable — NO action taken (cannot determine orphans safely).", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    typer.echo(
+        f"== reconcile-orphans ({mode}, older-than={older_than_minutes}m) ==\n"
+        f"  scanned={r['scanned']} orphan_found={r['orphan_found']} "
+        f"requeued={r['requeued']} skipped_already_has_body={r['skipped_already_has_body']} "
+        f"skipped_recent={r['skipped_recent']} skipped_rq_present={r['skipped_rq_present']} errors={r['errors']}"
+    )
+    if r["orphan_job_ids"]:
+        typer.echo(f"  orphan job ids: {r['orphan_job_ids'][:50]}")
+    if not apply and r["orphan_found"]:
+        typer.echo("  (dry-run) re-run with --apply to re-queue these safely.")
 
 
 # --------------------------------------------------------------------------- #
@@ -2002,6 +2044,25 @@ def storage_db_stats() -> None:
         typer.echo("  largest tables: " + ", ".join(f"{n}={round(b/1024/1024,2)}MB" for n, b in top))
 
 
+@storage_app.command("media-duplicates")
+def storage_media_duplicates() -> None:
+    """Phase 8C: list videos with MORE THAN ONE 'video' media file (should be 0).
+
+    A body-archive re-queue after a crash must not create duplicate files; this
+    verifies that invariant. Exit code 2 if any duplicate is found."""
+    from app.services import reconcile
+
+    with session_scope() as s:
+        dups = reconcile.duplicate_video_media(s)
+    if not dups:
+        typer.echo("== media-duplicates == duplicate video media_files: 0 (OK)")
+        return
+    typer.secho(f"== media-duplicates == FOUND {len(dups)} video(s) with duplicate 'video' media:", fg=typer.colors.RED)
+    for d in dups[:50]:
+        typer.echo(f"  video_id={d['video_id']} count={d['count']}")
+    raise typer.Exit(code=2)
+
+
 # --------------------------------------------------------------------------- #
 # system: build identity / preflight (Phase 6F)
 # --------------------------------------------------------------------------- #
@@ -2017,6 +2078,25 @@ def system_build_info() -> None:
     typer.echo(f"  git_commit  : {info['git_commit'] or '-'}")
     typer.echo(f"  build_time  : {info['build_time'] or '-'}")
     typer.echo(f"  schema_head : {info['schema_head'] or '-'}")
+
+
+@system_app.command("version")
+def system_version() -> None:
+    """Phase 10A: release/version identity (version / commit / tree clean /
+    build id / timestamp / schema head / frontend bundle / image digest).
+    No host paths, repo paths, usernames, or secret values."""
+    from app.services import build_info as bi
+
+    v = bi.version_info()
+    typer.echo("== version ==")
+    typer.echo(f"  app_version       : {v['app_version']}")
+    typer.echo(f"  git_commit        : {v['git_commit'] or '-'}")
+    typer.echo(f"  git_tree_clean    : {'-' if v['git_tree_clean'] is None else v['git_tree_clean']}")
+    typer.echo(f"  build_id          : {v['build_id']}")
+    typer.echo(f"  build_timestamp   : {v['build_timestamp'] or '-'}")
+    typer.echo(f"  schema_head       : {v['schema_head'] or '-'}")
+    typer.echo(f"  frontend_build_id : {v['frontend_build_id'] or '-'}")
+    typer.echo(f"  image_digest      : {v['image_digest'] or '-'}")
 
 
 @system_app.command("preflight")
@@ -2044,6 +2124,989 @@ def system_preflight_cmd() -> None:
     typer.echo(f"  => {'PASS' if report['ok'] else 'FAIL'}")
     if not report["ok"]:
         raise typer.Exit(code=1)
+
+
+@system_app.command("worker-convergence")
+def system_worker_convergence_cmd(
+    wait: bool = typer.Option(False, "--wait", help="Block until converged or timeout."),
+    timeout: int = typer.Option(150, "--timeout", help="Max seconds to wait (with --wait)."),
+    poll: int = typer.Option(5, "--poll", help="Poll interval seconds (with --wait)."),
+    as_json: bool = typer.Option(False, "--json", help="Machine-readable JSON output."),
+) -> None:
+    """Phase 9F.2: has the worker fleet converged on the CURRENT web build?
+
+    Deploy polls this after recreating containers so a just-stopped worker's
+    lingering (stale) heartbeat is WAITED OUT instead of failing the deploy.
+    Exit 0 = converged, 1 = not converged yet (or timed out with --wait),
+    2 = redis unavailable / error. Output is counts only — no worker ids,
+    hostnames, redis url, secrets, or host paths.
+    """
+    import json as _json
+    import time as _time
+
+    from app.services import build_info as bi
+
+    def _probe() -> dict:
+        try:
+            from app.worker.queue import get_redis
+
+            redis = get_redis()
+            redis.ping()
+        except Exception as exc:  # noqa: BLE001 - redis down
+            return {"error": "redis_unavailable", "detail": type(exc).__name__}
+        return bi.worker_convergence(redis)
+
+    deadline = _time.monotonic() + max(0, timeout)
+    while True:
+        res = _probe()
+        if bool(res.get("ready")) or not wait:
+            break  # single-shot, or converged
+        if _time.monotonic() >= deadline:
+            break  # --wait timed out (still not ready / redis down)
+        _time.sleep(max(1, poll))
+
+    if res.get("error") == "redis_unavailable":
+        if as_json:
+            typer.echo(_json.dumps({"ready": False, "reason": "redis_unavailable"}))
+        else:
+            typer.secho("worker convergence: redis unavailable", fg=typer.colors.RED)
+        raise typer.Exit(code=2)
+
+    if as_json:
+        typer.echo(_json.dumps(res))
+    else:
+        typer.secho(
+            f"worker convergence: ready={res['ready']} reason={res['reason']} "
+            f"build_id={res['web_build_id']} active_current={res['active_current_count']} "
+            f"stale={res['mismatched_stale_count'] + res['stale_current_count']} "
+            f"mismatched_fresh={res['mismatched_fresh_count']}",
+            fg=typer.colors.GREEN if res["ready"] else typer.colors.YELLOW,
+        )
+    if not res["ready"]:
+        raise typer.Exit(code=1)
+
+
+@system_app.command("production-check")
+def system_production_check_cmd() -> None:
+    """Phase 9B: consolidated production-readiness report (PASS/WARN/FAIL).
+
+    Runs preflight + disk guard + Redis AOF + orphan/duplicate + raw_json +
+    default-profile + queue/env/dev-setting checks. Exits 1 if any check FAILS.
+    No secret values or host paths are printed.
+    """
+    from app.services import production_check as pc
+
+    with session_scope() as s:
+        r = pc.production_check(s, get_settings())
+    icon = {"pass": "PASS", "warn": "WARN", "fail": "FAIL"}
+    typer.echo("== production readiness check (Phase 9B) ==")
+    for c in r["checks"]:
+        color = {"pass": None, "warn": typer.colors.YELLOW, "fail": typer.colors.RED}.get(c["status"])
+        typer.secho(f"  [{icon.get(c['status'], '?')}] {c['name']}: {c['detail']}", fg=color)
+    counts = r["counts"]
+    typer.echo(f"  default body profile: {r['default_body_profile']}  (min-free {r['disk_min_free_gb']} GiB)")
+    typer.echo(f"  reminder: {r['backup_reminder']}")
+    typer.secho(
+        f"  => {r['overall'].upper()}  (pass={counts['pass']} warn={counts['warn']} fail={counts['fail']})",
+        fg={"pass": typer.colors.GREEN, "warn": typer.colors.YELLOW, "fail": typer.colors.RED}.get(r["overall"]),
+    )
+    if r["overall"] == "fail":
+        raise typer.Exit(code=1)
+
+
+@system_app.command("archive-check")
+def system_archive_check_cmd(
+    limit: int = typer.Option(0, "--limit", help="0 = check all video media_files."),
+) -> None:
+    """Phase 9B: archive-root migration guard — verify DB video media_files resolve
+    to real files (run before/after switching ARCHIVE_HOST_PATH). Exits 2 on any
+    missing file or duplicate. Missing videos are shown by youtube id, not path.
+    """
+    from app.services import production_check as pc
+
+    with session_scope() as s:
+        r = pc.archive_media_check(s, get_settings(), limit=(limit or None))
+    typer.echo("== archive media check (Phase 9B) ==")
+    typer.echo(f"  DB video media_files: {r['db_video_media_files']}")
+    typer.echo(f"  checked:              {r['checked']}")
+    typer.echo(f"  files present:        {r['existing']}")
+    d = r["disk"]
+    if d.get("readable"):
+        typer.echo(f"  disk free/total:      {d['free_gb']}/{d['total_gb']} GiB")
+    color = typer.colors.RED if r["missing"] else None
+    typer.secho(f"  missing files:        {r['missing']}", fg=color)
+    if r["missing_youtube_ids"]:
+        typer.echo(f"  missing youtube ids (first 50): {r['missing_youtube_ids']}")
+    typer.secho(
+        f"  duplicate video media: {r['duplicate_video_media_files']}",
+        fg=typer.colors.RED if r["duplicate_video_media_files"] else None,
+    )
+    typer.secho(f"  => {'OK' if r['ok'] else 'PROBLEM'}",
+                fg=typer.colors.GREEN if r["ok"] else typer.colors.RED)
+    if not r["ok"]:
+        raise typer.Exit(code=2)
+
+
+@system_app.command("release-check")
+def system_release_check_cmd() -> None:
+    """Phase 9D deploy gate: production-check + archive presence + migration status
+    + backup freshness + build version. Exits 1 if any check FAILs. No secrets/paths.
+    """
+    from app.services import production_check as pc
+
+    with session_scope() as s:
+        r = pc.release_check(s, get_settings())
+    icon = {"pass": "PASS", "warn": "WARN", "fail": "FAIL"}
+    typer.echo("== release check (Phase 9D) ==")
+    for c in r["checks"]:
+        color = {"pass": None, "warn": typer.colors.YELLOW, "fail": typer.colors.RED}.get(c["status"])
+        typer.secho(f"  [{icon.get(c['status'], '?')}] {c['name']}: {c['detail']}", fg=color)
+    counts = r["counts"]
+    typer.secho(
+        f"  => {r['overall'].upper()}  (pass={counts['pass']} warn={counts['warn']} fail={counts['fail']})",
+        fg={"pass": typer.colors.GREEN, "warn": typer.colors.YELLOW, "fail": typer.colors.RED}.get(r["overall"]),
+    )
+    if r["overall"] == "fail":
+        raise typer.Exit(code=1)
+
+
+@system_app.command("compose-check")
+def system_compose_check_cmd(
+    file: str = typer.Option(..., "--file", "-f",
+                             help="`docker compose config --format json` output (JSON or YAML)."),
+    production: bool = typer.Option(False, "--production",
+                                    help="Treat unsafe host binds as FAIL (default WARN)."),
+) -> None:
+    """Phase 9D: statically check a compose config for unsafe host port publishing
+    (web on 0.0.0.0, published postgres/redis). The app can't see host binds from
+    inside the container, so pipe:  docker compose config --format json > cfg.json
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    from app.services import production_check as pc
+
+    text = _Path(file).read_text("utf-8")
+    try:
+        cfg = _json.loads(text)
+    except ValueError:
+        import yaml as _yaml
+        cfg = _yaml.safe_load(text)
+    r = pc.compose_static_check(cfg or {}, production=production)
+    typer.echo("== compose static check (Phase 9D) ==")
+    for c in r["checks"]:
+        color = {"pass": None, "warn": typer.colors.YELLOW, "fail": typer.colors.RED}.get(c["status"])
+        typer.secho(f"  [{c['status'].upper()}] {c['name']}: {c['detail']}", fg=color)
+    typer.secho(f"  => {r['overall'].upper()}",
+                fg={"pass": typer.colors.GREEN, "warn": typer.colors.YELLOW, "fail": typer.colors.RED}.get(r["overall"]))
+    if r["overall"] == "fail":
+        raise typer.Exit(code=1)
+
+
+@audit_app.command("list")
+def audit_list_cmd(
+    limit: int = typer.Option(20, "--limit"),
+    category: str = typer.Option("", "--category"),
+    severity: str = typer.Option("", "--severity"),
+    event_type: str = typer.Option("", "--event-type"),
+) -> None:
+    """List recent audit events (pseudonyms + sanitised metadata only)."""
+    from app.services import audit
+
+    with session_scope() as s:
+        rows = audit.list_events(s, limit=limit, category=(category or None),
+                                 severity=(severity or None), event_type=(event_type or None))
+        for e in rows:
+            typer.echo(f"#{e.id:<6} {e.occurred_at} {e.severity:<8} {e.category:<10} "
+                       f"{e.event_type:<24} {e.outcome:<8} actor={e.actor_kind} "
+                       f"rid={e.request_id or '-'} reason={e.reason_code or '-'}")
+        if not rows:
+            typer.echo("(no audit events)")
+
+
+@audit_app.command("show")
+def audit_show_cmd(event_id: int = typer.Argument(...)) -> None:
+    """Show one audit event as JSON (redacted)."""
+    import json as _json
+
+    from app.models import AuditEvent
+    from app.services import audit
+
+    with session_scope() as s:
+        ev = s.get(AuditEvent, event_id)
+        if ev is None:
+            typer.echo("not found")
+            raise typer.Exit(code=1)
+        typer.echo(_json.dumps(audit.event_to_dict(ev), indent=2, default=str))
+
+
+@audit_app.command("verify")
+def audit_verify_cmd() -> None:
+    """Verify the audit hash chain (segment-aware). Exits 1 if invalid. No secrets/paths."""
+    from app.services import audit
+
+    with session_scope() as s:
+        r = audit.verify_chain(s, get_settings())
+    ok = r["valid"]
+    typer.secho(
+        f"audit chain: valid={ok} valid_with_warnings={r['valid_with_warnings']} "
+        f"checked={r['checked_count']} segments={r['segment_count']} checkpoints={r['checkpoint_count']} "
+        f"unsigned={r['unsigned_event_count']} key_id={r['current_signing_key_id']}"
+        + ("" if ok else f" reason={r['failure_reason_code']} first_invalid_event_id={r['first_invalid_event_id']}")
+        + (f" missing_keys={r['missing_verification_keys']}" if r["missing_verification_keys"] else ""),
+        fg=typer.colors.GREEN if ok else typer.colors.RED,
+    )
+    if not ok:
+        raise typer.Exit(code=1)
+
+
+@audit_app.command("signing-status")
+def audit_signing_status_cmd() -> None:
+    """Show audit signing configuration + chain segment status (no key values/paths)."""
+    from app.services import audit
+
+    with session_scope() as s:
+        st = audit.signing_status(s, get_settings())
+    typer.echo("== audit signing status (Phase 9E.1) ==")
+    for k in ("signature_scheme", "current_key_id", "current_key_configured", "previous_key_ids",
+              "pseudonym_key_configured", "key_config_error", "chain_valid", "valid_with_warnings",
+              "unsigned_event_count", "segment_count", "checkpoint_count", "missing_verification_keys",
+              "boundary_needed"):
+        typer.echo(f"  {k}: {st[k]}")
+
+
+@audit_app.command("establish-signing-boundary")
+def audit_establish_boundary_cmd(
+    reason_code: str = typer.Option("", "--reason-code",
+                                    help="REQUIRED for --type restore_boundary; defaults to "
+                                         "'signing_enabled' for signing_enabled."),
+    checkpoint_type: str = typer.Option("signing_enabled", "--type",
+                                        help="signing_enabled | restore_boundary"),
+    apply: bool = typer.Option(False, "--apply/--dry-run", help="Default dry-run."),
+    confirm_restore: bool = typer.Option(False, "--confirm-restore",
+                                         help="Break-glass acknowledgement — required together with "
+                                              "--apply for --type restore_boundary."),
+) -> None:
+    """Establish an explicit signing boundary at the current chain head so a signing
+    regime change verifies cleanly. Dry-run by default; --apply records it.
+
+    restore_boundary is a BREAK-GLASS operation (CLI only): it attests the existing
+    chain instead of verifying it. It requires an explicit --reason-code and
+    --confirm-restore, and must NOT be used to conceal ordinary chain corruption —
+    preserve evidence (DB/volumes/logs) and investigate first.
+    """
+    from app.services import audit
+
+    reason = reason_code.strip()
+    if checkpoint_type == "restore_boundary":
+        if not reason:
+            typer.secho("restore_boundary requires an explicit --reason-code "
+                        "(e.g. db_restore / disaster_recovery / restore_rehearsal).", fg=typer.colors.RED)
+            raise typer.Exit(code=2)
+        typer.secho("!! break-glass: restore_boundary attests everything at/below the current head.",
+                    fg=typer.colors.YELLOW)
+        typer.secho("!! Do NOT use this to conceal suspected tampering — preserve evidence first.",
+                    fg=typer.colors.YELLOW)
+        if apply and not confirm_restore:
+            typer.secho("refusing to apply restore_boundary without --confirm-restore.", fg=typer.colors.RED)
+            raise typer.Exit(code=2)
+    else:
+        reason = reason or "signing_enabled"
+
+    with session_scope() as s:
+        r = audit.establish_signing_boundary(s, get_settings(), reason_code=reason,
+                                             checkpoint_type=checkpoint_type, apply=apply)
+    if not r.get("ok"):
+        typer.secho(f"cannot establish boundary: {r.get('reason')}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    mode = "APPLIED" if r.get("applied") else "dry-run"
+    typer.echo(f"[{mode}] {r['checkpoint_type']} at event #{r['previous_event_id']}: "
+               f"{r['previous_signing_key_id']} -> {r['next_signing_key_id']}")
+    typer.echo(f"  pre-boundary chain: valid={r['pre_boundary_chain_valid']}"
+               + (f" reason={r['pre_boundary_failure_reason_code']}"
+                  if r["pre_boundary_failure_reason_code"] else ""))
+    if not apply:
+        typer.echo("  (dry-run) re-run with --apply to record the boundary.")
+
+
+@audit_app.command("rotate-key")
+def audit_rotate_key_cmd(
+    next_key_id: str = typer.Option("", "--next-key-id",
+                                    help="Informational; the actual next key is the current signing key."),
+    reason_code: str = typer.Option("key_rotated", "--reason-code"),
+    apply: bool = typer.Option(False, "--apply/--dry-run", help="Default dry-run."),
+) -> None:
+    """Record a key-rotation boundary. Set the NEW key as the current signing key and
+    keep the OLD key as a previous verification key FIRST. Dry-run by default."""
+    from app.services import audit
+
+    with session_scope() as s:
+        r = audit.rotate_key(s, get_settings(), reason_code=reason_code, apply=apply)
+    if not r.get("ok"):
+        typer.secho(f"cannot rotate: {r.get('reason')}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    mode = "APPLIED" if r.get("applied") else "dry-run"
+    typer.echo(f"[{mode}] key_rotated at event #{r['previous_event_id']}: "
+               f"{r['previous_signing_key_id']} -> {r['next_signing_key_id']}")
+
+
+@audit_app.command("stats")
+def audit_stats_cmd(days: int = typer.Option(30, "--days")) -> None:
+    """Audit event counts by category / severity / outcome."""
+    from app.services import audit
+
+    with session_scope() as s:
+        st = audit.stats(s, days=days)
+    typer.echo(f"== audit stats (last {days}d; total {st['total']}) ==")
+    typer.echo(f"  by_category: {st['by_category']}")
+    typer.echo(f"  by_severity: {st['by_severity']}")
+    typer.echo(f"  by_outcome:  {st['by_outcome']}")
+
+
+@audit_app.command("export")
+def audit_export_cmd(
+    since: str = typer.Option("", "--since", help="ISO date/time lower bound."),
+    out: str = typer.Option("", "--out", help="Write JSONL to this file (default stdout)."),
+) -> None:
+    """Export the (redacted) audit trail as JSONL (capped by AUDIT_MAX_EXPORT_EVENTS)."""
+    from datetime import datetime as _dt
+
+    from app.services import audit
+
+    since_dt = None
+    if since:
+        try:
+            since_dt = _dt.fromisoformat(since.replace("Z", ""))
+        except ValueError:
+            typer.echo("invalid --since")
+            raise typer.Exit(code=2)
+    fh = open(out, "w", encoding="utf-8") if out else None
+    try:
+        with session_scope() as s:
+            for line in audit.export_events(s, get_settings(), since=since_dt):
+                (fh.write(line + "\n") if fh else typer.echo(line))
+    finally:
+        if fh:
+            fh.close()
+            typer.echo(f"exported -> {out}")
+
+
+@audit_app.command("log-op")
+def audit_log_op_cmd(
+    event: str = typer.Option(..., "--event", help="e.g. deploy_started / backup_completed."),
+    outcome: str = typer.Option("success", "--outcome"),
+    severity: str = typer.Option("info", "--severity"),
+    category: str = typer.Option("deploy", "--category"),
+) -> None:
+    """Record a deploy/backup operational audit event (for scripts run in-container).
+    Never fatal to the caller if auditing is unavailable."""
+    from app.services import audit
+
+    try:
+        with session_scope() as s:
+            audit.record_event(s, get_settings(), event_type=event, category=category,
+                               severity=severity, outcome=outcome, actor_kind="system", action="script")
+        typer.echo(f"audit: recorded {event} ({outcome})")
+    except Exception as exc:  # noqa: BLE001
+        typer.secho(f"audit: could not record {event}: {type(exc).__name__}", fg=typer.colors.YELLOW)
+
+
+@audit_app.command("cleanup")
+def audit_cleanup_cmd() -> None:
+    """Prune expired audit events (contiguous prefix) and record a checkpoint."""
+    from app.services import audit
+
+    with session_scope() as s:
+        r = audit.cleanup(s, get_settings())
+    typer.echo(f"audit cleanup: deleted={r['deleted']} up_to_event_id={r.get('up_to_event_id')}")
+
+
+# --------------------------------------------------------------------------- #
+# backup manifests / integrity (Phase 9F)
+# --------------------------------------------------------------------------- #
+@backup_app.command("write-manifest")
+def backup_write_manifest_cmd(
+    artifact: str = typer.Option(..., "--artifact", help="Path to the backup artifact (e.g. db dump)."),
+    summary_file: str = typer.Option("", "--summary-file",
+                                     help="Also write the small summary JSON here "
+                                          "(default: BACKUP_MANIFEST_SUMMARY_FILE)."),
+    schema_head: str = typer.Option("", "--schema-head",
+                                    help="Record this schema head instead of querying the DB "
+                                         "(for detached manifest generation)."),
+    archive_manifest: str = typer.Option("", "--archive-manifest",
+                                         help="Link this archive manifest file into the backup set "
+                                              "(its basename + sha256 are recorded)."),
+) -> None:
+    """Write <artifact>.manifest.json — a v2 BACKUP-SET manifest: dump sha256/size,
+    schema head, build, active jobs, audit chain head, archive-manifest linkage,
+    redis recovery mode, and a canonical integrity hash (HMAC when
+    BACKUP_MANIFEST_HMAC_KEY_FILE is set). Basenames only — never full paths."""
+    from pathlib import Path as _P
+
+    from sqlalchemy import func as _f
+    from sqlalchemy import select as _sel
+
+    from app.models import AuditEvent as _AE
+    from app.models import Job as _Job
+    from app.services import backup_manifest as bm
+    from app.services import build_info as bi
+
+    p = _P(artifact)
+    if not p.is_file():
+        typer.secho(f"artifact not found: {p.name}", fg=typer.colors.RED)
+        raise typer.Exit(code=2)
+    settings = get_settings()
+    head = schema_head.strip() or None
+    active = None
+    audit_head = None
+    try:
+        with session_scope() as s:
+            if head is None:
+                head = bi.db_schema_head(s)
+            active = int(s.scalar(_sel(_f.count(_Job.id)).where(
+                _Job.status.in_(["queued", "running"]))) or 0)
+            row = s.execute(_sel(_AE.id, _AE.event_hash).order_by(_AE.id.desc()).limit(1)).first()
+            if row:
+                audit_head = (int(row[0]), str(row[1]))
+    except Exception:  # noqa: BLE001 - manifest is still useful without a DB
+        typer.secho("warning: DB unreachable — schema_head/active_jobs/audit_head not recorded",
+                    fg=typer.colors.YELLOW)
+    if active is not None and active > 0:
+        typer.secho(f"warning: {active} active job(s) at backup time — restore may need "
+                    f"reconcile-orphans (recorded in the manifest)", fg=typer.colors.YELLOW)
+    summary = (summary_file or "").strip() or (settings.backup_manifest_summary_file or "").strip()
+    am = archive_manifest.strip()
+    m = bm.write_backup_manifest(
+        p, schema_head=head, summary_file=(_P(summary) if summary else None),
+        build=bi.build_info(), active_jobs=active, audit_head=audit_head,
+        archive_manifest_path=(_P(am) if am else None),
+        hmac_key=settings.backup_manifest_hmac_key())
+    typer.echo(f"manifest written for {m['artifact']}: backup_id={m['backup_id']} "
+               f"size={m['size_bytes']} sha256={m['sha256'][:12]}… schema_head={m['schema_head']} "
+               f"audit_head=#{m['audit_head_event_id']} active_jobs={m['active_jobs_at_backup']} "
+               f"integrity={m['integrity']['scheme']}"
+               + (f" archive_manifest={m['archive_manifest']['artifact']}" if m["archive_manifest"] else "")
+               + (" (summary updated)" if summary else ""))
+
+
+@backup_app.command("verify-manifest")
+def backup_verify_manifest_cmd(
+    manifest: str = typer.Option(..., "--manifest", help="Path to a *.manifest.json file."),
+    write_marker: bool = typer.Option(False, "--write-marker",
+                                      help="Touch BACKUP_VERIFIED_MARKER_FILE on success."),
+) -> None:
+    """Verify the BACKUP SET a manifest identifies: dump sha256/size, manifest
+    integrity hash (HMAC when signed), completed flag, archive-manifest linkage,
+    and the audit chain head against the live DB when reachable. Exits 1 on any
+    mismatch. Prints basenames/counts only."""
+    from pathlib import Path as _P
+
+    from app.services import backup_manifest as bm
+
+    settings = get_settings()
+    key = settings.backup_manifest_hmac_key()
+    try:
+        with session_scope() as sess:
+            r = bm.verify_backup_manifest(_P(manifest), hmac_key=key, session=sess)
+    except Exception:  # noqa: BLE001 - DB unavailable -> offline (file-only) verify
+        r = bm.verify_backup_manifest(_P(manifest), hmac_key=key, session=None)
+    if r["ok"]:
+        typer.secho(f"backup manifest OK (v{r['manifest_version']}): {r['artifact']} "
+                    f"backup_id={r['backup_id']} size={r['size_bytes']} sha256={r['sha256'][:12]}… "
+                    f"schema_head={r['schema_head']} audit_head=#{r['audit_head_event_id']}",
+                    fg=typer.colors.GREEN)
+        for w in r["warnings"]:
+            typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
+        if write_marker:
+            ok = bm.touch_marker(settings.backup_verified_marker_file)
+            typer.echo("verified marker touched" if ok
+                       else "BACKUP_VERIFIED_MARKER_FILE not set — marker skipped")
+        return
+    typer.secho(f"backup manifest FAILED: reason={r['reason']} artifact={r['artifact']}",
+                fg=typer.colors.RED)
+    raise typer.Exit(code=1)
+
+
+@backup_app.command("archive-manifest")
+def backup_archive_manifest_cmd(
+    out: str = typer.Option(..., "--out", help="Output path for the archive manifest JSON."),
+    hash_limit: int = typer.Option(0, "--hash-limit",
+                                   help="Also sha256-hash the first N present files (0 = sizes only)."),
+) -> None:
+    """Snapshot DB video media_files into an archive manifest (relative paths,
+    sizes, optional hashes). Read-only against the archive."""
+    from pathlib import Path as _P
+
+    from app.services import backup_manifest as bm
+
+    with session_scope() as s:
+        summary = bm.write_archive_manifest(s, get_settings(), out_path=_P(out),
+                                            hash_limit=max(0, hash_limit))
+    typer.echo(f"archive manifest written: media_files={summary['db_video_media_files']} "
+               f"present={summary['present']} missing={summary['missing_at_generation']} "
+               f"hashed={summary['hashed_count']} total_bytes={summary['total_bytes']}")
+
+
+@backup_app.command("verify-archive")
+def backup_verify_archive_cmd(
+    manifest: str = typer.Option(..., "--manifest", help="Path to an archive manifest JSON."),
+    no_hashes: bool = typer.Option(False, "--no-hashes", help="Skip sha256 re-checks (sizes only)."),
+) -> None:
+    """Verify current archive files against an archive manifest (existence + size
+    + recorded hashes). Missing/mismatched entries are reported by public youtube
+    id only. Exits 1 when anything is missing or mismatched."""
+    from pathlib import Path as _P
+
+    from app.services import backup_manifest as bm
+
+    r = bm.verify_archive_manifest(get_settings(), manifest_path=_P(manifest),
+                                   check_hashes=not no_hashes)
+    if r["reason"]:
+        typer.secho(f"archive manifest unreadable: {r['reason']}", fg=typer.colors.RED)
+        raise typer.Exit(code=2)
+    color = typer.colors.GREEN if r["ok"] else typer.colors.RED
+    typer.secho(f"archive verify: ok={r['ok']} checked={r['checked']} present={r['present']} "
+                f"missing={r['missing']} size_mismatch={r['size_mismatch']} "
+                f"hash_mismatch={r['hash_mismatch']}/{r['hash_checked']} "
+                f"recorded_missing={r['recorded_missing']}", fg=color)
+    if r["mismatch_youtube_ids"]:
+        typer.echo(f"  affected youtube ids (first {len(r['mismatch_youtube_ids'])}): "
+                   f"{r['mismatch_youtube_ids']}")
+    if not r["ok"]:
+        raise typer.Exit(code=1)
+
+
+@backup_app.command("status")
+def backup_status_cmd() -> None:
+    """Backup / DR readiness at a glance (ages + manifest summary; no paths)."""
+    from app.services import backup_manifest as bm
+
+    s = get_settings()
+    summary = bm.read_backup_manifest_summary(s)
+    backup_age = bm.marker_age_hours(s.backup_marker_file)
+    verified_age = bm.marker_age_hours(s.backup_verified_marker_file)
+    rehearsal_age = bm.marker_age_hours(s.restore_rehearsal_marker_file)
+    typer.echo("== backup / restore readiness (Phase 9F) ==")
+    typer.echo(f"  last backup marker:    "
+               + (f"~{backup_age:.1f}h ago" if backup_age is not None else "not recorded"))
+    if summary:
+        typer.echo(f"  manifest:              {summary['artifact']} size={summary['size_bytes']} "
+                   f"sha256={(summary['sha256'] or '')[:12]}… schema_head={summary['schema_head']}")
+    else:
+        typer.echo("  manifest:              (no summary recorded)")
+    typer.echo(f"  last verify:           "
+               + (f"~{verified_age:.1f}h ago" if verified_age is not None else "not recorded"))
+    typer.echo(f"  last restore rehearsal: "
+               + (f"~{rehearsal_age / 24.0:.1f}d ago" if rehearsal_age is not None else "not recorded"))
+
+
+# --------------------------------------------------------------------------- #
+# release manifest / provenance (Phase 10A)
+# --------------------------------------------------------------------------- #
+@release_app.command("create-manifest")
+def release_create_manifest_cmd(
+    out: str = typer.Option(..., "--out", help="Output path for the release manifest JSON."),
+    summary_file: str = typer.Option("", "--summary-file",
+                                     help="Also write the small summary here "
+                                          "(default: RELEASE_MANIFEST_SUMMARY_FILE)."),
+    backend_tests: int = typer.Option(-1, "--backend-tests", help="Backend test count (evidence)."),
+    frontend_tests: int = typer.Option(-1, "--frontend-tests", help="Frontend test count (evidence)."),
+    images_json: str = typer.Option("", "--images-json",
+                                    help="Path to a JSON file of per-service image identity "
+                                         "(name/image_id/image_digest/build_id) from `docker inspect`."),
+    base_images_json: str = typer.Option("", "--base-images-json",
+                                         help="Path to a JSON file of base image tag+digest refs."),
+    sbom_json: str = typer.Option("", "--sbom-json", help="Path to an SBOM descriptor JSON."),
+    scan_json: str = typer.Option("", "--scan-json", help="Path to a vuln-scan descriptor JSON."),
+    rehearsal_json: str = typer.Option("", "--rehearsal-json",
+                                       help="Path to a migration-rehearsal descriptor JSON."),
+    release_check_json: str = typer.Option("", "--release-check-json",
+                                           help="Path to a release-check summary JSON."),
+    base_remediation: str = typer.Option("", "--base-remediation-status",
+                                         help="Phase 10B: clean|remediated|pending|no_action_needed."),
+    dependency_remediation: str = typer.Option("", "--dependency-remediation-status",
+                                               help="Phase 10B: clean|remediated|pending|no_action_needed."),
+    apt_json: str = typer.Option("", "--apt-json",
+                                 help="Phase 10B.2: runtime dpkg package set descriptor "
+                                      "(package_count/sha256/targeted_versions)."),
+) -> None:
+    """Build a versioned release manifest (provenance + supply-chain identity)
+    with a canonical integrity hash (HMAC when RELEASE_MANIFEST_HMAC_KEY_FILE is
+    set). Basenames / hashes / counts only — never paths or secrets."""
+    import json as _json
+    from pathlib import Path as _P
+
+    from app.services import release_manifest as rm
+
+    def _load(p: str):
+        p = (p or "").strip()
+        if not p:
+            return None
+        try:
+            return _json.loads(_P(p).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            typer.secho(f"warning: could not read {_P(p).name}: {type(exc).__name__}",
+                        fg=typer.colors.YELLOW)
+            return None
+
+    settings = get_settings()
+    manifest = rm.create_release_manifest(
+        settings,
+        backend_test_count=(backend_tests if backend_tests >= 0 else None),
+        frontend_test_count=(frontend_tests if frontend_tests >= 0 else None),
+        images=_load(images_json), base_images=_load(base_images_json),
+        sbom=_load(sbom_json), vulnerability_scan=_load(scan_json),
+        migration_rehearsal=_load(rehearsal_json), release_check=_load(release_check_json),
+        base_remediation_status=(base_remediation.strip() or None),
+        dependency_remediation_status=(dependency_remediation.strip() or None),
+        apt=_load(apt_json),
+        hmac_key=settings.release_manifest_hmac_key())
+    summary = (summary_file or "").strip() or (settings.release_manifest_summary_file or "").strip()
+    rm.write_release_manifest(manifest, out_path=_P(out),
+                              summary_file=(_P(summary) if summary else None))
+    s = rm.read_summary_dict(manifest)
+    typer.echo(f"release manifest written: release_id={s['release_id']} app_version={s['app_version']} "
+               f"build_id={s['build_id']} schema_head={s['schema_head']} "
+               f"services={s['service_count']} sbom={'yes' if s['sbom_present'] else 'no'} "
+               f"scan={s['vulnerability_status'] or 'none'} integrity={s['integrity_scheme']}"
+               + (" (summary updated)" if summary else ""))
+
+
+@release_app.command("verify-manifest")
+def release_verify_manifest_cmd(
+    manifest: str = typer.Option(..., "--manifest", help="Path to a release manifest JSON."),
+) -> None:
+    """Verify a release manifest: integrity hash, completed flag, source/config
+    lock hashes vs the current tree, schema head, and per-service build-id
+    agreement. Exit 1 on any mismatch. Prints basenames/counts only."""
+    from pathlib import Path as _P
+
+    from app.services import release_manifest as rm
+
+    r = rm.verify_release_manifest(_P(manifest), hmac_key=get_settings().release_manifest_hmac_key())
+    if r["ok"]:
+        typer.secho(f"release manifest OK (v{r['manifest_version']}): {r['release_id']} "
+                    f"app_version={r['app_version']} build_id={r['build_id']} "
+                    f"schema_head={r['schema_head']} tree_clean={r['git_tree_clean']}",
+                    fg=typer.colors.GREEN)
+        for w in r["warnings"]:
+            typer.secho(f"  warning: {w}", fg=typer.colors.YELLOW)
+        return
+    typer.secho(f"release manifest FAILED: reason={r['reason']} release_id={r['release_id']}",
+                fg=typer.colors.RED)
+    raise typer.Exit(code=1)
+
+
+@release_app.command("status")
+def release_status_cmd() -> None:
+    """Release readiness at a glance (manifest summary; no paths/secrets)."""
+    from app.services import release_manifest as rm
+
+    s = rm.read_release_manifest_summary(get_settings())
+    typer.echo("== release readiness (Phase 10A) ==")
+    if not s:
+        typer.echo("  manifest: (no summary recorded — run scripts/build-release.sh)")
+        return
+    typer.echo(f"  release_id     : {s.get('release_id')}")
+    typer.echo(f"  app_version    : {s.get('app_version')} (tree_clean={s.get('git_tree_clean')})")
+    typer.echo(f"  build_id       : {s.get('build_id')}  schema_head: {s.get('schema_head')}")
+    typer.echo(f"  services       : {s.get('service_count')} build_ids={s.get('service_build_ids')} "
+               f"digests_captured={s.get('image_digests_captured')}")
+    typer.echo(f"  sbom           : {'present' if s.get('sbom_present') else 'absent'} "
+               f"sha256={(s.get('sbom_sha256') or '')[:12] or '-'}")
+    typer.echo(f"  vuln scan      : {s.get('vulnerability_status') or 'none'} "
+               f"severities={s.get('vulnerability_severities') or '-'}")
+    typer.echo(f"  release-check  : {s.get('release_check_overall') or '-'}")
+    typer.echo(f"  tests          : backend={s.get('backend_test_count')} frontend={s.get('frontend_test_count')}")
+
+
+@release_app.command("triage-scan")
+def release_triage_scan_cmd(
+    trivy: str = typer.Option(..., "--trivy", help="Path to a Trivy JSON report."),
+    out: str = typer.Option("", "--out", help="Write an enriched scan descriptor JSON here."),
+    scanner_version: str = typer.Option("", "--scanner-version"),
+    scanner_image_id: str = typer.Option("", "--scanner-image-id"),
+    scanner_image_created: str = typer.Option("", "--scanner-image-created"),
+    scanner_source: str = typer.Option("", "--scanner-source", help="e.g. mirror.gcr.io/aquasec/trivy"),
+    scanner_repo_digest: str = typer.Option(
+        "", "--scanner-repo-digest",
+        help="REAL registry RepoDigest 'name@sha256:...' (from .RepoDigests[0]); "
+             "leave empty when the image has none. NEVER synthesize it from the image id."),
+    operator_verified: bool = typer.Option(False, "--operator-verified",
+                                           help="Operator confirmed the scanner artifact out-of-band."),
+) -> None:
+    """Phase 10B: classify a Trivy report, evaluate time-bound exceptions against
+    the CRITICALs, attach scanner provenance, and emit an enriched scan
+    descriptor (counts/statuses only — no host paths or secrets). Exit 1 when
+    unapproved CRITICAL(s) remain (so a build can gate on it)."""
+    import json as _json
+    from pathlib import Path as _P
+
+    from app.services import vuln_exceptions as ve
+    from app.services import vuln_triage as vt
+
+    settings = get_settings()
+    data = vt.load_trivy(_P(trivy))
+    if data is None:
+        typer.secho("could not read Trivy report", fg=typer.colors.RED)
+        raise typer.Exit(code=2)
+    summary = vt.parse_report(data)
+    crit_keys = vt.cve_key_set(data, "CRITICAL")
+    ev = ve.evaluate(settings.vulnerability_exceptions_file, crit_keys)
+
+    # Honest provenance: image_id (.Id) and repo_digest (.RepoDigests[0]) are kept
+    # distinct; a synthesized-from-image-id digest or a short image id is rejected.
+    prov = vt.classify_scanner_provenance(
+        image_id=scanner_image_id, repo_digest=scanner_repo_digest,
+        operator_verified=operator_verified,
+    )
+    prov_status = prov["status"]
+
+    sev = summary["severity_counts"]
+    status = "fail" if sev.get("CRITICAL", 0) > 0 else ("warn" if sev.get("HIGH", 0) > 0 else "pass")
+    desc = {
+        "tool": "trivy", "tool_version": scanner_version or None, "status": status,
+        "severities": sev,
+        "db_updated_at": (data.get("Metadata") or {}).get("Timestamp") if isinstance(data.get("Metadata"), dict) else None,
+        "scanner": {
+            "image_id": prov["image_id"], "image_created": scanner_image_created or None,
+            "source": scanner_source or None, "repo_digest": prov["repo_digest"],
+            "operator_verified": prov["operator_verified"],
+            "provenance_status": prov_status, "provenance_errors": prov["errors"],
+        },
+        "critical_total": len(crit_keys), "critical_covered": ev["critical_covered"],
+        "critical_unapproved": ev["critical_unapproved"],
+        "exceptions_active": ev["active"], "exceptions_expired": ev["expired"],
+        "exceptions_invalid": ev["invalid"], "exceptions_policy_ok": ev["policy_ok"],
+        "report_integrity_valid": True,  # this descriptor is authoritative for the manifest
+        "artifact": _P(trivy).name,
+    }
+    outp = (out or "").strip()
+    if outp:
+        _P(outp).write_text(_json.dumps(desc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    typer.echo(f"triage: severities={sev} critical_total={len(crit_keys)} "
+               f"covered={ev['critical_covered']} unapproved={ev['critical_unapproved']} "
+               f"exceptions(active/expired/invalid)={ev['active']}/{ev['expired']}/{ev['invalid']} "
+               f"scanner_provenance={prov_status}")
+    for e in prov["errors"]:
+        typer.secho(f"  scanner provenance note: {e} (digest not trusted)", fg=typer.colors.YELLOW)
+    for e in ev["errors"]:
+        typer.secho(f"  exception error: {e}", fg=typer.colors.YELLOW)
+    if ev["critical_unapproved"] > settings.release_max_critical_vulnerabilities:
+        typer.secho(f"NOT production-ready: {ev['critical_unapproved']} unapproved CRITICAL",
+                    fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+
+@release_app.command("scan-artifact-leaks")
+def release_scan_artifact_leaks_cmd(
+    path: str = typer.Option(..., "--path", help="Release artifact (e.g. an SBOM) to scan."),
+    repo_root: str = typer.Option("", "--repo-root", help="Build repo path to flag if it leaks in."),
+) -> None:
+    """Phase 10B.2: fail (exit 1) if a release artifact carries host-build-machine
+    paths or secret-like content. In-image paths (/usr/lib, /app) are allowed;
+    only host markers (the build repo path, /Users/<name>) and secrets are flagged.
+    Findings are count-only (the matched content is never printed)."""
+    from pathlib import Path as _P
+
+    from app.services import vuln_triage as vt
+
+    p = _P(path)
+    if not p.is_file():
+        typer.secho(f"artifact not found: {p.name}", fg=typer.colors.RED)
+        raise typer.Exit(code=2)
+    findings = vt.scan_text_for_host_leaks(p.read_text(encoding="utf-8", errors="replace"),
+                                           repo_root=repo_root)
+    if findings:
+        typer.secho(f"LEAK in {p.name}: {findings}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    typer.echo(f"leak-scan OK: {p.name} (no host path/secret)")
+
+
+def _load_scans(scan_specs: list[str]):
+    """Parse repeated 'label=path' scan specs into ordered (label, dict, sha256)."""
+    import hashlib as _h
+    import json as _json
+    from pathlib import Path as _P
+
+    out = []
+    for spec in scan_specs:
+        if "=" not in spec:
+            raise typer.BadParameter(f"--scan must be label=path, got {spec!r}")
+        label, path = spec.split("=", 1)
+        raw = _P(path).read_bytes()
+        out.append((label.strip(), _json.loads(raw), _h.sha256(raw).hexdigest()))
+    return out
+
+
+@release_app.command("cve-inventory")
+def release_cve_inventory_cmd(
+    scan: list[str] = typer.Option(..., "--scan",
+                                   help="label=path/to/trivy.json (repeatable, chronological)."),
+    out: str = typer.Option("", "--out", help="Write the canonical inventory JSON here."),
+    remediation: list[str] = typer.Option([], "--remediation",
+                                          help="remediation-report.json to reconcile against (repeatable)."),
+    severity: str = typer.Option("CRITICAL", "--severity"),
+) -> None:
+    """Phase 10B.3: build the canonical cross-release CVE inventory (version-
+    independent (cve,package) identity) with an integrity hash, and reconcile it
+    against remediation reports (flags version-reclassification artifacts)."""
+    import json as _json
+    from pathlib import Path as _P
+
+    from app.services import vuln_inventory as vi
+
+    inv = vi.build_inventory(_load_scans(scan), severity=(severity or None))
+    issues = []
+    for rp in remediation:
+        try:
+            issues.extend(vi.reconcile_remediation(inv, _json.loads(_P(rp).read_text("utf-8"))))
+        except (OSError, ValueError):
+            pass
+    if out.strip():
+        _P(out).write_text(_json.dumps(inv, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    typer.echo(f"cve-inventory[{severity}]: {inv['counts']} integrity={inv['integrity']['value'][:16]}")
+    for i in issues:
+        typer.secho(f"  reconcile: {i['vulnerability_id']} {i['package']} -> {i['reason_code']}",
+                    fg=typer.colors.YELLOW)
+
+
+@release_app.command("decision-dossier")
+def release_decision_dossier_cmd(
+    scan: list[str] = typer.Option(..., "--scan", help="label=path/to/trivy.json (repeatable)."),
+    remediation: list[str] = typer.Option([], "--remediation", help="remediation-report.json (repeatable)."),
+    proposals: str = typer.Option("", "--proposals", help="proposals YAML (default: settings)."),
+    provenance_json: str = typer.Option("", "--provenance-json", help="scanner-provenance record JSON."),
+    wheel_repro_json: str = typer.Option("", "--wheel-repro-json", help="wheel-reproducibility record JSON."),
+    release: str = typer.Option("", "--release", help="release label under review."),
+    out_json: str = typer.Option("", "--out-json", help="Write the machine dossier JSON."),
+    out_md: str = typer.Option("", "--out-md", help="Write the human dossier Markdown."),
+    severity: str = typer.Option("CRITICAL", "--severity"),
+) -> None:
+    """Phase 10B.3: assemble the machine + human decision dossier from the
+    canonical inventory, the (non-active) proposals, scanner provenance, and the
+    wheel-reproducibility evidence. Exits 1 if the dossier is invalid or any
+    proposal is (wrongly) approved."""
+    import json as _json
+    from pathlib import Path as _P
+
+    from app.services import vuln_inventory as vi
+    from app.services import vuln_proposals as vp
+
+    settings = get_settings()
+    inv = vi.build_inventory(_load_scans(scan), severity=(severity or None))
+    issues = []
+    for rp in remediation:
+        try:
+            issues.extend(vi.reconcile_remediation(inv, _json.loads(_P(rp).read_text("utf-8"))))
+        except (OSError, ValueError):
+            pass
+    ppath = (proposals.strip() or settings.vulnerability_exception_proposals_file)
+    doc = vp.load_proposals(ppath)
+
+    def _load(p):
+        p = (p or "").strip()
+        if not p:
+            return None
+        try:
+            return _json.loads(_P(p).read_text("utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    dossier = vp.build_dossier(
+        inv, doc, reconciliation_issues=issues,
+        scanner_provenance=_load(provenance_json), wheel_reproducibility=_load(wheel_repro_json),
+        generated_for_release=release)
+    if out_json.strip():
+        _P(out_json).parent.mkdir(parents=True, exist_ok=True)
+        _P(out_json).write_text(_json.dumps(dossier, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if out_md.strip():
+        _P(out_md).parent.mkdir(parents=True, exist_ok=True)
+        _P(out_md).write_text(vp.render_dossier_markdown(dossier, doc), encoding="utf-8")
+    val = dossier["proposals_validation"]
+    typer.echo(f"decision-dossier: remaining_critical={val['remaining_critical_count']} "
+               f"proposals_valid={val['valid_count']} exception_candidates={val['exception_candidates']} "
+               f"reachability_complete={val['reachability_complete']} dossier_valid={val['dossier_valid']} "
+               f"integrity={dossier['integrity']['value'][:16]}")
+    for e in val["errors"]:
+        typer.secho(f"  dossier error: {e}", fg=typer.colors.RED)
+    if not val["dossier_valid"] or not val["all_unapproved"]:
+        raise typer.Exit(code=1)
+
+
+@release_app.command("remediation-report")
+def release_remediation_report_cmd(
+    before: str = typer.Option(..., "--before", help="Baseline Trivy JSON."),
+    after: str = typer.Option(..., "--after", help="Post-remediation Trivy JSON."),
+    out: str = typer.Option(..., "--out", help="Write the remediation diff JSON here."),
+    before_id: str = typer.Option("", "--before-id"),
+    after_id: str = typer.Option("", "--after-id"),
+) -> None:
+    """Phase 10B: machine-readable before/after CRITICAL/HIGH remediation diff
+    (added/removed/unchanged) with an integrity hash. No host paths/secrets."""
+    import json as _json
+    from pathlib import Path as _P
+
+    from app.services import vuln_triage as vt
+
+    b, a = vt.load_trivy(_P(before)), vt.load_trivy(_P(after))
+    if b is None or a is None:
+        typer.secho("could not read before/after Trivy report", fg=typer.colors.RED)
+        raise typer.Exit(code=2)
+    settings = get_settings()
+    rep = vt.remediation_report(
+        before=b, after=a,
+        before_meta={"release_id": before_id or None}, after_meta={"release_id": after_id or None},
+        hmac_key=settings.release_manifest_hmac_key())
+    _P(out).write_text(_json.dumps(rep, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    c = rep["critical"]
+    h = rep["high"]
+    typer.echo(f"remediation: CRITICAL removed={len(c['removed'])} added={len(c['added'])} "
+               f"{c['before_count']}→{c['after_count']} | HIGH {h['before_count']}→{h['after_count']} "
+               f"| status={rep['overall_status']} integrity={rep['integrity']['scheme']}")
+
+
+@auth_app.command("hash-password")
+def auth_hash_password() -> None:
+    """Generate a scrypt password hash for AUTH_MODE=local.
+
+    Prompts for the password (hidden). The plaintext is NEVER printed or logged;
+    only the hash goes to stdout. Redirect it to your secret file, e.g.:
+      archiver auth hash-password > ./secrets/admin_password_hash
+    """
+    from app.services import auth as auth_svc
+
+    pw = typer.prompt("Admin password", hide_input=True, confirmation_prompt=True)
+    typer.echo(auth_svc.hash_password(pw))
+
+
+@auth_app.command("gen-session-secret")
+def auth_gen_session_secret() -> None:
+    """Generate a random session-signing secret for SESSION_SECRET_FILE.
+
+    Redirect to your secret file, e.g.:
+      archiver auth gen-session-secret > ./secrets/session_secret
+    """
+    from app.services import auth as auth_svc
+
+    typer.echo(auth_svc.gen_session_secret())
+
+
+@auth_app.command("status")
+def auth_status() -> None:
+    """Show auth configuration as booleans/counts (no secret values or paths)."""
+    s = get_settings()
+    typer.echo("== auth status (Phase 9C) ==")
+    typer.echo(f"  app_env:                   {s.app_env}")
+    typer.echo(f"  auth_mode:                 {s.auth_mode}")
+    typer.echo(f"  auth_enabled:              {s.auth_enabled}")
+    typer.echo(f"  session_secret readable:   {s.session_secret_configured}")
+    typer.echo(f"  password_hash readable:    {s.admin_password_hash_configured}")
+    typer.echo(f"  cookie secure (effective): {s.effective_session_cookie_secure}")
+    typer.echo(f"  cookie samesite:           {s.session_cookie_samesite}")
+    typer.echo(f"  cors wildcard:             {s.cors_is_wildcard}")
+    typer.echo(f"  trusted_proxy CIDRs:       {len(s.trusted_proxy_cidr_list)}")
+    typer.echo(f"  allowed admin emails:      {len(s.allowed_admin_email_list)}")
 
 
 @takeout_sessions_app.command("show")
@@ -2333,10 +3396,36 @@ def liked_videos_plan_archive(
     typer.echo(f"  candidates:        {plan.total_candidates}")
     typer.echo(f"  missing metadata:  {plan.missing_metadata}")
     typer.echo(f"  missing body:      {plan.missing_body}")
+    typer.echo(
+        f"  eligible missing body: {plan.eligible_missing_body}  "
+        f"(permanent excluded {plan.permanent_excluded} — private/deleted/unavailable, kept)"
+    )
     typer.echo(f"  already have body: {plan.has_body}")
     typer.echo(f"  active jobs:       {plan.existing_active_jobs}")
     typer.echo(f"  retryable (liked): {plan.existing_retryable}")
-    typer.echo(f"  recommended limit: {plan.recommended_limit}")
+    typer.echo("  -- batch planning (Phase 9A) --")
+    typer.echo(f"  requested limit:   {plan.requested_limit}")
+    typer.echo(f"  cap per run:       {plan.cap_per_run}")
+    dsl = "n/a (disk unreadable)" if plan.disk_safe_limit is None else plan.disk_safe_limit
+    typer.echo(f"  disk-safe limit:   {dsl}")
+    typer.echo(f"  selected this run: {plan.selected_count}")
+    typer.echo(f"  recommended limit: {plan.recommended_limit}  (limited by: {plan.limiting_factor})")
+    typer.echo("  -- disk capacity --")
+    if plan.disk_readable:
+        typer.echo(
+            f"  disk total/used/free: {plan.disk_total_gb}/{plan.disk_used_gb}/{plan.disk_free_gb} GiB"
+        )
+    else:
+        typer.echo("  disk:              UNREADABLE (capacity guard inactive here)")
+    typer.echo(
+        f"  est size/video:    {plan.estimated_size_per_video_mb} MiB "
+        f"({plan.size_estimate_source}, n={plan.size_estimate_sample_count})"
+    )
+    typer.echo(f"  est required:      {plan.estimated_required_gb} GiB for {plan.selected_count}")
+    free_after = "n/a" if plan.estimated_free_after_gb is None else f"{plan.estimated_free_after_gb} GiB"
+    typer.echo(f"  est free after:    {free_after}  (min-free {plan.min_free_gb} GiB)")
+    if plan.blocked:
+        typer.secho(f"  BLOCKED: {plan.block_reason}", fg=typer.colors.RED)
     typer.echo(f"  recommended delay: {plan.recommended_delay_seconds}s")
     typer.echo(f"  body profile:      {plan.profile}")
     for n in plan.notes:
@@ -2348,28 +3437,58 @@ def liked_videos_enqueue_archive(
     limit: int = typer.Option(0, "--limit", help="0 = use LIKED_ARCHIVE_DEFAULT_LIMIT."),
     profile: str = typer.Option("", "--profile", help="Body profile (default LIKED_ARCHIVE_DEFAULT_PROFILE)."),
     missing_body_only: bool = typer.Option(True, "--missing-body-only/--all", help="Only liked videos without a saved body."),
+    include_permanent: bool = typer.Option(
+        False, "--include-permanent/--exclude-permanent",
+        help="NOT recommended: also archive private/deleted/unavailable (excluded by default).",
+    ),
     source: str = typer.Option("", "--source"),
     channel: str = typer.Option("", "--channel"),
     title: str = typer.Option("", "--title"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     now: bool = typer.Option(False, "--now"),
+    allow_low_disk: bool = typer.Option(
+        False, "--allow-low-disk",
+        help="Override the disk capacity guard (NOT recommended — may fill the disk).",
+    ),
+    min_free_gb: float = typer.Option(
+        0.0, "--min-free-gb", help="Override ARCHIVE_MIN_FREE_GB for this run (0 = use config).",
+    ),
 ) -> None:
-    """Enqueue a BODY archive for liked videos (DOWNLOADS the video body!)."""
+    """Enqueue a BODY archive for liked videos (DOWNLOADS the video body!).
+
+    Permanent failures (private/deleted/unavailable) are excluded by default and
+    kept (never deleted); use --include-permanent to override (not recommended).
+    Phase 9A: a run that would drop the archive volume below ARCHIVE_MIN_FREE_GB
+    is REFUSED (exit 2) unless --allow-low-disk is given."""
     from app.services import liked_archive as la
 
     settings = get_settings()
-    prof = profile or settings.liked_archive_default_profile
+    prof = profile or settings.effective_body_archive_profile
     _ensure_profile(prof)
     with session_scope() as s:
         r = la.enqueue_archive(
             s, settings,
             filters=_liked_filters(source, channel, title, missing_body=missing_body_only),
             limit=(limit or None), profile=prof, dry_run=dry_run, submit=not now,
+            exclude_permanent=not include_permanent,
+            allow_low_disk=allow_low_disk, min_free_gb=(min_free_gb or None),
         )
         job_ids = list(r.job_ids)
+    if r.blocked:
+        cap = r.capacity or {}
+        typer.secho(f"[DISK GUARD] body archive blocked: {r.block_reason}", fg=typer.colors.RED)
+        typer.echo(
+            f"  free={(cap.get('disk') or {}).get('free_gb')} GiB  "
+            f"est_required={cap.get('estimated_required_gb')} GiB  "
+            f"min_free={cap.get('min_free_gb')} GiB  disk_safe_limit={cap.get('disk_safe_limit')}"
+        )
+        typer.echo("  Re-run with a smaller --limit, or --allow-low-disk to override (not recommended).")
+        if not dry_run:
+            raise typer.Exit(code=2)
     typer.secho(
         f"[VIDEO BODY DOWNLOAD — profile {prof}] selected={r.selected_count} created={r.jobs_created} "
-        f"skipped_existing={r.skipped_existing_job} skipped_has_body={r.skipped_already_has_body}"
+        f"skipped_existing={r.skipped_existing_job} skipped_has_body={r.skipped_already_has_body} "
+        f"skipped_permanent={r.skipped_permanent}"
         + ("  (dry-run, no jobs created)" if dry_run else ""),
         fg=typer.colors.YELLOW,
     )
@@ -2398,6 +3517,45 @@ def liked_videos_failures() -> None:
             typer.echo(f"    {reason:<12} {n:>9} {uniq.get(reason, 0):>14}")
     else:
         typer.echo("    (no failed liked-archive jobs)")
+
+
+@liked_videos_app.command("ops-status")
+def liked_videos_ops_status() -> None:
+    """Phase 9A: consolidated body-archive operations status (disk / queue /
+    orphan / duplicate / DB size). Counts + figures only — no raw_json / paths."""
+    from app.services import liked_archive as la
+
+    with session_scope() as s:
+        st = la.operations_status(s, get_settings())
+    d = st["disk"]
+    e = st["size_estimate"]
+    o = st["orphan"]
+    typer.echo("== body archive operations status (Phase 9A) ==")
+    typer.echo(f"  default body profile:    {st['default_body_profile']}")
+    typer.echo(f"  body_saved:              {st['body_saved']}")
+    typer.echo(
+        f"  remaining eligible body: {st['remaining_eligible_body']}  "
+        f"(permanent kept {st['permanent_unique_videos']})"
+    )
+    typer.echo(
+        f"  jobs active/queued/running: {st['total_active_jobs']}/{st['queued_jobs']}/{st['running_jobs']}"
+        f"  workers={st['worker_count']}"
+    )
+    if d.get("readable"):
+        typer.echo(
+            f"  disk free/total:         {d['free_gb']}/{d['total_gb']} GiB "
+            f"(min-free {st['min_free_gb']} GiB)"
+        )
+    else:
+        typer.echo("  disk:                    UNREADABLE")
+    typer.echo(f"  est size/video:          {e['estimate_mb']} MiB ({e['source']}, n={e['sample_count']})")
+    typer.echo(
+        f"  orphan dry-run:          scanned={o['scanned']} orphan_found={o['orphan_found']} "
+        f"rq_unreadable={o['rq_unreadable']}"
+    )
+    typer.echo(f"  duplicate video media:   {st['duplicate_video_media_files']}")
+    typer.echo(f"  comments table bytes:    {st['comments_table_bytes']}")
+    typer.echo(f"  raw_json stored total:   {st['raw_json_stored_total']}")
 
 
 @queue_app.command("status")

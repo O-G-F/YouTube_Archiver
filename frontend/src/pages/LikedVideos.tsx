@@ -2,10 +2,12 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { api, LikedArchiveBody } from "../api/endpoints";
 import { useFetch } from "../lib/useFetch";
+import { useModalA11y } from "../lib/useModalA11y";
 import { fmtDate } from "../lib/format";
 import { ErrorBox, Loading } from "../components/ui";
 import { Thumb } from "../components/Thumb";
 import { LikedProgressDashboard } from "../components/LikedProgress";
+import { LikedOperationsPanel } from "../components/LikedOperations";
 import type { LikedArchivePlan, LikedArchiveEnqueueResult } from "../api/types";
 
 const SOURCE_LABEL: Record<string, string> = {
@@ -45,8 +47,10 @@ export default function LikedVideos() {
 
   // confirm modal
   const [modal, setModal] = useState<ModalKind>(null);
-  const [mProfile, setMProfile] = useState("video_compressed_1080p");
+  useModalA11y(modal !== null, () => setModal(null));
+  const [mProfile, setMProfile] = useState("video_compressed_1080p_light");
   const [mLimit, setMLimit] = useState(10);
+  const [allowLowDisk, setAllowLowDisk] = useState(false); // Phase 9A: override disk guard
 
   function baseFilters(): LikedArchiveBody {
     return {
@@ -75,7 +79,7 @@ export default function LikedVideos() {
   function openModal(kind: ModalKind) {
     setResult(null);
     setActionErr(null);
-    setMProfile(kind === "metadata" ? "metadata_only" : plan?.recommended_profile || "video_compressed_1080p");
+    setMProfile(kind === "metadata" ? "metadata_only" : plan?.recommended_profile || "video_compressed_1080p_light");
     setMLimit(plan?.recommended_limit || 10);
     setModal(kind);
   }
@@ -93,13 +97,17 @@ export default function LikedVideos() {
         // when targeting a specific job kind, default the matching missing-filter on
         missing_metadata: modal === "metadata" ? onlyMissingMeta || true : onlyMissingMeta,
         missing_body: modal === "archive" ? onlyMissingBody || true : onlyMissingBody,
+        // Phase 9A: disk guard override applies to body archive only
+        allow_low_disk: modal === "archive" ? allowLowDisk : undefined,
       };
       const r =
         modal === "metadata"
           ? await api.enqueueLikedMetadataV2(body)
           : await api.enqueueLikedArchive(body);
       setResult(r);
-      if (!dryRun) {
+      if (r.blocked) {
+        setActionErr(`DISK BLOCK: ${r.block_reason ?? "insufficient free space"} — 小さい limit にするか disk を増設してください。`);
+      } else if (!dryRun) {
         setFlash(
           `${modal === "archive" ? "Archive" : "Metadata"} enqueue: created ${r.jobs_created} job(s)` +
             (r.downloads_body ? " (video BODY will be downloaded)" : " (metadata only, no body)")
@@ -152,6 +160,13 @@ export default function LikedVideos() {
 
       <LikedProgressDashboard onChanged={reload} />
 
+      <LikedOperationsPanel />
+
+      <p className="muted small" style={{ margin: "10px 2px" }}>
+        Runtime &amp; release status, backup / recovery readiness, and the audit trail
+        moved to <Link to="/settings">System / Settings</Link>.
+      </p>
+
       {stats.data && (
         <div className="cards">
           <div className="card"><div className="label">Total liked</div><div className="value">{stats.data.total}</div></div>
@@ -168,15 +183,29 @@ export default function LikedVideos() {
             <h2>Archive plan (preview — no jobs created)</h2>
             <button onClick={() => setPlan(null)}>✕</button>
           </div>
+          {plan.blocked && (
+            <div className="flash" style={{ background: "var(--err-bg, #3a1c1c)", marginBottom: 8 }}>
+              ⛔ DISK BLOCK: {plan.block_reason} — 小さい limit にするか、disk を増設してください。
+            </div>
+          )}
           <div className="cards">
             <div className="card"><div className="label">candidates</div><div className="value">{plan.total_candidates}</div></div>
             <div className="card"><div className="label">missing metadata</div><div className="value sm">{plan.missing_metadata}</div></div>
             <div className="card"><div className="label">missing body</div><div className="value sm">{plan.missing_body}</div></div>
+            <div className="card" title="missing body minus permanent (private/deleted/unavailable)"><div className="label">eligible missing body</div><div className="value sm">{plan.eligible_missing_body ?? "—"}</div></div>
             <div className="card"><div className="label">already have body</div><div className="value sm">{plan.has_body}</div></div>
             <div className="card"><div className="label">active jobs</div><div className="value sm">{plan.existing_active_jobs}</div></div>
-            <div className="card"><div className="label">retryable</div><div className="value sm">{plan.existing_retryable}</div></div>
-            <div className="card"><div className="label">rec. limit</div><div className="value sm">{plan.recommended_limit}</div></div>
-            <div className="card"><div className="label">rec. delay</div><div className="value sm">{plan.recommended_delay_seconds}s</div></div>
+          </div>
+          <div className="cards" style={{ marginTop: 4 }}>
+            <div className="card"><div className="label">requested / cap</div><div className="value sm">{plan.requested_limit ?? "—"} / {plan.cap_per_run ?? "—"}</div></div>
+            <div className="card" title="max videos that fit while keeping min-free"><div className="label">disk-safe limit</div><div className="value sm">{plan.disk_safe_limit ?? "n/a"}</div></div>
+            <div className="card"><div className="label">selected this run</div><div className="value sm">{plan.selected_count ?? "—"}</div></div>
+            <div className="card" title={`limited by: ${plan.limiting_factor ?? "—"}`}><div className="label">rec. limit</div><div className="value sm">{plan.recommended_limit} <span className="muted">({plan.limiting_factor ?? "—"})</span></div></div>
+            <div className="card"><div className="label">disk free</div><div className="value sm">
+              <span className={`badge ${plan.disk_readable ? (plan.blocked ? "err" : "ok") : "warn"}`}>{plan.disk_readable ? `${plan.disk_free_gb} GiB` : "unreadable"}</span>
+              <span className="muted"> min {plan.min_free_gb} GiB</span>
+            </div></div>
+            <div className="card" title={`estimate ${plan.size_estimate_source} (n=${plan.size_estimate_sample_count})`}><div className="label">est req / free after</div><div className="value sm">{plan.estimated_required_gb ?? "—"} / {plan.estimated_free_after_gb ?? "—"} GiB</div></div>
           </div>
           <ul className="muted small" style={{ lineHeight: 1.7 }}>
             {plan.notes.map((n, i) => <li key={i}>{n}</li>)}
@@ -299,28 +328,37 @@ export default function LikedVideos() {
               <label>profile
                 {modal === "archive" ? (
                   <select value={mProfile} onChange={(e) => setMProfile(e.target.value)}>
-                    <option value="video_compressed_1080p">video_compressed_1080p</option>
-                    <option value="video_compressed_720p">video_compressed_720p</option>
-                    <option value="video_best">video_best</option>
-                    <option value="audio_only">audio_only</option>
+                    <option value="video_compressed_1080p_light">video_compressed_1080p_light (推奨・comments無)</option>
+                    <option value="video_compressed_1080p">video_compressed_1080p (comments有・大規模非推奨)</option>
+                    <option value="video_proxy_1080p_mp4">video_proxy_1080p_mp4</option>
+                    <option value="audio_opus_save_space">audio_opus_save_space</option>
+                    <option value="audio_flac_best">audio_flac_best</option>
                   </select>
                 ) : (
                   <input value={mProfile} readOnly />
                 )}
               </label>
               <label>limit
-                <input type="number" min={1} max={200} value={mLimit} onChange={(e) => setMLimit(Number(e.target.value))} />
+                <input type="number" min={1} max={1000} value={mLimit} onChange={(e) => setMLimit(Number(e.target.value))} />
               </label>
             </div>
+            {modal === "archive" && (
+              <label className="checkbox" style={{ marginTop: 4 }}>
+                <input type="checkbox" checked={allowLowDisk} onChange={(e) => setAllowLowDisk(e.target.checked)} />
+                --allow-low-disk（disk guard を上書き・非推奨）
+              </label>
+            )}
             <p className="muted small">
               対象: source={source || "all"} / missing_metadata={String(onlyMissingMeta)} / missing_body={String(onlyMissingBody)}
               {query ? ` / q="${query}"` : ""}
             </p>
             {result && (
-              <div className="flash">
-                {result.dry_run ? "DRY-RUN: " : ""}selected={result.selected_count} created={result.jobs_created}{" "}
-                skip_existing={result.skipped_existing_job} skip_has_metadata={result.skipped_already_has_metadata}{" "}
-                skip_has_body={result.skipped_already_has_body} body={String(result.downloads_body)}
+              <div className={`flash${result.blocked ? " err" : ""}`}>
+                {result.blocked
+                  ? `⛔ DISK BLOCK: ${result.block_reason ?? "insufficient free space"}`
+                  : `${result.dry_run ? "DRY-RUN: " : ""}selected=${result.selected_count} created=${result.jobs_created} ` +
+                    `skip_existing=${result.skipped_existing_job} skip_has_body=${result.skipped_already_has_body} ` +
+                    `body=${String(result.downloads_body)}`}
               </div>
             )}
             <ErrorBox error={actionErr} />

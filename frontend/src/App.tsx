@@ -1,4 +1,5 @@
 import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { AuthGate } from "./components/AuthGate";
 import Layout from "./components/Layout";
 import Dashboard from "./pages/Dashboard";
 import Jobs from "./pages/Jobs";
@@ -18,6 +19,7 @@ import NotFound from "./pages/NotFound";
 export function App() {
   return (
     <BrowserRouter>
+      <AuthGate>
       <Routes>
         <Route element={<Layout />}>
           <Route path="/" element={<Dashboard />} />
@@ -36,6 +38,7 @@ export function App() {
           <Route path="*" element={<NotFound />} />
         </Route>
       </Routes>
+      </AuthGate>
     </BrowserRouter>
   );
 }

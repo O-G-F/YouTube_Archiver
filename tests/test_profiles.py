@@ -38,6 +38,7 @@ def test_builtin_profiles_exist():
         "video_best_archive",
         "video_best_archive_all_subs",
         "video_compressed_1080p",
+        "video_compressed_1080p_light",
         "video_proxy_1080p_mp4",
         "audio_flac_best",
         "audio_opus_save_space",
@@ -211,7 +212,7 @@ def test_redact_masks_password_not_cookies():
 
 def test_seed_and_lookup(session):
     written = seed_builtin_profiles(session)
-    assert written == 10
+    assert written == 11
     spec = get_profile_spec(session, "video_best_archive")
     assert spec.media_mode == "video"
     # idempotent: second seed writes 0 new rows

@@ -5,7 +5,13 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 sqlalchemy>=2.0
 alembic>=1.13
-psycopg2-binary>=2.9
+# Phase 10B.2: use the SOURCE distribution `psycopg2` (built into a wheel in a
+# dedicated builder stage), NOT `psycopg2-binary`. The -binary manylinux wheel
+# bundles its own AlmaLinux-built shared libs (libpq/libpcre2/libssl/...); its
+# vendored pcre2 10.32 is flagged CRITICAL by Trivy. Source build links the
+# system libpq5 -> system libpcre2-8-0 (patched), eliminating the bundled CVEs.
+# Do NOT switch back to psycopg2-binary without re-running the 10B.2 audit.
+psycopg2>=2.9
 redis>=5.0
 rq>=1.16
 # Pydantic v2 only. Upper-bounded to avoid a future v3 (or a stray old

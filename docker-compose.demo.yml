@@ -1,0 +1,29 @@
+# Isolated demo overlay — synthetic data only, loopback-only, fully isolated.
+#
+# Layer this on top of the base compose *with a distinct project name* so its
+# containers and volumes never collide with a real stack, and so tearing it
+# down (`down -v`) only ever removes the demo's own volumes:
+#
+#   PROJ=ya-demo
+#   docker compose -p $PROJ -f docker-compose.yml -f docker-compose.demo.yml up -d postgres redis migrate web
+#   docker compose -p $PROJ -f docker-compose.yml -f docker-compose.demo.yml \
+#       exec -e YA_DEMO_SEED_CONFIRM=yes web python scripts/demo_seed.py
+#   # open http://127.0.0.1:18080 , capture screenshots
+#   docker compose -p $PROJ -f docker-compose.yml -f docker-compose.demo.yml down -v
+#
+# `!override` fully replaces the base list (compose otherwise *appends*), so the
+# real 8000 publish and the real archive/config/log host binds are dropped: the
+# demo publishes only to loopback and writes only to throwaway named volumes.
+services:
+  web:
+    ports: !override
+      - "127.0.0.1:18080:8000"
+    volumes: !override
+      - ya-demo-archive:/archive
+      - ya-demo-config:/config
+      - ya-demo-logs:/logs
+
+volumes:
+  ya-demo-archive:
+  ya-demo-config:
+  ya-demo-logs:

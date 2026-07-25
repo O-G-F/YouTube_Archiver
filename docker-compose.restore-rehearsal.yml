@@ -1,0 +1,98 @@
+# =====================================================================
+# Phase 9F: ISOLATED restore-rehearsal stack — tracked TEMPLATE.
+# Contains NO secret values and NO real host paths.
+# =====================================================================
+# NEVER `docker compose up` this file directly. It is driven exclusively by
+# scripts/restore-rehearsal.sh, which:
+#   * passes a UNIQUE temporary project name  (-p ya-rehearsal-<ts>-<rand>)
+#   * passes --env-file <tmp>/.compose-env so interpolation never falls back
+#     to the real .env
+#   * binds only directories under a throwaway ${REHEARSAL_ROOT} (mktemp)
+#   * tears the stack down with `down -v` scoped to THAT project only
+#
+# Isolation properties:
+#   * volume NAMES (rehearsal_pgdata / rehearsal_redisdata) differ from the
+#     real stack's pgdata / redisdata, so even a mis-projected invocation
+#     cannot collide with youtube_archiver_pgdata / youtube_archiver_redisdata;
+#   * web is published on 127.0.0.1 at a script-chosen ephemeral port only;
+#   * postgres / redis are internal-only (no host ports);
+#   * there is NO scheduler service — nothing can enqueue periodic work or
+#     downloads during a rehearsal;
+#   * the real archive / data / secrets / takeout directories are never
+#     referenced — all mounts come from ${REHEARSAL_ROOT}.
+# =====================================================================
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: archiver          # must match the pg_dump owner
+      POSTGRES_PASSWORD: ${REHEARSAL_PG_PASSWORD:?set by restore-rehearsal.sh}
+      POSTGRES_DB: archiver
+    volumes:
+      - rehearsal_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U archiver"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    # Same AOF settings as production — the rehearsal still starts from an
+    # EMPTY queue on purpose: the Phase 9F recovery policy is "do not restore
+    # the Redis AOF; reconcile orphans against the restored DB instead".
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - rehearsal_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: applied AFTER the dump restore; must be a no-op at schema head.
+  migrate:
+    image: ${REHEARSAL_IMAGE:?set by restore-rehearsal.sh}
+    command: ["migrate"]
+    env_file: ${REHEARSAL_ENV_FILE:?set by restore-rehearsal.sh}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    image: ${REHEARSAL_IMAGE:?set by restore-rehearsal.sh}
+    command: ["web"]
+    env_file: ${REHEARSAL_ENV_FILE:?set by restore-rehearsal.sh}
+    ports:
+      - "127.0.0.1:${REHEARSAL_WEB_PORT:?set by restore-rehearsal.sh}:8000"
+    volumes:
+      - ${REHEARSAL_ROOT:?set by restore-rehearsal.sh}/archive:/archive
+      - ${REHEARSAL_ROOT:?}/config:/config
+      - ${REHEARSAL_ROOT:?}/logs:/logs
+      - ${REHEARSAL_ROOT:?}/takeout:/takeout_imports
+      - ${REHEARSAL_ROOT:?}/secrets:/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    image: ${REHEARSAL_IMAGE:?set by restore-rehearsal.sh}
+    command: ["worker"]
+    env_file: ${REHEARSAL_ENV_FILE:?set by restore-rehearsal.sh}
+    volumes:
+      - ${REHEARSAL_ROOT:?}/archive:/archive
+      - ${REHEARSAL_ROOT:?}/config:/config
+      - ${REHEARSAL_ROOT:?}/logs:/logs
+      - ${REHEARSAL_ROOT:?}/takeout:/takeout_imports
+      - ${REHEARSAL_ROOT:?}/secrets:/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  rehearsal_pgdata:     # temporary — removed by the rehearsal teardown
+  rehearsal_redisdata:  # temporary — removed by the rehearsal teardown

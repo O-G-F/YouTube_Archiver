@@ -98,6 +98,7 @@ export default function Search() {
             <label key={t.key} className="checkbox">
               <input
                 type="checkbox"
+                aria-label={t.label}
                 checked={active[t.key]}
                 onChange={(e) => setActive((a) => ({ ...a, [t.key]: e.target.checked }))}
               />

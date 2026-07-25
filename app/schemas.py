@@ -391,6 +391,8 @@ class LikedProgressOut(BaseModel):
     permanent_unique_videos: int = 0
     body_saved: int
     body_missing: int
+    # Phase 9A: missing body minus permanent = downloadable-but-not-yet-saved.
+    eligible_missing_body: int = 0
     active_archive_jobs: int
     retryable_liked_jobs: int
     failed_liked_jobs: int
@@ -787,6 +789,9 @@ class LikedArchiveRequest(BaseModel):
     # Phase 7J: include permanent failures (private/deleted/unavailable) in
     # metadata selection. Default False (they are skipped, kept in DB).
     include_permanent: bool = False
+    # Phase 9A: override the disk capacity guard on a body archive (NOT default).
+    allow_low_disk: bool = False
+    min_free_gb: float | None = None
 
 
 class LikedArchivePlanOut(BaseModel):
@@ -794,6 +799,8 @@ class LikedArchivePlanOut(BaseModel):
     missing_metadata: int
     missing_body: int
     has_body: int
+    permanent_excluded: int = 0
+    eligible_missing_body: int = 0
     existing_active_jobs: int
     existing_retryable: int
     recommended_limit: int
@@ -801,6 +808,24 @@ class LikedArchivePlanOut(BaseModel):
     recommended_profile: str
     profile: str
     notes: list[str] = Field(default_factory=list)
+    # Phase 9A: batch planning + disk capacity guard (all leak-safe figures).
+    requested_limit: int = 0
+    cap_per_run: int = 0
+    selected_count: int = 0
+    disk_safe_limit: int | None = None
+    limiting_factor: str = ""
+    blocked: bool = False
+    block_reason: str | None = None
+    disk_readable: bool = True
+    disk_total_gb: float | None = None
+    disk_used_gb: float | None = None
+    disk_free_gb: float | None = None
+    min_free_gb: float = 0.0
+    estimated_size_per_video_mb: float = 0.0
+    size_estimate_source: str = ""
+    size_estimate_sample_count: int = 0
+    estimated_required_gb: float = 0.0
+    estimated_free_after_gb: float | None = None
 
 
 class LikedArchiveEnqueueOut(BaseModel):
@@ -809,10 +834,66 @@ class LikedArchiveEnqueueOut(BaseModel):
     skipped_existing_job: int
     skipped_already_has_metadata: int
     skipped_already_has_body: int
+    skipped_permanent: int = 0
     job_ids: list[int] = Field(default_factory=list)
     profile: str
     downloads_body: bool
     dry_run: bool
+    # Phase 9A: disk capacity guard outcome (body archive only).
+    blocked: bool = False
+    block_reason: str | None = None
+    capacity: dict = Field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 9A: production operations status
+# --------------------------------------------------------------------------- #
+class OpsDiskOut(BaseModel):
+    readable: bool = True
+    total_bytes: int | None = None
+    used_bytes: int | None = None
+    free_bytes: int | None = None
+    total_gb: float | None = None
+    used_gb: float | None = None
+    free_gb: float | None = None
+    used_percent: float | None = None
+
+
+class OpsSizeEstimateOut(BaseModel):
+    source: str = ""
+    sample_count: int = 0
+    estimate_bytes: int = 0
+    estimate_mb: float = 0.0
+    avg_mb: float | None = None
+    median_mb: float | None = None
+    p90_mb: float | None = None
+
+
+class OpsOrphanOut(BaseModel):
+    scanned: int = 0
+    orphan_found: int = 0
+    rq_unreadable: bool = False
+
+
+class LikedOperationsOut(BaseModel):
+    """Consolidated body-archive operations snapshot (no raw_json/paths/secrets)."""
+
+    default_body_profile: str
+    body_saved: int
+    remaining_eligible_body: int
+    permanent_unique_videos: int = 0
+    active_archive_jobs: int = 0
+    queued_jobs: int = 0
+    running_jobs: int = 0
+    total_active_jobs: int = 0
+    worker_count: int = 0
+    disk: OpsDiskOut
+    min_free_gb: float
+    size_estimate: OpsSizeEstimateOut
+    orphan: OpsOrphanOut
+    duplicate_video_media_files: int = 0
+    comments_table_bytes: int = 0
+    raw_json_stored_total: int = 0
 
 
 class LikedRetryFailedRequest(BaseModel):
@@ -1409,6 +1490,19 @@ class BuildInfoOut(BaseModel):
     supported_job_types: list[str] = Field(default_factory=list)
 
 
+class VersionOut(BaseModel):
+    """Phase 10A: consolidated release/version identity (no paths / secrets)."""
+
+    app_version: str
+    git_commit: str | None = None
+    git_tree_clean: bool | None = None
+    build_id: str
+    build_timestamp: str | None = None
+    schema_head: str | None = None
+    frontend_build_id: str | None = None
+    image_digest: str | None = None
+
+
 class WorkerInfoOut(BaseModel):
     worker_id: str | None = None
     build_id: str | None = None
@@ -1440,6 +1534,256 @@ class FullHealthOut(BaseModel):
     workers: list[WorkerInfoOut] = Field(default_factory=list)
     worker_build_match: bool
     schema_head_match: bool | None = None  # None = could not determine (dev DB)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 9E: audit trail
+# --------------------------------------------------------------------------- #
+class AuditEventOut(BaseModel):
+    id: int
+    occurred_at: str | None = None
+    event_type: str
+    category: str
+    severity: str
+    outcome: str
+    actor_kind: str
+    actor_id_hash: str | None = None
+    client_id_hash: str | None = None
+    request_id: str | None = None
+    correlation_id: str | None = None
+    resource_type: str | None = None
+    resource_id: str | None = None
+    action: str | None = None
+    reason_code: str | None = None
+    metadata: dict | None = None
+    event_hash: str
+
+
+class AuditListOut(BaseModel):
+    events: list[AuditEventOut] = Field(default_factory=list)
+    limit: int
+    offset: int
+
+
+class AuditStatsOut(BaseModel):
+    total: int
+    window_days: int
+    by_category: dict[str, int] = Field(default_factory=dict)
+    by_severity: dict[str, int] = Field(default_factory=dict)
+    by_outcome: dict[str, int] = Field(default_factory=dict)
+
+
+class AuditVerifyOut(BaseModel):
+    valid: bool
+    valid_with_warnings: bool = False
+    checked_count: int
+    segment_count: int = 0
+    checkpoint_count: int = 0
+    current_signing_key_id: str | None = None
+    unsigned_event_count: int = 0
+    missing_verification_keys: list[str] = Field(default_factory=list)
+    first_invalid_event_id: int | None = None
+    failure_reason_code: str | None = None
+    signed: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# Phase 9C: auth
+# --------------------------------------------------------------------------- #
+class LoginRequest(BaseModel):
+    password: str
+
+
+class AuthSessionOut(BaseModel):
+    authenticated: bool
+    auth_mode: str
+    app_env: str
+    identity: str | None = None
+    login_required: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# Phase 9B: production deployment readiness
+# --------------------------------------------------------------------------- #
+class ProductionCheckOut(BaseModel):
+    overall: str  # pass | warn | fail
+    counts: dict[str, int] = Field(default_factory=dict)
+    checks: list[PreflightCheckOut] = Field(default_factory=list)  # status: pass|warn|fail
+    default_body_profile: str = ""
+    app_env: str = ""
+    auth_mode: str = ""
+    disk_min_free_gb: float = 0.0
+    backup_reminder: str = ""
+
+
+class BackupManifestSummaryOut(BaseModel):
+    """Phase 9F/9F.1: small manifest summary — basename/counts only, never paths."""
+
+    artifact: str | None = None
+    size_bytes: int | None = None
+    sha256: str | None = None
+    schema_head: str | None = None
+    created_at: str | None = None
+    manifest_version: int | None = None
+    # v2 backup-set fields (Phase 9F.1)
+    backup_id: str | None = None
+    completed: bool | None = None
+    app_version: str | None = None
+    build_id: str | None = None
+    active_jobs_at_backup: int | None = None
+    audit_head_event_id: int | None = None
+    redis_recovery_mode: str | None = None
+    encrypted: bool | None = None
+    archive_manifest_artifact: str | None = None
+    archive_manifest_sha256: str | None = None
+    integrity_scheme: str | None = None
+
+
+class BackupReadinessOut(BaseModel):
+    """Phase 9F: read-only backup / disaster-recovery readiness."""
+
+    overall: str  # pass | warn | fail
+    counts: dict[str, int] = Field(default_factory=dict)
+    checks: list[PreflightCheckOut] = Field(default_factory=list)
+    manifest: BackupManifestSummaryOut | None = None
+    backup_age_hours: float | None = None
+    backup_verified_age_hours: float | None = None
+    restore_rehearsal_age_days: float | None = None
+
+
+class ReleaseManifestSummaryOut(BaseModel):
+    """Phase 10A: leak-free release manifest summary (basenames/counts/statuses)."""
+
+    manifest_version: int | None = None
+    release_id: str | None = None
+    app_version: str | None = None
+    git_commit: str | None = None
+    git_tree_clean: bool | None = None
+    build_id: str | None = None
+    schema_head: str | None = None
+    frontend_build_id: str | None = None
+    completed: bool | None = None
+    service_build_ids: list[str] = Field(default_factory=list)
+    service_count: int | None = None
+    image_digests_captured: int | None = None
+    sbom_present: bool | None = None
+    sbom_sha256: str | None = None
+    vulnerability_status: str | None = None
+    vulnerability_severities: dict[str, int] | None = None
+    vulnerability_tool: str | None = None
+    vulnerability_tool_version: str | None = None
+    vulnerability_db_updated_at: str | None = None
+    release_check_overall: str | None = None
+    integrity_scheme: str | None = None
+    backend_test_count: int | None = None
+    frontend_test_count: int | None = None
+    # Phase 10A.1 reproducible-lock / supply-chain gates
+    python_lock_exact: bool | None = None
+    python_lock_hashed: bool | None = None
+    python_lock_package_count: int | None = None
+    base_python_digest_pinned: bool | None = None
+    base_node_digest_pinned: bool | None = None
+
+
+class SecurityPostureOut(BaseModel):
+    """Phase 11A: honest security-posture summary. Surfaces the known accepted
+    CRITICAL count (from the decision dossier) and the local-vs-production
+    distinction. Counts / enums / repo-relative doc names only — no paths/secrets."""
+
+    operating_mode: str
+    known_critical_accepted: int | None = None
+    exception_candidates: int | None = None
+    active_vulnerability_exceptions: int = 0
+    reachability_assessed: bool = False
+    production_ready: bool = False
+    release_check_passes: bool = False
+    risk_acceptance_doc: str = ""
+    decision_dossier_doc: str = ""
+    note: str = ""
+
+
+class FirstRunItemOut(BaseModel):
+    """Phase 11B: one fresh-install checklist item (no secrets / host paths)."""
+
+    key: str
+    label: str
+    done: bool = False
+    detail: str = ""
+    link: str = ""
+    optional: bool = False
+    warn: bool = False
+    danger: bool = False
+
+
+class FirstRunStatusOut(BaseModel):
+    """Phase 11B: fresh-install setup checklist."""
+
+    is_fresh: bool = False
+    video_count: int = 0
+    liked_count: int = 0
+    job_count: int = 0
+    auth_mode: str = "disabled"
+    web_bind_host: str = "127.0.0.1"
+    web_bind_all_interfaces: bool = False
+    exposure_warning: bool = False
+    exposure_level: str = "warn"  # none | warn | danger
+    exposure_note: str = ""
+    items: list[FirstRunItemOut] = Field(default_factory=list)
+    done_count: int = 0
+    total_count: int = 0
+
+
+class RuntimeReleaseStatusOut(BaseModel):
+    """Phase 11B: separates the running runtime from the last scanned release."""
+
+    verdict: str  # match | mismatch | no_scanned_release
+    message: str = ""
+    status_source: str = "none"
+    manifest_matches_runtime: bool = False
+    runtime_build_id: str | None = None
+    manifest_build_id: str | None = None
+    runtime_app_version: str | None = None
+    runtime_git_commit: str | None = None
+    runtime_schema_head: str | None = None
+    runtime_git_tree_clean: bool | None = None
+    manifest_app_version: str | None = None
+    manifest_release_id: str | None = None
+    manifest_git_commit: str | None = None
+    manifest_age_seconds: float | None = None
+    scan_age_seconds: float | None = None
+
+
+class ReleaseReadinessOut(BaseModel):
+    """Phase 10A: read-only release / provenance readiness."""
+
+    overall: str  # pass | warn | fail
+    counts: dict[str, int] = Field(default_factory=dict)
+    checks: list[PreflightCheckOut] = Field(default_factory=list)
+    version: VersionOut
+    manifest: ReleaseManifestSummaryOut | None = None
+    security_posture: SecurityPostureOut | None = None  # Phase 11A
+    runtime_release: RuntimeReleaseStatusOut | None = None  # Phase 11B
+
+
+class ArchiveMediaCheckDiskOut(BaseModel):
+    readable: bool = True
+    free_gb: float | None = None
+    total_gb: float | None = None
+    used_gb: float | None = None
+
+
+class ArchiveMediaCheckOut(BaseModel):
+    """Archive-root migration guard. Missing videos are public youtube ids only —
+    NEVER file/host paths."""
+
+    db_video_media_files: int
+    checked: int
+    existing: int
+    missing: int
+    missing_youtube_ids: list[str] = Field(default_factory=list)
+    duplicate_video_media_files: int
+    disk: ArchiveMediaCheckDiskOut
+    ok: bool
 
 
 class SecretsStatusOut(BaseModel):

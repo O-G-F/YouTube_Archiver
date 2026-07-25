@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "youtube-archiver"
-version = "0.1.0"
-description = "Local YouTube archiver (yt-dlp + FastAPI + RQ + PostgreSQL). Phase 0-1."
+version = "0.11.0b1"
+description = "Local YouTube archiver (yt-dlp + FastAPI + RQ + PostgreSQL)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -14,7 +14,7 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "sqlalchemy>=2.0",
     "alembic>=1.13",
-    "psycopg2-binary>=2.9",
+    "psycopg2>=2.9",  # source build (Phase 10B.2): links system libpq/pcre2, NOT the -binary manylinux wheel (which vendors a CVE-flagged pcre2 10.32)
     "redis>=5.0",
     "rq>=1.16",
     "pydantic>=2.7,<3",

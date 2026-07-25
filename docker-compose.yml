@@ -23,6 +23,11 @@ services:
 
   redis:
     image: redis:7-alpine
+    # Phase 8C: persist the RQ queue (AOF) to a named volume so queued/started
+    # jobs survive a Redis/stack restart or host sleep (body-archive robustness).
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -42,8 +47,11 @@ services:
     build: .
     command: ["web"]
     env_file: .env
+    # Secure-by-default: publish the admin console to loopback only. Override
+    # WEB_BIND_HOST=0.0.0.0 (and WEB_PORT) in .env for LAN access — but enable
+    # authentication first (see README "Security posture").
     ports:
-      - "8000:8000"
+      - "${WEB_BIND_HOST:-127.0.0.1}:${WEB_PORT:-8000}:8000"
     volumes:
       - ${ARCHIVE_HOST_PATH:-./data/archive}:/archive
       - ${CONFIG_HOST_PATH:-./data/config}:/config
@@ -99,3 +107,4 @@ services:
 
 volumes:
   pgdata:
+  redisdata:  # Phase 8C: RQ queue persistence (AOF) so jobs survive restarts
